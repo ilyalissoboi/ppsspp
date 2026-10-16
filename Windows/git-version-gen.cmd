@@ -149,7 +149,10 @@ if /i "%GIT_VERSION:~0,1%" == "v" (
 	rem // Official releases with version tags
 	for /f "tokens=1 delims=-" %%a in ("%GIT_VERSION:~1%") do set WIN_RELEASE_VERSION=%%a
 	for /f "tokens=2 delims=-" %%a in ("%GIT_VERSION%") do set WIN_BUILD_NUMBER=%%a
-	set WIN_VERSION_COMMA=!WIN_RELEASE_VERSION:.=,!,!WIN_BUILD_NUMBER!
+	rem // VERSIONINFO takes exactly four numbers: the first four of tag.build, padded with zeros.
+	rem // So v1.20.4-55 is 1,20,4,55, while a fork's four-part tag v1.20.4.3, exact or with commits
+	rem // past it, is 1,20,4,3. The full describe output still goes in PPSSPP_WIN_VERSION_STRING.
+	for /f "tokens=1-4 delims=." %%a in ("!WIN_RELEASE_VERSION!.!WIN_BUILD_NUMBER!.0.0.0") do set WIN_VERSION_COMMA=%%a,%%b,%%c,%%d
 ) else (
 	rem // Normal commits
 	set WIN_VERSION_COMMA=0,0,0x%GIT_VERSION:~0,4%,0x%GIT_VERSION:~4,4%
