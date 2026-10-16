@@ -16,7 +16,6 @@
 #include "Common/System/Display.h"
 #include "Common/GPU/Vulkan/VulkanContext.h"
 #include "Common/GPU/Vulkan/VulkanBarrier.h"
-#include "Common/Data/Convert/SmallDataConvert.h"
 #include "Common/Data/Collections/FastVec.h"
 #include "Common/Math/math_util.h"
 #include "Common/GPU/DataFormat.h"
@@ -115,6 +114,8 @@ public:
 
 // Wrapped pipeline. Does own desc!
 struct VKRGraphicsPipeline {
+	VKRGraphicsPipeline(const VKRGraphicsPipeline &) = delete;
+	VKRGraphicsPipeline &operator=(const VKRGraphicsPipeline &) = delete;
 	VKRGraphicsPipeline(PipelineFlags flags, const char *tag) : flags_(flags), tag_(tag) {}
 	~VKRGraphicsPipeline();
 
@@ -195,6 +196,9 @@ static_assert(sizeof(PackedDescriptor::buffer) == 16, "PackedDescriptor should b
 // Note that we only support a single descriptor set due to compatibility with some ancient devices.
 // We should probably eventually give that up eventually.
 struct VKRPipelineLayout {
+	VKRPipelineLayout() = default;
+	VKRPipelineLayout(const VKRPipelineLayout &) = delete;
+	VKRPipelineLayout &operator=(const VKRPipelineLayout &) = delete;
 	~VKRPipelineLayout();
 
 	enum { MAX_DESC_SET_BINDINGS = 5 };
@@ -265,7 +269,8 @@ public:
 	// as the other backends, even though there's no actual binding happening here.
 	// For layer, we use the same convention as thin3d, where layer = -1 means all layers together. For texturing, that means that you
 	// get an array texture view.
-	VkImageView BindFramebufferAsTexture(VKRFramebuffer *fb, int binding, VkImageAspectFlags aspectBits, int layer);
+	// With samples, binds the multisampled color image (for texelFetch of single samples) instead of the resolved one.
+	VkImageView BindFramebufferAsTexture(VKRFramebuffer *fb, int binding, VkImageAspectFlags aspectBits, int layer, bool samples = false);
 
 	bool CopyFramebufferToMemory(VKRFramebuffer *src, VkImageAspectFlags aspectBits, int x, int y, int w, int h, Draw::DataFormat destFormat, uint8_t *pixels, int pixelStride, Draw::ReadbackMode mode, const char *tag);
 	void CopyImageToMemorySync(VkImage image, int mipLevel, int x, int y, int w, int h, Draw::DataFormat destFormat, uint8_t *pixels, int pixelStride, const char *tag);
@@ -396,11 +401,11 @@ public:
 		data.stencil.stencilRef = refValue;
 	}
 
-	void SetBlendFactor(uint32_t color) {
+	void SetBlendFactor(const float color[4]) {
 		_dbg_assert_(curRenderStep_ && curRenderStep_->stepType == VKRStepType::RENDER);
 		VkRenderData &data = curRenderStep_->commands.push_uninitialized();
 		data.cmd = VKRRenderCommand::BLEND;
-		data.blendColor.color = color;
+		memcpy(data.blendColor.color, color, sizeof(data.blendColor.color));
 	}
 
 	void PushConstants(VkShaderStageFlags stages, int offset, int size, void *constants) {
@@ -628,6 +633,8 @@ private:
 	std::condition_variable compileCond_;
 	std::mutex compileQueueMutex_;
 	std::vector<CompileQueueEntry> compileQueue_;
+	// Set while the compile thread turns a batch it took off compileQueue_ into tasks.
+	bool compileScheduling_ = false;
 
 	// Thread for measuring presentation delay.
 	std::thread presentWaitThread_;

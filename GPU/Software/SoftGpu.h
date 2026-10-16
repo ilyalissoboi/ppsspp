@@ -20,7 +20,7 @@
 #include <cstdint>
 
 #include "GPU/GPUCommon.h"
-#include "GPU/GPUCommon.h"
+#include "GPU/Common/DepthSwizzle.h"
 #include "Common/GPU/thin3d.h"
 
 struct FormatBuffer {
@@ -56,7 +56,31 @@ struct FormatBuffer {
 	}
 };
 
-enum class SoftDirty : uint64_t {
+// The depth buffer, stored in VRAM as the GE stores it (GPU/Common/DepthSwizzle.h).
+struct DepthBuffer {
+	// VRAM's start, and the buffer's offset in it.
+	u8 *vram = nullptr;
+	uint32_t base = 0;
+	DepthLayout layout;
+	// sceGeEdramSetAddrTranslation's value, which with the color format picks the layout.
+	uint32_t translation = 0x400;
+
+	inline u16 *Get16Ptr(int x, int y, int stride) const {
+		return (u16 *)(vram + layout.Stored(base + (uint32_t)(x + y * stride) * 2));
+	}
+	inline u16 Get16(int x, int y, int stride) const {
+		return *Get16Ptr(x, y, stride);
+	}
+	inline void Set16(int x, int y, int stride, u16 v) const {
+		*Get16Ptr(x, y, stride) = v;
+	}
+	// Whether the four depths from x in row y are stored together: unless they cross the end of a 16-pixel run.
+	inline bool Contiguous4(int x, int y, int stride) const {
+		return ((base + (uint32_t)(x + y * stride) * 2) & 31) <= 24;
+	}
+};
+
+enum class SoftDirty : uint32_t {
 	NONE = 0,
 
 	PIXEL_BASIC = 1ULL << 0,
@@ -131,23 +155,28 @@ public:
 	u32 CheckGPUFeatures() const override { return 0; }
 	void ExecuteOp(u32 op, u32 diff) override;
 	void FinishDeferred() override;
+	void FlushPendingDrawing() override;
 	int ListSync(int listid, int mode) override;
 	u32 DrawSync(int mode) override;
 	void UpdateCmdInfo() override {}
 
 	void SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format) override;
+	uint32_t SetAddrTranslation(uint32_t value) override;
+	bool CopyBlockTransfer(u32 srcBasePtr, u32 srcStride, int srcX, int srcY, u32 dstBasePtr, u32 dstStride, int dstX, int dstY, int width, int height, int bpp) override;
+	void DoState(PointerWrap &p) override;
 	void SetCurFramebufferDirty(bool dirty) override {}
 	void PrepareCopyDisplayToOutput(const DisplayLayoutConfig &config) override;
 	void CopyDisplayToOutput(const DisplayLayoutConfig &config) override;
 	void GetStats(StringWriter &w) override;
 	std::vector<const VirtualFramebuffer *> GetFramebufferList() const override { return std::vector<const VirtualFramebuffer *>(); }
 	void InvalidateCache(u32 addr, int size, GPUInvalidationType type) override;
-	void PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format) override;
+	void PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format, int rectWidth) override;
 	bool PerformMemoryCopy(u32 dest, u32 src, int size, GPUCopyFlag flags = GPUCopyFlag::NONE) override;
 	bool PerformMemorySet(u32 dest, u8 v, int size) override;
 	bool PerformReadbackToMemory(u32 dest, int size) override;
 	bool PerformWriteColorFromMemory(u32 dest, int size) override;
 	bool PerformWriteStencilFromMemory(u32 dest, int size, WriteStencil flags) override;
+	bool PerformReadbackStencilToMemory(u32 dest, int size) override;
 
 	void DeviceLost() override;
 	void DeviceRestore(Draw::DrawContext *draw) override;
@@ -173,16 +202,18 @@ public:
 	bool GetCurrentTexture(GPUDebugBuffer &buffer, int level, bool *isFramebuffer) override;
 	bool GetCurrentClut(GPUDebugBuffer &buffer) override;
 
-	bool DescribeCodePtr(const u8 *ptr, std::string &name) override;
 
 	void Execute_BlockTransferStart(u32 op, u32 diff);
 	void Execute_Prim(u32 op, u32 diff);
+	int RunVertexCount(u32 count, u32 vertexSize);
 	void Execute_Bezier(u32 op, u32 diff);
 	void Execute_Spline(u32 op, u32 diff);
 	void Execute_LoadClut(u32 op, u32 diff);
 	void Execute_FramebufPtr(u32 op, u32 diff);
 	void Execute_FramebufFormat(u32 op, u32 diff);
 	void Execute_ZbufPtr(u32 op, u32 diff);
+	void UpdateDepthBuffer();
+	void Execute_TexFlush(u32 op, u32 diff);
 	void Execute_VertexType(u32 op, u32 diff);
 
 	// Overridden to change flushing behavior.
@@ -214,6 +245,8 @@ protected:
 	void FastRunLoop(DisplayList &list) override;
 	void CopyToCurrentFboFromDisplayRam(const DisplayLayoutConfig &config, int srcwidth, int srcheight);
 	void ConvertTextureDescFrom16(Draw::TextureDesc &desc, int srcwidth, int srcheight, const uint16_t *overrideData = nullptr);
+	bool DarkStalkersStretchActive() const;
+	void GetDarkStalkersDisplay(GPUDebugBuffer &buffer);
 
 	void BuildReportingInfo() override {}
 
@@ -243,7 +276,7 @@ private:
 // TODO: These shouldn't be global.
 extern uint8_t clut[1024];
 extern FormatBuffer fb;
-extern FormatBuffer depthbuf;
+extern DepthBuffer depthbuf;
 
 // Type for the DarkStalkers stretch replacement.
 enum class DSStretch {

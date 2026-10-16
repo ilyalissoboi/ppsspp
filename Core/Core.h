@@ -281,9 +281,13 @@ enum class FPUExceptionType {
 	DIVIDE_BY_ZERO,
 };
 
-void Core_MemoryException(u32 address, u32 accessSize, u32 pc, MemoryExceptionType type, std::string_view additionalInfo = "");
+// halting: the caller stops emulation whatever the configured action, so the exception is recorded
+// for the crash screen even when the action is to ignore it.
+void Core_MemoryException(u32 address, u32 accessSize, u32 pc, MemoryExceptionType type, std::string_view additionalInfo = "", bool halting = false);
 void Core_ExecException(u32 address, u32 pc, ExecExceptionType type);
 void Core_BreakException(u32 pc);
+// For HLE that finds it can't go on (a corrupt callback stack, a failed LoadExec) and stops the core.
+void Core_HLEError(std::string_view message);
 // Only called for exceptions the game has unmasked in fcr31 - a masked one just sets the flag bit
 // and produces the IEEE default result, without coming through here.
 void Core_FPUException(u32 pc, FPUExceptionType type);
@@ -301,9 +305,19 @@ struct DebugScreenshotDesc {
 	u32 height;
 	GEBufferFormat format;
 };
+// Which of the host's output streams a piece of emulated output belongs on.
+enum class DebugOutputChannel {
+	Debug,   // The "emulator:" devctl channel, plus our own messages about the run. This is what pspautotests uses.
+	StdOut,  // sceIoWrite() to fd 1, and to a tty device.
+	StdErr,  // sceIoWrite() to fd 2.
+};
+
 void Core_SendDebugOutput(LogLevel level, std::string_view string);
+// Offers raw output from the emulated program to the listener, if any. Returns false if there was
+// none, in which case the caller should log it instead - that's what the normal app does.
+bool Core_SendHostOutput(DebugOutputChannel channel, std::string_view string);
 void Core_SendDebugScreenshot(const DebugScreenshotDesc &desc);
-void Core_RegisterDebugOutputListeners(std::function<void(std::string_view)> listener, std::function<void(const DebugScreenshotDesc &)> screenshotListener);
+void Core_RegisterDebugOutputListeners(std::function<void(DebugOutputChannel, std::string_view)> listener, std::function<void(const DebugScreenshotDesc &)> screenshotListener);
 
 class MIPSState;
 // Shortcut, just calls Core_MemoryException with automatically determined parameters (function name, etc).
@@ -315,6 +329,7 @@ enum class MIPSExceptionType {
 	BREAK,
 	BAD_EXEC_ADDR,
 	FPU,
+	HLE,
 };
 
 struct MIPSExceptionInfo {

@@ -189,7 +189,7 @@ static std::string DescribeFormat(GPUDebugBufferFormat fmt) {
 
 // Note: Calls req.Respond().  Other data can be added afterward.
 static bool StreamBufferToBase64(DebuggerRequest &req, const GPUDebugBuffer &buf, bool isFramebuffer) {
-	size_t length = buf.GetStride() * buf.GetHeight();
+	size_t length = buf.GetStride() * buf.GetHeight() * buf.PixelSize();
 
 	auto &json = req.Respond();
 	json.writeInt("width", buf.GetStride());
@@ -278,7 +278,12 @@ static void GenericStreamBuffer(DebuggerRequest &req, std::function<bool(const G
 void WebSocketGPUBufferScreenshot(DebuggerRequest &req) {
 	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
 		*isFramebuffer = false;
-		return GPUStepping::GPU_GetOutputFramebuffer(buf);
+		if (GPUStepping::GPU_GetOutputFramebuffer(buf)) {
+			return true;
+		}
+		// Without a backbuffer (headless Vulkan), the displayed PSP framebuffer is the closest thing.
+		*isFramebuffer = true;
+		return GPUStepping::GPU_GetCurrentFramebuffer(buf, GPU_DBG_FRAMEBUF_DISPLAY);
 	});
 }
 

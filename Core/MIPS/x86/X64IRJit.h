@@ -57,6 +57,8 @@ public:
 	void InvalidateBlock(IRBlockCache *irBlockCache, int block_num) override;
 
 protected:
+	void GetFixedCodeLabels(std::vector<IRNativeFixedCodeLabel> &labels) const override;
+
 	const CodeBlockCommon &CodeBlock() const override {
 		return *this;
 	}
@@ -115,7 +117,6 @@ private:
 	void CompIR_Transfer(IRInst inst) override;
 	void CompIR_VecArith(IRInst inst) override;
 	void CompIR_VecAssign(IRInst inst) override;
-	void CompIR_VecClamp(IRInst inst) override;
 	void CompIR_VecHoriz(IRInst inst) override;
 	void CompIR_VecLoad(IRInst inst) override;
 	void CompIR_VecPack(IRInst inst) override;
@@ -142,6 +143,8 @@ private:
 
 	const u8 *saveStaticRegisters_ = nullptr;
 	const u8 *loadStaticRegisters_ = nullptr;
+	// See GenerateX64VfpuDot().
+	const u8 *vfpuDot_ = nullptr;
 
 	typedef struct { float f[4]; } Float4Constant;
 	struct Constants {

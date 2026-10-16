@@ -29,6 +29,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Swap.h"
 #include "Core/Opcode.h"
+#include "GPU/Common/DepthSwizzle.h"
 
 // PPSSPP is very aggressive about trying to do memory accesses directly, for speed.
 // This can be a problem when debugging though, as stray memory reads and writes will
@@ -83,6 +84,9 @@ extern u8 *base;
 // This replaces RAM_NORMAL_SIZE at runtime.
 extern u32 g_MemorySize;
 extern u32 g_PSPModel;
+// Size of RAM (from 0x08000000) that the user partition may extend into. 0 means all of g_MemorySize.
+// Smaller only for homebrew on a PSP-2000+ that doesn't ask for the extra RAM (see CPU_Init).
+extern u32 g_UserPartitionSize;
 
 // UWP has such limited memory management that we need to mask
 // even in 64-bit mode. Also, when using the sanitizer, we need to mask as well.
@@ -104,7 +108,44 @@ enum {
 	// This wraparound should work for PSP too.
 	MEMVIEW32_MASK  = 0x3FFFFFFF,
 #endif
+
+	// Index mask for the block shadow (see blockShadow below). Dropping bits 30-31 folds the
+	// kernel and uncached mirrors onto the same entry, the way they share physical memory.
+	// Where address space is short, bits 28-29 are dropped too, so garbage PCs with those bits
+	// set alias real code instead of faulting.
+#if PPSSPP_ARCH(64BIT) && !PPSSPP_PLATFORM(IOS) && !PPSSPP_PLATFORM(SWITCH)
+	BLOCK_SHADOW_MASK = 0x3FFFFFFF,
+#else
+	BLOCK_SHADOW_MASK = 0x0FFFFFFF,
+#endif
+	// For looking up an entry from a PC. A misaligned PC would otherwise read across two entries, and
+	// jump to a garbage offset.
+	BLOCK_SHADOW_ENTRY_MASK = BLOCK_SHADOW_MASK & ~3,
 };
+
+enum : u32 {
+	// The block shadow value for a replacement hook when no JIT is running, and for the IR
+	// interpreter, which keeps this offset in its arena empty.
+	BLOCK_SHADOW_HOOK_NO_JIT = 1,
+};
+
+// One u32 per guest instruction, at the same byte offset as the instruction (after masking with
+// BLOCK_SHADOW_MASK). Holds the JIT's handle for the block starting there, 0 for none, or the
+// replacement hook value (see ReplaceTables.h).
+// Only the ranges backed by PSP memory are committed, so it's never safe to touch an entry for
+// an address that isn't valid. Reallocated by Init(), along with base.
+extern u8 *blockShadow;
+
+inline u32 *GetBlockShadowEntry(u32 address) {
+	return (u32 *)(blockShadow + (address & BLOCK_SHADOW_ENTRY_MASK));
+}
+
+// These check the address, and are safe to call when there's no shadow (after Shutdown()).
+u32 ReadBlockShadow(u32 address);
+void WriteBlockShadow(u32 address, u32 value);
+// Clears the entry only if it still holds value, back to the hook value if the address is hooked.
+// Returns true if it did.
+bool ClearBlockShadow(u32 address, u32 value);
 
 enum {
 	MV_MIRROR_PREVIOUS = 1,
@@ -136,14 +177,9 @@ void DoState(PointerWrap &p);
 // False when shutdown has already been called.
 bool IsActive();
 
-// used by JIT to read instructions. Does not resolve replacements.
-Opcode Read_Opcode_JIT(const u32 _Address);
-// used by JIT. Reads in the "Locked cache" mode
-void Write_Opcode_JIT(const u32 _Address, const Opcode& _Value);
-
-// Should be used by analyzers, disassemblers etc. Does resolve replacements.
-Opcode Read_Instruction(const u32 _Address, bool resolveReplacements = false);
-Opcode ReadUnchecked_Instruction(const u32 _Address, bool resolveReplacements = false);
+Opcode Read_Instruction(const u32 _Address);
+// Caller checks that the address is valid.
+Opcode ReadUnchecked_Instruction(const u32 _Address);
 
 u8  ReadOrException_U8(const u32 _Address);
 u16 ReadOrException_U16(const u32 _Address);
@@ -189,7 +225,25 @@ inline float ReadUnchecked_Float(const u32 address) {
 #endif
 }
 
-inline u16 ReadUnchecked_U16(const u32 address) {
+// With the software renderer, which stores depth as the GE does, VRAM's 0x04200000 and 0x04600000 mirrors show it
+// through the GE's 16-bit and 32-bit color layouts (GPU/Common/DepthSwizzle.h, ppsspp-re geprobe exp88). Only 16-bit
+// accesses go through them: games read and write depth with nothing else. The layouts are fixed but for the EDRAM
+// address translation, which the software renderer keeps here as DepthTranslationIndex().
+extern int g_depthTranslationIndex;
+
+// Whether the depth mirrors apply the layouts: only with the software renderer. Hardware renderers keep depth
+// plain and handle the games that need the layout their own way.
+bool DepthMirrorsActive();
+u32 DepthMirroredSlow(u32 address);
+
+inline u32 DepthMirrored16(u32 address) {
+	if ((address & 0xBFA00000) == 0x04200000)
+		return DepthMirroredSlow(address);
+	return address;
+}
+
+inline u16 ReadUnchecked_U16(u32 address) {
+	address = DepthMirrored16(address);
 #ifdef MASKED_PSP_MEMORY
 	return *(u16_le *)(base + (address & MEMVIEW32_MASK));
 #else
@@ -230,6 +284,7 @@ inline void WriteUnchecked_Float(float data, u32 address) {
 }
 
 inline void WriteUnchecked_U16(u16 data, u32 address) {
+	address = DepthMirrored16(address);
 #ifdef MASKED_PSP_MEMORY
 	*(u16_le *)(base + (address & MEMVIEW32_MASK)) = data;
 #else
@@ -673,6 +728,8 @@ constexpr u32 PSP_GetScratchpadMemoryEnd() { return 0x00014000;}
 
 constexpr u32 PSP_GetKernelMemoryBase() { return 0x08000000;}
 inline u32 PSP_GetUserMemoryEnd() { return PSP_GetKernelMemoryBase() + Memory::g_MemorySize;}
+// Where the user memory partition ends. Usually PSP_GetUserMemoryEnd(), which is the end of mapped RAM.
+inline u32 PSP_GetUserPartitionEnd() { return PSP_GetKernelMemoryBase() + (Memory::g_UserPartitionSize ? Memory::g_UserPartitionSize : Memory::g_MemorySize); }
 constexpr u32 PSP_GetKernelMemoryEnd() { return 0x08400000;}
 
 // "Volatile" RAM is between 0x08400000 and 0x08800000, can be requested by the

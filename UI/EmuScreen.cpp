@@ -105,7 +105,17 @@ using namespace std::placeholders;
 static AVIDump avi;
 #endif
 
-extern bool g_TakeScreenshot;
+class FadingChatButton : public UI::ChoiceWithValueDisplay {
+public:
+	using UI::ChoiceWithValueDisplay::ChoiceWithValueDisplay;
+
+	void Draw(UIContext &dc) override {
+		float opacity = g_Config.bShowTouchControls ? GamepadGetOpacity() : 1.0f;
+		dc.Draw()->PushAlpha(opacity);
+		UI::ChoiceWithValueDisplay::Draw(dc);
+		dc.Draw()->PopAlpha();
+	}
+};
 
 // Handles control rotation due to internal screen rotation.
 void EmuScreen::UpdatePSPButtons(uint32_t bitsToSet, uint32_t bitsToClear) {
@@ -282,17 +292,16 @@ void EmuScreen::ProcessGameBoot(const Path &filename) {
 
 	CoreParameter coreParam{};
 	coreParam.cpuCore = (CPUCore)g_Config.iCpuCore;
+	coreParam.bUseVertexDecoderJit = System_GetPropertyBool(SYSPROP_CAN_JIT);
 	coreParam.gpuCore = GPUCORE_GLES;
 	switch (GetGPUBackend()) {
 	case GPUBackend::DIRECT3D11:
 		coreParam.gpuCore = GPUCORE_DIRECTX11;
 		break;
-#if !PPSSPP_PLATFORM(UWP)
-#if PPSSPP_API(ANY_GL)
 	case GPUBackend::OPENGL:
 		coreParam.gpuCore = GPUCORE_GLES;
 		break;
-#endif
+#if !PPSSPP_PLATFORM(UWP)
 	case GPUBackend::VULKAN:
 		coreParam.gpuCore = GPUCORE_VULKAN;
 		break;
@@ -742,6 +751,23 @@ void EmuScreen::ProcessVKey(VirtKey virtKey, bool down) {
 	case VIRTKEY_SCREENSHOT:
 		if (down) {
 			TakeUserScreenshot();
+		}
+		break;
+
+	case VIRTKEY_CREATE_FRAME_DUMP:
+		if (down) {
+			if (!gpu) {
+				return;
+			}
+			gpu->GetRecorder()->RecordNextFrame([](const Path &dumpPath) {
+				NOTICE_LOG(Log::System, "Frame dump created at '%s'", dumpPath.c_str());
+				g_OSD.Show(OSDType::MESSAGE_SUCCESS, GetFriendlyPath(dumpPath), 7.0f, "framedump");
+				if (System_GetPropertyBool(SYSPROP_CAN_SHOW_FILE)) {
+					g_OSD.SetClickCallback("framedump", [dumpPath]() {
+						System_ShowFileInFolder(dumpPath);
+					});
+				}
+			});
 		}
 		break;
 
@@ -1266,7 +1292,7 @@ void EmuScreen::CreateViews() {
 		if (g_Config.iChatButtonPosition != 8) {
 			auto n = GetI18NCategory(I18NCat::NETWORKING);
 			AnchorLayoutParams *layoutParams = AnchorInCorner(bounds, g_Config.iChatButtonPosition, 80.0f, 50.0f);
-			chatButton_ = root_->Add(new ChoiceWithValueDisplay(&newChatMessages_, n->T("Chat"), layoutParams));
+			chatButton_ = root_->Add(new FadingChatButton(&newChatMessages_, n->T("Chat"), layoutParams));
 			chatButton_->OnClick.Add([this](UI::EventParams &e) {
 				// Really, the check here should be "has a hard keyboard".
 				bool focus = System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_DESKTOP;

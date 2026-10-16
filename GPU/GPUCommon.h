@@ -28,6 +28,7 @@
 class FramebufferManagerCommon;
 class TextureCacheCommon;
 class DrawEngineCommon;
+class VertexDecoder;
 class GraphicsContext;
 struct PspGeListArgs;
 struct GEState;
@@ -55,6 +56,8 @@ inline bool IsTrianglePrim(GEPrimitiveType prim) {
 struct TransformStats;
 class GPUCommon {
 public:
+	GPUCommon(const GPUCommon &) = delete;
+	GPUCommon &operator=(const GPUCommon &) = delete;
 	// The constructor might run on the loader thread.
 	GPUCommon(GraphicsContext *gfxCtx, Draw::DrawContext *draw);
 	virtual ~GPUCommon() = default;
@@ -126,6 +129,8 @@ public:
 	virtual bool GetMatrix24(GEMatrixType type, u32_le *result, u32 cmdbits);
 	virtual void ResetMatrices();
 	virtual void DoState(PointerWrap &p);
+	// Finishes drawing still queued for PSP memory (the software renderer can hold some past a stall).
+	virtual void FlushPendingDrawing() {}
 	bool BusyDrawing();
 	u32 Continue(bool *runList);
 	u32 Break(int mode);
@@ -139,7 +144,7 @@ public:
 	// For example, a debugger is active.
 	bool ShouldSplitOverGe() const;
 
-	uint32_t SetAddrTranslation(uint32_t value);
+	virtual uint32_t SetAddrTranslation(uint32_t value);
 	uint32_t GetAddrTranslation();
 
 	virtual void SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format) = 0;
@@ -159,8 +164,17 @@ public:
 	virtual bool PerformReadbackToMemory(u32 dest, int size);
 	virtual bool PerformWriteColorFromMemory(u32 dest, int size);
 
-	virtual void PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format);
+	// width is the stride. rectWidth, if set, is how many pixels of each row were written, which lets
+	// a write that starts partway into a framebuffer row be uploaded without clobbering the rest.
+	virtual void PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format, int rectWidth = 0);
 	virtual bool PerformWriteStencilFromMemory(u32 dest, int size, WriteStencil flags);
+	// Reads the stencil of whole framebuffer rows into the alpha bytes in RAM, leaving the color alone.
+	// For games that test stencil with the CPU. Only 8888 for now.
+	virtual bool PerformReadbackStencilToMemory(u32 dest, int size);
+
+	// Tells the texture cache that a block copy moved pixels, so it can carry "this is video" from
+	// the source to the destination. Cheap and safe to call for any copy.
+	void NotifyVideoCopy(u32 dest, u32 src, int size);
 
 	virtual void ExecuteOp(u32 op, u32 diff) = 0;
 
@@ -183,6 +197,25 @@ public:
 	void Execute_Unknown(u32 op, u32 diff);
 
 	static int EstimatePerVertexCost();
+	// Fill time for a through-mode rectangle draw textured from a decoded video frame, or (when
+	// enabled) a clear. Zero for anything else. We don't model fill rate in general, but a movie
+	// player can be paced by it.
+	int EstimateFillCycles(GEPrimitiveType prim, const void *verts, const void *inds, int count, const VertexDecoder *dec, u32 vertType) const;
+
+	// Memory a video decoder has written a frame into recently (PerformWriteFormattedFromMemory),
+	// or a copy of such a frame (NotifyVideoCopy). An entry ages out a few flips after its last write.
+	struct VideoInfo {
+		u32 addr;
+		u32 size;
+		int flips;
+	};
+	bool IsVideo(u32 addr) const;
+	bool VideoIsPlaying() const {
+		return !videos_.empty();
+	}
+	const std::vector<VideoInfo> &Videos() const {
+		return videos_;
+	}
 
 	virtual void Flush();
 
@@ -226,6 +259,9 @@ public:
 
 	DisplayList* getList(int listid) {
 		return &dls[listid];
+	}
+	bool IsValidListId(int listid) const {
+		return listid >= 0 && listid < DisplayListMaxCount;
 	}
 
 	const std::list<int> &GetDisplayListQueue() {
@@ -311,11 +347,17 @@ protected:
 	virtual void FastRunLoop(DisplayList &list) = 0;
 
 	bool SlowRunLoop(DisplayList &list);  // Returns false on breakpoint.
+	// Counts the cycles of the commands run since the last update, up to currentPC, and continues at newPC: the
+	// commands between are skipped (a jump), not run. Commands consumed by hand go before currentPC.
 	void UpdatePC(u32 currentPC, u32 newPC);
 	void UpdateState(GPURunState state);
 	void FastLoadBoneMatrix(u32 target);
 	void FlushImm();
 	void DoBlockTransfer(u32 skipDrawReason);
+	// Does a block transfer's copy itself and returns true, when the backend needs to.
+	virtual bool CopyBlockTransfer(u32 srcBasePtr, u32 srcStride, int srcX, int srcY, u32 dstBasePtr, u32 dstStride, int dstX, int dstY, int width, int height, int bpp) {
+		return false;
+	}
 
 	// TODO: Unify this. Vulkan and OpenGL are different due to how they buffer data.
 	virtual void FinishDeferred() {}
@@ -351,6 +393,10 @@ protected:
 	bool isbreak;  // This doesn't mean debugger breakpoints.
 	u64 drawCompleteTicks;
 	u64 busyTicks;
+
+	void NoteVideoRange(u32 addr, u32 size);
+	void DecimateVideos();
+	std::vector<VideoInfo> videos_;
 
 	int downcount;
 	u64 startingTicks;
@@ -424,5 +470,5 @@ protected:
 private:
 	void DoExecuteCall(u32 target);
 	void PopDLQueue();
-	void CheckDrawSync();
+	void CompleteFailedList(DisplayList &list);
 };

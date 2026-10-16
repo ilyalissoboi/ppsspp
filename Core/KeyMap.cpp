@@ -515,6 +515,7 @@ const KeyMap_IntStrPair psp_button_names[] = {
 	{VIRTKEY_TEXTURE_REPLACE, "Texture Replacement"},
 	{VIRTKEY_SCREENSHOT, "Screenshot"},
 	{VIRTKEY_MUTE_TOGGLE, "Mute toggle"},
+	{VIRTKEY_CREATE_FRAME_DUMP, "Create frame dump"},
 
 #ifdef OPENXR
 	{VIRTKEY_VR_CAMERA_ADJUST, "VR camera adjust"},
@@ -612,6 +613,17 @@ bool InputMappingToPspButton(const InputMapping &mapping, std::vector<int> *pspB
 		}
 	}
 	return found;
+}
+
+void GetAllComboMappingsNoLock(std::vector<MultiInputMapping> *combos) {
+	combos->clear();
+	for (const auto &iter : g_controllerMap) {
+		for (const auto &mapping : iter.second) {
+			if (mapping.mappings.size() > 1) {
+				combos->push_back(mapping);
+			}
+		}
+	}
 }
 
 // This is the main workhorse of the ControlMapper.

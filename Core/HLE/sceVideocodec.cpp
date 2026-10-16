@@ -26,11 +26,15 @@
 // by looking at sceMpegBaseYCrCbCopy output on a real PSP.
 
 #include <algorithm>
+#include <cstring>
 #include <map>
+#include <utility>
 #include <vector>
 
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
+#include "Core/CoreTiming.h"
+#include "Core/System.h"
 #include "Core/HLE/ErrorCodes.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/FunctionWrappers.h"
@@ -38,6 +42,7 @@
 #include "Core/Util/BlockAllocator.h"
 #include "Core/HLE/sceMpeg.h"
 #include "Core/HLE/sceMpegbase.h"
+#include "Core/HLE/scePower.h"
 #include "Core/HW/AvcDecoder.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
@@ -97,40 +102,45 @@ struct VideocodecCtx {
 
 static std::map<u32, VideocodecCtx> g_videocodecCtxs;
 
-// The Media Engine's own 2MB of embedded DRAM, modelled as memory of ours.
+// The Media Engine's own memory, modelled as an address space rather than a pool of blocks.
 //
-// The main CPU cannot address it. mpeg.prx asks for a block with sceVideocodecGetEDRAM, keeps the value
-// and hands it back, and never dereferences it; the frame buffers the ME reports back live in here
-// too, which is why sceVideocodecSetMemory is given a frame size rather than a buffer - 480, 272
-// and a count of 2 for a full-screen movie, with nowhere for the caller to say where to put them.
-//
-// The addresses handed out are offsets into g_meRam, based well outside anything PSP RAM maps so
-// that a stray dereference faults where it happens instead of quietly reading the game's memory.
-// Being outside PSP RAM, the contents aren't in the memory a savestate captures either, so the
-// block and its allocator go in __VideocodecDoState.
-static const u32 ME_EDRAM_BASE = 0xC0000000;
-static const u32 ME_EDRAM_SIZE = 2 * 1024 * 1024;
+// mpeg.prx bounds-checks the ones it uses against 0x3FFFFF (4MB). However only 2MB are available
+// for the ME: the rest of the EDRAM is actually allocated to the GPU on a real PSP in the default
+// configuration, which is what we emulate. DMA:s can arrive in multiple pieces so this has to be
+// a "real" separate address space, so a subsequent larger read will work.
+static const u32 ME_MEM_SIZE = 2 * 1024 * 1024;
+// What we hand out ourselves lives in the top half, out of the way of the addresses mpeg.prx
+// picks for itself, which have all been well down in the first megabyte.
+static const u32 ME_ALLOC_BASE = ME_MEM_SIZE / 2;
 static std::vector<u8> g_meRam;
 static BlockAllocator g_meAlloc(64);
 
-// The 2MB is only committed once something asks for a piece of it, so a game that never plays a
-// video pays nothing for this and its savestates don't carry it.
+// Only committed once something asks for a piece of it, so a game that never plays a video pays
+// nothing for this and its savestates don't carry it.
 static void MEEnsureRam() {
-	if (g_meRam.size() != ME_EDRAM_SIZE) {
-		g_meRam.assign(ME_EDRAM_SIZE, 0);
-		g_meAlloc.Init(ME_EDRAM_BASE, ME_EDRAM_SIZE, false);
+	if (g_meRam.size() != ME_MEM_SIZE) {
+		g_meRam.assign(ME_MEM_SIZE, 0);
+		g_meAlloc.Init(ME_ALLOC_BASE, ME_MEM_SIZE - ME_ALLOC_BASE, false);
 	}
 }
 
-u8 *VideocodecMEPointer(u32 addr, u32 size) {
-	if (addr < ME_EDRAM_BASE || size > ME_EDRAM_SIZE || g_meRam.size() != ME_EDRAM_SIZE) {
-		return nullptr;
-	}
-	const u32 offset = addr - ME_EDRAM_BASE;
-	if (offset > ME_EDRAM_SIZE - size) {
-		return nullptr;
-	}
-	return g_meRam.data() + offset;
+// When the Media Engine finishes the last job it was given. Not serialized: after a load it's
+// simply free.
+static s64 g_meBusyUntilUs;
+
+int MEScheduleJob(int us) {
+	const s64 now = CoreTiming::GetGlobalTimeUs();
+	const s64 start = std::max(now, g_meBusyUntilUs);
+	g_meBusyUntilUs = start + us;
+	return (int)(g_meBusyUntilUs - now);
+}
+
+bool MEIsValidRange(u32 addr, u32 size) {
+	return g_meRam.size() == ME_MEM_SIZE && addr < ME_MEM_SIZE && size <= ME_MEM_SIZE - addr;
+}
+
+u8 *MEGetPointerRange(u32 addr, u32 size) {
+	return MEIsValidRange(addr, size) ? g_meRam.data() + addr : nullptr;
 }
 
 static void FreeContext(VideocodecCtx &ctx) {
@@ -162,8 +172,10 @@ static void ClearContexts(bool freeMemory) {
 }
 
 void __VideocodecInit() {
-	// Nothing to free: a boot starts with a fresh allocator.
-	g_videocodecCtxs.clear();
+	// The decoders have to be deleted; the ME blocks they hold don't need freeing individually,
+	// since the allocator is emptied right below.
+	ClearContexts(false);
+	g_meBusyUntilUs = 0;
 	g_meRam.clear();
 	g_meRam.shrink_to_fit();
 	g_meAlloc.Shutdown();
@@ -174,8 +186,21 @@ void __VideocodecShutdown() {
 }
 
 void __VideocodecDoState(PointerWrap &p) {
+	if (p.mode == p.MODE_READ) {
+		// Not serialized, and the clock it was measured against just moved (maybe backwards).
+		g_meBusyUntilUs = 0;
+	}
+
 	auto s = p.Section("sceVideocodec", 0, 1);
 	if (!s) {
+		if (p.mode == p.MODE_READ) {
+			// A state from before this module. Don't keep the contexts and ME memory of the session
+			// before the load.
+			ClearContexts(false);
+			g_meRam.clear();
+			g_meRam.shrink_to_fit();
+			g_meAlloc.Shutdown();
+		}
 		return;
 	}
 
@@ -227,9 +252,13 @@ u32 VideocodecFrameBufferLayout(int width, int height, int sizes[8], u32 offsets
 	// buffer0/2 take the odd band out when the width isn't a multiple of 32.
 	const int lumaLeft = ((width + 16) >> 5) * (height >> 1) * 16;
 	const int lumaRight = (width >> 5) * (height >> 1) * 16;
+	// Chroma is paired like luma (left/right of a band, then even/odd rows), which is what
+	// sceMpegBaseYCrCbCopy's flags assume: bit 0 selects buffers 0,1,4,5 and bit 1 selects 2,3,6,7.
+	// The sizes have to match that, or a copy writes the wrong count into a buffer someone else
+	// sized.
 	const int local[8] = {
 		lumaLeft, lumaRight, lumaLeft, lumaRight,
-		lumaLeft >> 1, lumaLeft >> 1, lumaRight >> 1, lumaRight >> 1,
+		lumaLeft >> 1, lumaRight >> 1, lumaLeft >> 1, lumaRight >> 1,
 	};
 	u32 total = 0;
 	for (int i = 0; i < 8; i++) {
@@ -244,9 +273,8 @@ u32 VideocodecFrameBufferLayout(int width, int height, int sizes[8], u32 offsets
 	return total;
 }
 
-// The descriptor mpeg.prx passes in is empty: on hardware the ME owns the frame buffers, and
-// reports where it put them. So allocate them here and fill the descriptor in the shape
-// sceMpegBaseCscAvc expects - dimensions in macroblocks, then the eight buffer addresses.
+// The descriptor mpeg.prx passes in is empty: on hardware the ME owns the frame buffers and
+// reports where it put them. So allocate them here and fill in the eight buffer addresses.
 static bool PublishFrameBuffers(VideocodecCtx &vctx, u32 structAddr, int width, int height, u32 buffers[8]) {
 	u32 offsets[8];
 	const u32 total = VideocodecFrameBufferLayout(width, height, nullptr, offsets);
@@ -278,13 +306,15 @@ static bool PublishFrameBuffers(VideocodecCtx &vctx, u32 structAddr, int width, 
 		buffers[i] = vctx.frameBuffers + offsets[i];
 	}
 
-	if (!Memory::IsValidRange(structAddr, 48)) {
+	// mpeg.prx reads eight buffer addresses off the front of this structure (`lw` at 0x00..0x1C,
+	// verified in 1.3 at 08805698 and 1.8 at 08805898) and takes the frame dimensions from its own
+	// context. So write only the addresses; anything else at the front lands in slots 0 and 1,
+	// which sceMpegBaseYCrCbCopy then DMAs to.
+	if (!Memory::IsValidRange(structAddr, 8 * 4)) {
 		return false;
 	}
-	Memory::WriteUnchecked_U32(height >> 4, structAddr + 0);   // macroblocks
-	Memory::WriteUnchecked_U32(width >> 4, structAddr + 4);
 	for (int i = 0; i < 8; i++) {
-		Memory::WriteUnchecked_U32(buffers[i], structAddr + 16 + i * 4);
+		Memory::WriteUnchecked_U32(buffers[i], structAddr + i * 4);
 	}
 	return true;
 }
@@ -308,7 +338,7 @@ void VideocodecGetCtxInfo(std::vector<VideocodecCtxInfo> *infos) {
 	}
 }
 
-bool VideocodecGetFrameBuffers(u32 firstBuffer, u32 buffers[8]) {
+bool VideocodecGetFrameBuffers(u32 firstBuffer, u32 buffers[8], int *width, int *height) {
 	// sceMpegbase only has the first of the eight addresses, so find whose allocation it is.
 	const VideocodecCtx *found = nullptr;
 	for (const auto &[addr, ctx] : g_videocodecCtxs) {
@@ -322,6 +352,12 @@ bool VideocodecGetFrameBuffers(u32 firstBuffer, u32 buffers[8]) {
 	}
 	u32 offsets[8];
 	VideocodecFrameBufferLayout(found->frameBufferWidth, found->frameBufferHeight, nullptr, offsets);
+	if (width) {
+		*width = found->frameBufferWidth;
+	}
+	if (height) {
+		*height = found->frameBufferHeight;
+	}
 	for (int i = 0; i < 8; i++) {
 		buffers[i] = found->frameBuffers + offsets[i];
 	}
@@ -355,7 +391,7 @@ static void WriteTiledYCbCr(const u32 *buffers, const AvcDecoder &dec, int width
 		if (ySize[b] <= 0) {
 			continue;
 		}
-		u8 *dst = VideocodecMEPointer(buffers[b], ySize[b]);
+		u8 *dst = MEGetPointerRange(buffers[b], ySize[b]);
 		if (!dst) {
 			continue;
 		}
@@ -377,12 +413,12 @@ static void WriteTiledYCbCr(const u32 *buffers, const AvcDecoder &dec, int width
 		if (cSize[b] <= 0) {
 			continue;
 		}
-		u8 *dst = VideocodecMEPointer(buffers[4 + b], cSize[b]);
+		u8 *dst = MEGetPointerRange(buffers[4 + b], cSize[b]);
 		if (!dst) {
 			continue;
 		}
-		const int xOffset = (b >> 1) ? 8 : 0;
-		const int yStart = (b & 1) ? 1 : 0;
+		const int xOffset = (b & 1) ? 8 : 0;
+		const int yStart = (b >> 1) ? 1 : 0;
 		int j = 0;
 		for (int bandX = xOffset; bandX < width2; bandX += 16) {
 			for (int row = yStart; row < height2; row += 2) {
@@ -399,6 +435,34 @@ static void WriteTiledYCbCr(const u32 *buffers, const AvcDecoder &dec, int width
 	}
 }
 
+// Every call here that reaches the ME blocks while it answers. Measured at 222MHz in pspautotests
+// video/mp4/mp4timing: Open, GetEDRAM, GetVersion and ReleaseEDRAM called directly, the rest through
+// mpeg.prx's thin wrappers. sceMpegCreate (Open, Init, GetVersion, SetMemory) took 26.9-28.0ms,
+// nearly all of it Init and SetMemory, which are charged together to Init here. sceMpegDelete took
+// 21.2ms, and 35.9ms in a run that had stopped the decoder twice first. An sceMpegAvcDecodeStop with
+// nothing held back took 132us (with three pictures to hand over, 4.9ms, the rest being their output).
+static const int openUs = 96;
+static const int getEdramUs = 146;
+static const int getVersionUs = 94;
+static const int releaseEdramUs = 66;
+static const int initUs = 26600;
+static const int stopUs = 132;
+static const int deleteUs = 21000;
+
+static int MECall(int result, const char *reason, int us) {
+	return hleDelayResult(result, reason, MEScheduleJob(PowerScaleFromDefaultClock(us)));
+}
+
+// Init and Delete take tens of milliseconds for the caller, but they don't hold the ME for that
+// long: queueing them there stalled the SAS mix behind them, and with it Jak and Daxter's sound
+// threads, whose last wake to video_sound_thread then came after the game had deleted it
+// (NOT_DORMANT, then the orphan reads a freed context). On hardware SAS keeps mixing through them:
+// pspautotests audio/timing/meshare saw ~1.3ms SAS calls throughout a 39ms sceMpegCreate and a 32ms
+// sceMpegDelete, the longest 2.2ms.
+static int CallerWait(int result, const char *reason, int us) {
+	return hleDelayResult(result, reason, PowerScaleFromDefaultClock(us));
+}
+
 static int sceVideocodecOpen(u32 ctxAddr, int type) {
 	if (!Memory::IsValidRange(ctxAddr, 96)) {
 		return hleLogError(Log::ME, -1, "bad context pointer");
@@ -408,7 +472,11 @@ static int sceVideocodecOpen(u32 ctxAddr, int type) {
 		return hleLogError(Log::ME, -1, "built without ffmpeg, can't decode video");
 	}
 	g_videocodecCtxs[ctxAddr].type = type;
-	return hleLogInfo(Log::ME, 0, "type %d", type);
+	if (type == 0) {
+		// The EDRAM the decoder needs, which mpeg.prx reads back and passes to GetEDRAM.
+		Memory::WriteUnchecked_U32(0x3c2c, ctxAddr + CTX_EDRAM_SIZE);
+	}
+	return MECall(hleLogInfo(Log::ME, 0, "type %d", type), "videocodec open", openUs);
 }
 
 static int sceVideocodecInit(u32 ctxAddr, int type) {
@@ -421,7 +489,7 @@ static int sceVideocodecInit(u32 ctxAddr, int type) {
 	vctx.decoder = new AvcDecoder();
 	vctx.frameCount = 0;
 	vctx.type = type;
-	return hleLogInfo(Log::ME, 0, "type %d", type);
+	return CallerWait(hleLogInfo(Log::ME, 0, "type %d", type), "videocodec init", initUs);
 }
 
 // See g_meRam for why this doesn't come out of the game's memory.
@@ -446,7 +514,7 @@ static int sceVideocodecGetEDRAM(u32 ctxAddr, int type) {
 	// works in 64-byte grains, so the two only differ in what they mean, not in value.
 	Memory::WriteUnchecked_U32(addr, ctxAddr + CTX_EDRAM);
 	Memory::WriteUnchecked_U32(addr, ctxAddr + CTX_EDRAM_RAW);
-	return hleLogInfo(Log::ME, 0, "%u bytes at %08x in ME memory", size, addr);
+	return MECall(hleLogInfo(Log::ME, 0, "%u bytes at %08x in ME memory", size, addr), "videocodec getedram", getEdramUs);
 }
 
 static int sceVideocodecReleaseEDRAM(u32 ctxAddr) {
@@ -465,7 +533,7 @@ static int sceVideocodecReleaseEDRAM(u32 ctxAddr) {
 	}
 	Memory::WriteUnchecked_U32(0, ctxAddr + CTX_EDRAM);
 	Memory::WriteUnchecked_U32(0, ctxAddr + CTX_EDRAM_RAW);
-	return hleLogInfo(Log::ME, 0, "released %08x", token);
+	return MECall(hleLogInfo(Log::ME, 0, "released %08x", token), "videocodec releaseedram", releaseEdramUs);
 }
 
 static int sceVideocodecDecode(u32 ctxAddr, int type) {
@@ -495,24 +563,21 @@ static int sceVideocodecDecode(u32 ctxAddr, int type) {
 		return hleLogError(Log::ME, -1, "bad output descriptor");
 	}
 
-	// The access unit address mpeg.prx passes is in Media Engine space, which we can't read -
-	// on hardware sceMpegBasePESpacketCopy DMA'd the data there. That copy is ours, so use what
-	// it gathered instead, and fall back to main memory for any caller that points at it
-	// directly.
+	// The access unit mpeg.prx points at is normally in Media Engine memory, which the DMA in
+	// sceMpegBasePESpacketCopy has already filled in, so read it straight from there - auSize is
+	// the length it says it wrote. A caller pointing at main memory instead is served from there.
 	bool gotFrame = false;
 	const u8 *au = nullptr;
 	int auBytes = 0;
-	// Owns the gathered payload for as long as au points into it.
-	std::vector<u8> pes;
-	if (auSize > 0 && Memory::IsValidRange(auAddr, auSize)) {
-		au = Memory::GetTypedPointerRange<u8>(auAddr, auSize);
-		auBytes = auSize;
-	} else {
-		// Take the payload copied to this exact address - the same call carries audio too.
-		pes = MpegBaseTakePESPacket(auAddr);
-		if (!pes.empty()) {
-			au = pes.data();
-			auBytes = (int)pes.size();
+	if (auSize > 0) {
+		au = MEGetPointerRange(auAddr, auSize);
+		if (!au && Memory::IsValidRange(auAddr, auSize)) {
+			au = Memory::GetTypedPointerRange<u8>(auAddr, auSize);
+		}
+		auBytes = au ? auSize : 0;
+		if (!au) {
+			WARN_LOG(Log::ME, "sceVideocodecDecode: %d bytes at %08x is neither game nor ME memory",
+				auSize, auAddr);
 		}
 	}
 	if (au && auBytes > 0) {
@@ -578,16 +643,42 @@ static int sceVideocodecDecode(u32 ctxAddr, int type) {
 		out32(36, published ? 0 : 1);
 	}
 
+	// The decode takes real time on the ME: about 3.4ms for a 480x272 frame on a PSP, measured as
+	// sceMpegAvcDecode (5.8ms) less sceMpegAvcCsc alone (2.4ms), in pspautotests
+	// video/mpeg/playertiming. Movie players that present every decoded frame after a single
+	// vblank wait rely on decode, colour conversion and blit adding up to more than a vblank.
+	// It takes as long when the decoder holds the picture back: the first sceMpegAvcDecode calls of
+	// a stream, which return none, took 4.2-5.4ms in video/mp4/mp4timing. Until a picture has told
+	// us the size, assume full screen.
+	int delayUs = 0;
+	if (auBytes > 0) {
+		const int w = vctx.decoder->Width() > 0 ? vctx.decoder->Width() : 480;
+		const int h = vctx.decoder->Height() > 0 ? vctx.decoder->Height() : 272;
+		delayUs = MEScheduleJob(PowerScaleFromDefaultClock((int)(3400LL * w * h / (480 * 272))));
+	}
+
+	if (delayUs > 0) {
+		return hleDelayResult(hleLogDebug(Log::ME, 0, "type %d, %d bytes -> %s %dx%d",
+			type, auBytes, gotFrame ? "frame" : "no frame yet", width, height), "videocodec decode", delayUs);
+	}
 	return hleLogDebug(Log::ME, 0, "type %d, %d bytes -> %s %dx%d",
 		type, auBytes, gotFrame ? "frame" : "no frame yet", width, height);
 }
+
+// Returning immediately from Stop or Delete is not correct, because a game can be relying on a
+// thread of its own getting to run once more before it tears things down. Jak and Daxter deletes
+// its video_sound_thread straight after sceVideocodecDelete without waiting for it to exit, and
+// with no time passing here the audio thread never gets to deliver the wake that would let it exit
+// - so the delete fails with NOT_DORMANT and the thread lives on, reading a context the game has
+// already freed. One audio mix block is 64 samples at 44100Hz, about 1.45ms, which Delete's
+// measured time is well above.
 
 static int sceVideocodecStop(u32 ctxAddr, int type) {
 	auto it = g_videocodecCtxs.find(ctxAddr);
 	if (it != g_videocodecCtxs.end() && it->second.decoder) {
 		it->second.decoder->Flush();
 	}
-	return hleLogInfo(Log::ME, 0);
+	return MECall(hleLogInfo(Log::ME, 0), "videocodec stop", stopUs);
 }
 
 static int sceVideocodecDelete(u32 ctxAddr, int type) {
@@ -596,7 +687,7 @@ static int sceVideocodecDelete(u32 ctxAddr, int type) {
 		FreeContext(it->second);
 		g_videocodecCtxs.erase(it);
 	}
-	return hleLogInfo(Log::ME, 0);
+	return CallerWait(hleLogInfo(Log::ME, 0), "videocodec delete", deleteUs);
 }
 
 static int sceVideocodecGetVersion(u32 ctxAddr, int type) {
@@ -605,7 +696,7 @@ static int sceVideocodecGetVersion(u32 ctxAddr, int type) {
 	}
 	// The value a real PSP returns, read with JpcspTrace.
 	Memory::WriteUnchecked_U32(0x78, ctxAddr + CTX_VERSION);
-	return hleLogInfo(Log::ME, 0);
+	return MECall(hleLogInfo(Log::ME, 0), "videocodec getversion", getVersionUs);
 }
 
 static int sceVideocodecGetSEI(u32 ctxAddr, int type) {
@@ -624,12 +715,66 @@ static int sceVideocodecSetMemory(u32 ctxAddr, int type) {
 	return hleLogDebug(Log::ME, 0);
 }
 
-static int sceVideocodec_893B32B1(u32 ctxAddr, int type) {
+// 0x893B32B1. mpeg.prx runs this from sceMpegCreate, only in mode 1 (the path where the game reads
+// raw YCbCr out rather than letting sceMpegbase convert to RGB). On hardware it writes back the
+// 0x28-byte output descriptor at ctx+0x10 and issues ME video op 0x6D68B223 to configure the codec.
+// Nothing we run reaches it, so it stays a stub - implement it if a mode-1 game needs it.
+static int sceVideocodecSetMode(u32 ctxAddr, int type) {
 	return hleLogWarning(Log::ME, 0, "UNIMPL");
 }
 
-static int sceVideocodec_D95C24D5(u32 ctxAddr, int type) {
-	return hleLogWarning(Log::ME, 0, "UNIMPL");
+// 0xD95C24D5. Hands a decoded frame back to the caller as three planes, which is what
+// sceMpegAvcCopyYCbCr is built on - the videocodec-level counterpart of sceMpegBaseYCrCbCopy.
+// Games that want the raw YCbCr rather than letting sceMpegbase convert to RGB use this and nothing
+// else (Monster Hunter Portable 3rd calls it once per decoded frame and never calls a Csc).
+//
+// mpeg.prx builds the descriptor on its own stack (AvcCopyDeeper in mpeg.prx 2.60) and avcodec.prx
+// reads it back at 0x800015c4, which is where the layout below comes from:
+//
+//   0x00  width in pixels        0x04  height in pixels
+//   0x0c  the eight frame buffers, but ordered 0,2,4,6 then 1,3,5,7 rather than 0..7
+//   0x2c  destination Y, then Cb at +width*height and Cr a further width*height/4 on - so the
+//         three planes are contiguous, and the caller gets ordinary planar YUV420.
+static int sceVideocodecCopyYCbCr(u32 ctxAddr, int type) {
+	if (!Memory::IsValidRange(ctxAddr, 0x38)) {
+		return hleLogError(Log::ME, -1, "bad descriptor pointer");
+	}
+	const int width = (int)Memory::ReadUnchecked_U32(ctxAddr + 0x00);
+	const int height = (int)Memory::ReadUnchecked_U32(ctxAddr + 0x04);
+	if (width <= 0 || height <= 0 || width > 1024 || height > 1024) {
+		return hleLogError(Log::ME, -1, "unreasonable frame size %dx%d", width, height);
+	}
+
+	// Back into the order the rest of our code uses: four luma, then four chroma.
+	static const int fromDescriptor[8] = { 0, 2, 4, 6, 1, 3, 5, 7 };
+	u32 buffers[8]{};
+	for (int i = 0; i < 8; i++) {
+		buffers[fromDescriptor[i]] = Memory::ReadUnchecked_U32(ctxAddr + 0x0c + i * 4);
+	}
+
+	const u8 *luma, *cb, *cr;
+	if (!ReadTiledYCbCr(buffers, width, height, &luma, &cb, &cr)) {
+		return hleLogError(Log::ME, -1, "YCbCr buffers not readable");
+	}
+
+	const u32 dst[3] = {
+		Memory::ReadUnchecked_U32(ctxAddr + 0x2c),
+		Memory::ReadUnchecked_U32(ctxAddr + 0x30),
+		Memory::ReadUnchecked_U32(ctxAddr + 0x34),
+	};
+	const u8 *planes[3] = { luma, cb, cr };
+	const u32 planeSizes[3] = {
+		(u32)(width * height),
+		(u32)((width >> 1) * (height >> 1)),
+		(u32)((width >> 1) * (height >> 1)),
+	};
+	for (int i = 0; i < 3; i++) {
+		if (!Memory::IsValidRange(dst[i], planeSizes[i])) {
+			return hleLogError(Log::ME, -1, "plane %d (%08x, %d bytes) not writable", i, dst[i], planeSizes[i]);
+		}
+		Memory::MemcpyUnchecked(dst[i], planes[i], planeSizes[i]);
+	}
+	return hleLogDebug(Log::ME, 0, "%dx%d -> %08x %08x %08x", width, height, dst[0], dst[1], dst[2]);
 }
 
 const HLEFunction sceVideocodec[] = {
@@ -645,8 +790,8 @@ const HLEFunction sceVideocodec[] = {
 	{0X17CF7D2C, &WrapI_UI<sceVideocodecGetFrameCrop>,  "sceVideocodecGetFrameCrop",  'i', "xi"},
 	{0X26927D19, &WrapI_UI<sceVideocodecGetVersion>,    "sceVideocodecGetVersion",    'i', "xi"},
 	{0X627B7D42, &WrapI_UI<sceVideocodecGetSEI>,        "sceVideocodecGetSEI",        'i', "xi"},
-	{0X893B32B1, &WrapI_UI<sceVideocodec_893B32B1>,     "sceVideocodec_893B32B1",     'i', "xi"},
-	{0XD95C24D5, &WrapI_UI<sceVideocodec_D95C24D5>,     "sceVideocodec_D95C24D5",     'i', "xi"},
+	{0X893B32B1, &WrapI_UI<sceVideocodecSetMode>,       "sceVideocodecSetMode",       'i', "xi"},
+	{0XD95C24D5, &WrapI_UI<sceVideocodecCopyYCbCr>,     "sceVideocodecCopyYCbCr",     'i', "xi"},
 };
 
 void Register_sceVideocodec() {

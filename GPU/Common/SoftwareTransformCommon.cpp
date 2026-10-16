@@ -37,6 +37,7 @@
 #include "GPU/Common/VertexReader.h"
 #include "GPU/Common/DrawEngineCommon.h"
 #include "GPU/Software/Clipper.h"
+#include "GPU/Software/GEMath.h"
 
 static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSize, u16 *&inds, int indsSize, const TransformedVertex *transformed, TransformedVertex *transformedExpanded, int *drawIndexCount, bool throughmode, bool *pixelMappedExactly);
 static bool ExpandLines(int vertexCount, int &numDecodedVerts, int vertsSize, u16 *&inds, int indsSize, const TransformedVertex *transformed, TransformedVertex *transformedExpanded, int *drawIndexCount, bool throughmode);
@@ -125,6 +126,18 @@ static bool IsReallyAClear(const TransformedVertex *transformed, int numVerts, f
 }
 
 // At the end, this calls ProjectClipAndExpand which will expand rectangles as necessary, or apply culling.
+// Whether a through-mode sprite's u plane falls just short on the GE (GESpriteUPlaneExact), so a pixel center
+// exactly on a texel edge reads the texel before. u in texels.
+static bool SpriteUPlaneShort(const TransformedVertex &a, const TransformedVertex &b, double texW) {
+	// A sprite drawn bottom left to top right (or the reverse) swaps its UV axes.
+	if ((a.x < b.x) != (a.y < b.y))
+		return false;
+	const TransformedVertex &left = a.x <= b.x ? a : b;
+	const TransformedVertex &right = a.x <= b.x ? b : a;
+	const int64_t top = (int64_t)(std::min(a.y, b.y) * 16.0f), bottom = (int64_t)(std::max(a.y, b.y) * 16.0f);
+	return !GESpriteUPlaneExact((int64_t)(left.x * 16.0f), top, (int64_t)(right.x * 16.0f), bottom, left.u / texW, right.u / texW);
+}
+
 SoftwareTransformAction RunSoftwareTransform(SoftwareTransformParams &params, int prim, u32 vertType, const DecVtxFormat &decVtxFormat, int numDecodedVerts, int vertsSize, int vertexCount, u16 *&inds, int indsSize, SoftwareTransformResult *result) {
 	// These primitive are not handled.
 	_dbg_assert_(prim != GE_PRIM_KEEP_PREVIOUS && prim != GE_PRIM_TRIANGLE_FAN && prim != GE_PRIM_TRIANGLE_STRIP && prim != GE_PRIM_LINE_STRIP);
@@ -194,11 +207,13 @@ SoftwareTransformAction RunSoftwareTransform(SoftwareTransformParams &params, in
 			bool depthMatchesStencil = gstate.isClearModeAlphaMask() == gstate.isClearModeDepthMask();
 			bool matchingComponents = params.allowSeparateAlphaClear || (alphaMatchesColor && depthMatchesStencil);
 			bool stencilNotMasked = !gstate.isClearModeAlphaMask() || gstate.getStencilWriteMask() == 0x00;
-			if (matchingComponents && stencilNotMasked) {
+			// The color mask applies to clears too (gpu/stencil/writemask), which a hardware clear can't do.
+			bool colorNotMasked = !gstate.isClearModeColorMask() || (gstate.pmskc & 0xFFFFFF) == 0;
+			if (matchingComponents && stencilNotMasked && colorNotMasked) {
 				float depth = std::clamp(transformed[1].z, 0.0f, 65535.0f) / 65535.0f;
 				// Non-zero depth clears are unusual, but some drivers don't match drawn depth values to cleared values.
 				// Games sometimes expect exact matches (see #12626, for example) for equal comparisons.
-				if (!(params.everUsedEqualDepth && gstate.isClearModeDepthMask() && result->depth > 0.0f && result->depth < 1.0f)) {
+				if (!(params.everUsedEqualDepth && gstate.isClearModeDepthMask() && depth > 0.0f && depth < 1.0f)) {
 					result->color = transformed[1].color0_32;
 					result->depth = depth;
 					gpuStats.perFrame.numClears++;
@@ -219,6 +234,33 @@ SoftwareTransformAction RunSoftwareTransform(SoftwareTransformParams &params, in
 		const float heightFactor = (float)texH / (float)gstate_c.curTextureHeight;
 
 		const Vec4f materialAmbientRGBA = Vec4f::FromRGBA(gstate.getMaterialAmbientRGBA());
+
+		// A rectangle's depth is flat, so when it's right at a depth range limit, rounding can drop or keep
+		// all of it (Mana Khemia 2 draws a background at screen Z 1 with minz 1, and we computed 0).
+		// There, check the depth the GE would compute, and if it disagrees about the range, use it.
+		// Otherwise keep ours, which matches the hardware-transformed draws the rectangle might be tested against.
+		const int minZ = gstate.getDepthRangeMin();
+		const int maxZ = gstate.getDepthRangeMax();
+		const bool checkGEDepth = prim == GE_PRIM_RECTANGLES && (minZ > 0 || maxZ < 65535);
+		// Like the clip planes in the vertex shader.
+		auto inDepthRange = [=](float z) {
+			if (minZ > 0 && floorf(z * 0.5f + 0.5f) * 2.0f < minZ)
+				return false;
+			if (maxZ < 65535 && floorf(z * 0.5f) * 2.0f > maxZ)
+				return false;
+			return true;
+		};
+		const float zScale = gstate.getViewportZScale();
+		const float zCenter = gstate.getViewportZCenter();
+		float geMatrix[16];
+		if (checkGEDepth) {
+			float world[16], view[16], worldView[16];
+			ConvertMatrix4x3To4x4(world, gstate.worldMatrix);
+			ConvertMatrix4x3To4x4(view, gstate.viewMatrix);
+			GECombineMatrices(worldView, world, view);
+			GECombineMatrices(geMatrix, worldView, gstate.projMatrix);
+		}
+
 		// Okay, need to actually perform the full transform.
 		for (int index = 0; index < numDecodedVerts; index++) {
 			reader.Goto(index);
@@ -333,23 +375,11 @@ SoftwareTransformAction RunSoftwareTransform(SoftwareTransformParams &params, in
 			case GE_TEXMAP_ENVIRONMENT_MAP:
 				// Shade mapping - use two light sources to generate U and V.
 				{
-					auto getLPosFloat = [&](int l, int i) {
-						return getFloat24(gstate.lpos[l * 3 + i]);
-					};
-					auto getLPos = [&](int l) {
-						return Vec3f(getLPosFloat(l, 0), getLPosFloat(l, 1), getLPosFloat(l, 2));
-					};
-					auto calcShadingLPos = [&](int l) {
-						Vec3f pos = getLPos(l);
-						return pos.NormalizedOr001(cpu_info.bSSE4_1);
-					};
-
 					// Might not have lighting enabled, so don't use lighter.
-					Vec3f lightpos0 = calcShadingLPos(gstate.getUVLS0());
-					Vec3f lightpos1 = calcShadingLPos(gstate.getUVLS1());
-
-					uv[0] = (1.0f + Dot(lightpos0, worldnormal))/2.0f;
-					uv[1] = (1.0f + Dot(lightpos1, worldnormal))/2.0f;
+					const Vec3f viewDir = PSPViewDirection(gstate.viewMatrix);
+					const Vec3f worldpos(out[0], out[1], out[2]);
+					uv[0] = PSPShadeMapCoord(gstate.getUVLS0(), worldpos, worldnormal, viewDir);
+					uv[1] = PSPShadeMapCoord(gstate.getUVLS1(), worldpos, worldnormal, viewDir);
 					uv[2] = 1.0f;
 				}
 				break;
@@ -366,6 +396,15 @@ SoftwareTransformAction RunSoftwareTransform(SoftwareTransformParams &params, in
 
 			// Then transform by the projection.
 			Vec3ByMatrix44(transformed[index].pos, v, gstate.projMatrix);
+			if (checkGEDepth) {
+				TransformedVertex &t = transformed[index];
+				const Vec3f modelPos(pos[0], pos[1], pos[2]);
+				const float geZ = GEScreenZ(GEClipComponent(modelPos, geMatrix, 2), GEClipComponent(modelPos, geMatrix, 3), zScale, zCenter);
+				if (inDepthRange(geZ) != inDepthRange(t.z * zScale / t.pos_w + zCenter)) {
+					// Set clip Z so the projection lands on it.
+					t.z = (geZ - zCenter) * t.pos_w / zScale;
+				}
+			}
 
 			transformed[index].fog = fogCoef;
 			memcpy(&transformed[index].uv, uv, 3 * sizeof(float));
@@ -416,8 +455,9 @@ inline bool IsInsideNearPlane(const TransformedVertex& v) {
 	return v.z >= -v.pos_w;
 }
 
+// With the same epsilon as the cull distances in the vertex shader (z/w up to 0x3F8000XX counts as 1.0).
 inline bool IsInsideFarPlane(const TransformedVertex& v) {
-	return v.z <= v.pos_w;
+	return v.z <= v.pos_w + 0.0000304f / v.pos_w;
 }
 
 // TODO: Use CrossSIMD, should help.
@@ -440,7 +480,7 @@ inline void LerpTransformedVertex(TransformedVertex *dest, TransformedVertex &a,
 static void ClipTrianglesAgainstNearPlane(
 	TransformedVertex *transformed, int &transformedCount, int maxTransformed,
 	u16 *indicesIn, int numIndicesIn,
-	u16 *indicesOut, int &numIndicesOut, int maxIndicesOut, TransformStats *stats
+	u16 *indicesOut, int &numIndicesOut, int maxIndicesOut, bool reversed, TransformStats *stats
 ) {
 	// Process one triangle (3 indices) at a time
 	for (size_t i = 0; i < numIndicesIn; i += 3) {
@@ -463,25 +503,25 @@ static void ClipTrianglesAgainstNearPlane(
 		int insideCount = (in0 ? 1 : 0) + (in1 ? 1 : 0) + (in2 ? 1 : 0);
 		int insideFarCount = (inFar0 ? 1 : 0) + (inFar1 ? 1 : 0) + (inFar2 ? 1 : 0);
 
-		// Case 1: Entirely visible
-		if (insideCount == 3) {
+		// Case 1: Entirely beyond far plane
+		if (insideFarCount == 0) {
+			// All are beyond the far plane. Cull.
+			stats->culledTrianglesFar++;
+			continue;
+		}
+		// Case 2: Entirely visible
+		else if (insideCount == 3) {
 			indicesOut[numIndicesOut++] = idx0;
 			indicesOut[numIndicesOut++] = idx1;
 			indicesOut[numIndicesOut++] = idx2;
 		}
-		// Case 2: Entirely clipped / behind near plane
+		// Case 3: Entirely clipped / behind near plane
 		else if (insideCount == 0) {
 			// Cull, no clipping needed.
 			stats->culledTrianglesNear++;
 			continue;
 		}
-		// Case 3: Entirely beyond far plane
-		else if (insideFarCount == 0) {
-			// All are beyond the far plane. Cull.
-			stats->culledTrianglesFar++;
-			continue;
-		}
-		// Case 3: Partially clipped
+		// Case 4: Partially clipped
 		else {
 			stats->clippedTriangles++;
 
@@ -508,8 +548,9 @@ static void ClipTrianglesAgainstNearPlane(
 
 				// If we cross the clipping plane line (inside->outside or outside->inside)
 				if (triIn[j] != triIn[next]) {
-					/* const */ TransformedVertex& a = transformed[currIdx];
-					/* const */ TransformedVertex& b = transformed[nextIdx];
+					// Interpolate from the inside vertex, like the GE.
+					/* const */ TransformedVertex& a = transformed[triIn[j] ? currIdx : nextIdx];
+					/* const */ TransformedVertex& b = transformed[triIn[j] ? nextIdx : currIdx];
 
 					// Find interpolation factor 't' where: z_interpolated = -w_interpolated
 					// Lerp formulation:
@@ -551,6 +592,18 @@ static void ClipTrianglesAgainstNearPlane(
 				indicesOut[numIndicesOut++] = polyIndices[1];
 				indicesOut[numIndicesOut++] = polyIndices[2];
 			} else if (polyLength == 4) {
+				// One vertex (o) was outside. The GE splits the quad from the vertex before it (p), giving
+				// (p, a, b) and (p, b, n), which matters when a new vertex fails the range check
+				// (gpu/probe exp43, exp44; see Clipper.cpp). Rotate p to the front.
+				const int o = !in0 ? 0 : (!in1 ? 1 : 2);
+				const u16 p = triIdx[reversed ? (o + 1) % 3 : (o + 2) % 3];
+				while (polyIndices[0] != p) {
+					const u16 first = polyIndices[0];
+					polyIndices[0] = polyIndices[1];
+					polyIndices[1] = polyIndices[2];
+					polyIndices[2] = polyIndices[3];
+					polyIndices[3] = first;
+				}
 				// Triangle 1
 				indicesOut[numIndicesOut++] = polyIndices[0];
 				indicesOut[numIndicesOut++] = polyIndices[1];
@@ -841,7 +894,7 @@ static SoftwareTransformAction ProjectClipAndExpand(SoftwareTransformParams &par
 			if (gstate.isDepthClipEnabled()) {
 				const u16 *indsIn = (const u16 *)inds;
 				int newIndexCount = 0;
-				ClipTrianglesAgainstNearPlane(transformed, numDecodedVerts, 65536, inds, vertexCount, indsOut, newIndexCount, 65336, &result->stats);
+				ClipTrianglesAgainstNearPlane(transformed, numDecodedVerts, 65536, inds, vertexCount, indsOut, newIndexCount, 65336, params.trianglesReversed, &result->stats);
 				drawIndexCount = newIndexCount;
 			} else {
 				std::vector<int> outsideZ;
@@ -974,8 +1027,6 @@ static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSiz
 	u16 *newInds = inds + vertexCount;
 	u16 *indsOut = newInds;
 
-	numDecodedVerts = 4 * (vertexCount / 2);
-
 	float uScale = 1.0f;
 	float vScale = 1.0f;
 	if (throughmode) {
@@ -1028,9 +1079,43 @@ static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSiz
 	}
 
 
+	// Like the software renderer's ProcessRect: rectangles aren't clipped, one with a vertex behind the camera
+	// or outside the screen range is dropped whole. With depth clamp, a vertex past the near plane is exempt
+	// from the range check (gpu/clipping/guardband).
+	const bool depthClamp = gstate.isDepthClipEnabled();
+	const float zScale = gstate.getViewportZScale();
+	const float zCenter = gstate.getViewportZCenter();
+	auto outsideRange = [&](const TransformedVertex &v) {
+		constexpr float SCREEN_BOUND = 4095.0f + (15.5f / 16.0f);
+		if (!(v.pos_w > 0.0f)) {
+			return true;
+		}
+		if (depthClamp) {
+			// The near plane in projected terms: z/w < -1.
+			if (zScale != 0.0f && (v.z - zCenter) / zScale < -1.0f) {
+				return false;
+			}
+			return !(v.x < SCREEN_BOUND && v.y < SCREEN_BOUND && v.x >= 0.0f && v.y >= 0.0f);
+		}
+		return !(v.x <= SCREEN_BOUND && v.y < SCREEN_BOUND && v.x >= 0.0f && v.y >= 0.0f && v.z >= 0.0f && v.z < 65536.0f);
+	};
+
+	// The CLUT8 depal picks a byte where a pixel center can sit exactly on a byte edge (u = 1 + 2x over a 16-bit
+	// framebuffer). The GE lands on the edge only when the sprite's u gradient is exact; otherwise its plane falls
+	// just short and reads the byte before (gpu/probe exp256). Sprite by sprite, nudge the short ones' u down a
+	// little, 0.03 of the GE's 1/16 texel step, which the shader's truncation then follows.
+	const bool nudgeShortU = throughmode && gstate_c.shaderDepalMode == ShaderDepalMode::CLUT8;
+	const double texW = (double)gstate.getTextureWidth(0);
+
+	int outVerts = 0;
 	for (int i = 0; i < vertexCount; i += 2) {
 		const TransformedVertex &transVtxTL = transformed[indsIn[i + 0]];
 		const TransformedVertex &transVtxBR = transformed[indsIn[i + 1]];
+		const float uNudge = nudgeShortU && SpriteUPlaneShort(transVtxTL, transVtxBR, texW) ? 0.03f / 16.0f : 0.0f;
+
+		if (!throughmode && (outsideRange(transVtxTL) || outsideRange(transVtxBR))) {
+			continue;
+		}
 
 		float z = transVtxBR.z;
 		// Apply Z clamping. It appears clipping/culling does not affect rectangles, see #12058.
@@ -1046,14 +1131,14 @@ static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSiz
 
 		// bottom right
 		trans[0] = transVtxBR;
-		trans[0].u = (transVtxBR.u - spriteBorderFixR) * uScale;
+		trans[0].u = (transVtxBR.u - spriteBorderFixR - uNudge) * uScale;
 		trans[0].v = (transVtxBR.v - spriteBorderFixB) * vScale;
 		trans[0].z = z;
 
 		// top right
 		trans[1] = transVtxBR;
 		trans[1].y = transVtxTL.y;
-		trans[1].u = (transVtxBR.u - spriteBorderFixR) * uScale;
+		trans[1].u = (transVtxBR.u - spriteBorderFixR - uNudge) * uScale;
 		trans[1].v = (transVtxTL.v + spriteBorderFixT) * vScale;
 		trans[1].z = z;
 
@@ -1061,14 +1146,14 @@ static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSiz
 		trans[2] = transVtxBR;
 		trans[2].x = transVtxTL.x;
 		trans[2].y = transVtxTL.y;
-		trans[2].u = (transVtxTL.u + spriteBorderFixL) * uScale;
+		trans[2].u = (transVtxTL.u + spriteBorderFixL - uNudge) * uScale;
 		trans[2].v = (transVtxTL.v + spriteBorderFixT) * vScale;
 		trans[2].z = z;
 
 		// bottom left
 		trans[3] = transVtxBR;
 		trans[3].x = transVtxTL.x;
-		trans[3].u = (transVtxTL.u + spriteBorderFixL) * uScale;
+		trans[3].u = (transVtxTL.u + spriteBorderFixL - uNudge) * uScale;
 		trans[3].v = (transVtxBR.v - spriteBorderFixB) * vScale;
 		trans[3].z = z;
 
@@ -1077,17 +1162,19 @@ static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSiz
 		RotateUV(trans);
 
 		// Triangle: BR-TR-TL
-		indsOut[0] = i * 2 + 0;
-		indsOut[1] = i * 2 + 1;
-		indsOut[2] = i * 2 + 2;
+		indsOut[0] = outVerts + 0;
+		indsOut[1] = outVerts + 1;
+		indsOut[2] = outVerts + 2;
 		// Triangle: BL-BR-TL
-		indsOut[3] = i * 2 + 3;
-		indsOut[4] = i * 2 + 0;
-		indsOut[5] = i * 2 + 2;
+		indsOut[3] = outVerts + 3;
+		indsOut[4] = outVerts + 0;
+		indsOut[5] = outVerts + 2;
 
 		trans += 4;
 		indsOut += 6;
+		outVerts += 4;
 	}
+	numDecodedVerts = outVerts;
 	inds = newInds;
 	*pixelMappedExactly = pixelMapped;
 	*drawIndexCount = indsOut - newInds;

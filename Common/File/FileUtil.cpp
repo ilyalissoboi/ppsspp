@@ -703,7 +703,9 @@ bool CreateDir(const Path &path, bool quiet) {
 	}
 	return false;
 #else
-	if (mkdir(path.ToString().c_str(), 0755) == 0) {
+	if (mkdir(path.ToString().c_str(), 0775) == 0) {
+		// mkdir's mode is masked by the umask, chmod's isn't.
+		chmod(path.ToString().c_str(), 0775);
 		return true;
 	}
 
@@ -712,6 +714,8 @@ bool CreateDir(const Path &path, bool quiet) {
 		if (!quiet) {
 			DEBUG_LOG(Log::IO, "CreateDir: mkdir failed on %s: already exists", path.c_str());
 		}
+		// Don't touch the permissions of existing directories: CreateFullPath calls this
+		// on every component of a path, including the user's home directory.
 		return true;
 	}
 
@@ -726,6 +730,14 @@ bool CreateDir(const Path &path, bool quiet) {
 bool CreateFullPath(const Path &path) {
 	if (File::Exists(path)) {
 		VERBOSE_LOG(Log::IO, "CreateFullPath: path exists %s", path.ToVisualString().c_str());
+#if !defined(HAVE_LIBRETRO_VFS) && !defined(_WIN32)
+		// Repair directories created with older, narrower permissions. Only the last
+		// component, the parents can be anything (like the user's home directory).
+		struct stat info;
+		if (path.Type() == PathType::NATIVE && stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) {
+			chmod(path.c_str(), 0775);
+		}
+#endif
 		return true;
 	}
 

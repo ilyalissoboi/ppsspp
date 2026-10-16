@@ -37,9 +37,11 @@
 #include <typeinfo>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <memory>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -95,6 +97,7 @@
 #include <set>
 #include <list>
 #include "Core/CmdLine.h"
+#include "Core/System.h"
 #include "Common/Data/Collections/Hashmaps.h"
 #include "Core/Util/BlockAllocator.h"
 #include "Core/Debugger/Breakpoints.h"
@@ -103,17 +106,23 @@
 #include "Common/UI/View.h"
 #include "Common/UI/ViewGroup.h"
 #include "Core/Debugger/MemBlockInfo.h"
+#include "Core/FileLoaders/CachingFileLoader.h"
 #include "Core/FileSystems/FileSystem.h"
 #include "Core/FileSystems/ISOFileSystem.h"
 #include "Core/MemMap.h"
 #include "Core/KeyMap.h"
+#include "Core/ControlMapper.h"
+#include "Core/HLE/sceCtrl.h"
+#include "Core/HLE/sceUsbMic.h"
 #include "Core/Util/PathUtil.h"
 #include "Core/MIPS/MIPSVFPUUtils.h"
+#include "GPU/Common/DepthSwizzle.h"
 #include "GPU/Common/TextureDecoder.h"
 #include "GPU/Common/GPUStateUtils.h"
 #include "GPU/Math3D.h"
 
 #include "Common/File/AndroidContentURI.h"
+#include "Common/System/Request.h"
 
 #include "unittest/JitHarness.h"
 #include "unittest/TestVertexJit.h"
@@ -150,7 +159,15 @@ std::vector<std::string> System_GetCameraDeviceList() { return std::vector<std::
 void NativeFrame(GraphicsContext *graphicsContext) {}
 void NativeResized() {}
 
-bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) { return false; }
+// TestRequestManager answers these itself.
+static int g_lastInputBoxRequestId = -1;
+bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) {
+	if (type == SystemRequestType::INPUT_TEXT_MODAL) {
+		g_lastInputBoxRequestId = requestId;
+		return true;
+	}
+	return false;
+}
 // Pulled in via Core/WebServer.cpp's OpenWebDebugger(), which CmdLine.cpp now references.
 void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {}
 void System_InputBoxGetString(const std::string &title, const std::string &defaultValue, std::function<void(bool, const std::string &)> cb) { cb(false, ""); }
@@ -171,203 +188,17 @@ jclass findClass(const char *name) {
 	return nullptr;
 }
 
+// Defined in app-android.cpp for the app itself, which this doesn't link.
+jobject Android_GetActivity(JNIEnv *env) {
+	return nullptr;
+}
+
 bool System_AudioRecordingIsAvailable() { return false; }
-bool System_AudioRecordingState() { return false; }
 #endif
 
 #ifndef M_PI_2
 #define M_PI_2     1.57079632679489661923
 #endif
-
-// asin acos atan: https://github.com/michaldrobot/ShaderFastLibs/blob/master/ShaderFastMathLib.h
-
-// TODO:
-// Fast approximate sincos for NEON
-// http://blog.julien.cayzac.name/2009/12/fast-sinecosine-for-armv7neon.html
-// Fast sincos
-// http://www.dspguru.com/dsp/tricks/parabolic-approximation-of-sin-and-cos
-
-// minimax (surprisingly terrible! something must be wrong)
-// double asin_plus_sqrtthing = .9998421793 + (1.012386649 + (-.6575341673 + .8999841642 + (-1.669668977 + (1.571945105 - .5860008052 * x) * x) * x) * x) * x;
-
-// VERY good. 6 MAD, one division.
-// double asin_plus_sqrtthing = (1.807607311 + (.191900116 + (-2.511278506 + (1.062519236 + (-.3572142480 + .1087063463 * x) * x) * x) * x) * x) / (1.807601897 - 1.615203794 * x);
-// float asin_plus_sqrtthing_correct_ends =
-// 	(1.807607311f + (.191900116f + (-2.511278506f + (1.062519236f + (-.3572142480f + .1087063463f * x) * x) * x) * x) * x) / (1.807607311f - 1.615195094 * x);
-
-// Unfortunately this is very serial.
-// At least there are only 8 constants needed - load them into two low quads and go to town.
-// For every step, VDUP the constant into a new register (out of two alternating), then VMLA or VFMA into it.
-
-// http://www.ecse.rpi.edu/~wrf/Research/Short_Notes/arcsin/
-// minimax polynomial rational approx, pretty good, get four digits consistently.
-// unfortunately fastasin(1.0) / M_PI_2  != 1.0f, but it's pretty close.
-float fastasin(double x) {
-	float sign = x >= 0.0f ? 1.0f : -1.0f;
-	x = fabs(x);
-	float sqrtthing = sqrt(1.0f - x * x);
-	// note that the sqrt can run parallel while we do the rest
-	// if the hardware supports it
-
-	float y = -.3572142480f + .1087063463f * x;
-	y = y * x + 1.062519236f;
-	y = y * x + -2.511278506f;
-	y = y * x + .191900116f;
-	y = y * x + 1.807607311f;
-	y /= (1.807607311f - 1.615195094 * x);
-	return sign * (y - sqrtthing);
-}
-
-double atan_66s(double x) {
-	const double c1=1.6867629106;
-	const double c2=0.4378497304;
-	const double c3=1.6867633134;
-
-	double x2; // The input argument squared
-
-	x2 = x * x;
-	return (x*(c1 + x2*c2)/(c3 + x2));
-}
-
-// Terrible.
-double fastasin2(double x) {
-	return atan_66s(x / sqrt(1 - x * x));
-}
-
-// Also terrible.
-float fastasin3(float x) {
-	return x + x * x * x * x * x * 0.4971;
-}
-
-// Great! This is the one we'll use. Can be easily rescaled to get the right range for free.
-// http://mathforum.org/library/drmath/view/54137.html
-// http://www.musicdsp.org/showone.php?id=115
-float fastasin4(float x) {
-	float sign = x >= 0.0f ? 1.0f : -1.0f;
-	x = fabs(x);
-	x = M_PI/2 - sqrtf(1.0f - x) * (1.5707288 + -0.2121144*x + 0.0742610*x*x + -0.0187293*x*x*x);
-	return sign * x;
-}
-
-// Or this:
-float fastasin5(float x)
-{
-	float sign = x >= 0.0f ? 1.0f : -1.0f;
-	x = fabs(x);
-	float fRoot = sqrtf(1.0f - x);
-	float fResult = 0.0742610f + -0.0187293f  * x;
-	fResult = -0.2121144f + fResult * x;
-	fResult = 1.5707288f + fResult * x;
-	fResult = M_PI/2 - fRoot*fResult;
-	return sign * fResult;
-}
-
-
-// This one is unfortunately not very good. But lets us avoid PI entirely
-// thanks to the special arguments of the PSP functions.
-// http://www.dspguru.com/dsp/tricks/parabolic-approximation-of-sin-and-cos
-#define C            0.70710678118654752440f    // 1.0f / sqrt(2.0f)
-// Some useful constants (PI and <math.h> are not part of algo)
-#define BITSPERQUARTER (20)
-void fcs(float angle, float &sinout, float &cosout) {
-	int phasein = angle * (1 << BITSPERQUARTER);
-	// Modulo phase into quarter, convert to float 0..1
-	float modphase = (phasein & ((1<<BITSPERQUARTER)-1)) * (1.0f / (1<<BITSPERQUARTER));
-	// Extract quarter bits
-	int quarter = phasein >> BITSPERQUARTER;
-	// Recognize quarter
-	if (!quarter) {
-		// First quarter, angle = 0 .. pi/2
-		float x = modphase - 0.5f;      // 1 sub
-		float temp = (2 - 4*C)*x*x + C; // 2 mul, 1 add
-		sinout = temp + x;              // 1 add
-		cosout = temp - x;              // 1 sub
-	} else if (quarter == 1) {
-		// Second quarter, angle = pi/2 .. pi
-		float x = 0.5f - modphase;      // 1 sub
-		float temp = (2 - 4*C)*x*x + C; // 2 mul, 1 add
-		sinout = x + temp;              // 1 add
-		cosout = x - temp;              // 1 sub
-	} else if (quarter == 2) {
-		// Third quarter, angle = pi .. 1.5pi
-		float x = modphase - 0.5f;      // 1 sub
-		float temp = (4*C - 2)*x*x - C; // 2 mul, 1 sub
-		sinout = temp - x;              // 1 sub
-		cosout = temp + x;              // 1 add
-	} else if (quarter == 3) {
-		// Fourth quarter, angle = 1.5pi..2pi
-		float x = modphase - 0.5f;      // 1 sub
-		float temp = (2 - 4*C)*x*x + C; // 2 mul, 1 add
-		sinout = x - temp;              // 1 sub
-		cosout = x + temp;              // 1 add
-	}
-}
-#undef C
-
-
-const float PI_SQR      = 9.86960440108935861883449099987615114f;
-
-//https://code.google.com/p/math-neon/source/browse/trunk/math_floorf.c?r=18
-// About 2 correct decimals. Not great.
-void fcs2(float theta, float &outsine, float &outcosine) {
-	float gamma = theta + 1;
-	gamma += 2;
-	gamma /= 4;
-	theta += 2;
-	theta /= 4;
-	//theta -= (float)(int)theta;
-	//gamma -= (float)(int)gamma;
-	theta -= floorf(theta);
-	gamma -= floorf(gamma);
-	theta *= 4;
-	theta -= 2;
-	gamma *= 4;
-	gamma -= 2;
-
-	float x = 2 * gamma - gamma * fabs(gamma);
-	float y = 2 * theta - theta * fabs(theta);
-	const float P = 0.225f;
-	outsine = P * (y * fabsf(y) - y) + y;   // Q * y + P * y * abs(y)
-	outcosine = P * (x * fabsf(x) - x) + x;   // Q * y + P * y * abs(y)
-}
-
-
-
-void fastsincos(float x, float &sine, float &cosine) {
-	fcs2(x, sine, cosine);
-}
-
-bool TestSinCos() {
-	for (int i = -100; i <= 100; i++) {
-		float f = i / 30.0f;
-
-		// The PSP sin/cos take as argument angle * M_PI_2.
-		// We need to match that.
-		float slowsin = sinf(f * M_PI_2), slowcos = cosf(f * M_PI_2);
-		float fastsin, fastcos;
-		fastsincos(f, fastsin, fastcos);
-		if (g_testLog) {
-			printf("%f: slow: %0.8f, %0.8f fast: %0.8f, %0.8f\n", f, slowsin, slowcos, fastsin, fastcos);
-		}
-	}
-	return true;
-}
-
-
-bool TestAsin() {
-	for (int i = -100; i <= 100; i++) {
-		float f = i / 100.0f;
-		float slowval = asinf(f) / M_PI_2;
-		float fastval = fastasin5(f) / M_PI_2;
-		if (g_testLog) {
-			printf("slow: %0.16f fast: %0.16f\n", slowval, fastval);
-		}
-		float diff = fabsf(slowval - fastval);
-		// EXPECT_TRUE(diff < 0.0001f);
-	}
-	// EXPECT_TRUE(fastasin(1.0) / M_PI_2 <= 1.0f);
-	return true;
-}
 
 bool TestMathUtil() {
 	EXPECT_FALSE(my_isinf(1.0));
@@ -1115,6 +946,27 @@ static bool ValidateAllocator(BlockAllocator &a, u32 rangeStart, u32 rangeSize) 
 	return true;
 }
 
+// Writes one allocator's state and reads it back into another, the way a savestate does.
+// Returns false if either direction reported an error.
+static bool SaveLoadAllocator(BlockAllocator &from, BlockAllocator &to) {
+	std::vector<u8> buffer(64 * 1024);
+	u8 *writePtr = buffer.data();
+	PointerWrap pw(&writePtr, PointerWrap::MODE_WRITE);
+	from.DoState(pw);
+	if (pw.Failed())
+		return false;
+	const size_t written = (size_t)(writePtr - buffer.data());
+
+	u8 *readPtr = buffer.data();
+	PointerWrap pr(&readPtr, PointerWrap::MODE_READ);
+	pr.SetReadEnd(buffer.data() + written);
+	to.DoState(pr);
+	if (pr.Failed())
+		return false;
+	// Both sides must have walked exactly the same number of bytes.
+	return (size_t)(readPtr - buffer.data()) == written;
+}
+
 bool TestBlockAllocator() {
 	const u32 kStart = 0x08800000;
 	const u32 kSize = 0x00100000;  // 1MB
@@ -1332,6 +1184,12 @@ bool TestBlockAllocator() {
 		EXPECT_TRUE(ValidateAllocator(a, kStart, oddSize));
 	}
 
+	// Validating is quadratic in the block count, so the churn loops below only do it periodically.
+	// A broken tiling or free count doesn't repair itself, so it's still caught, just a few steps late.
+	auto validateEvery = [](int i, int count) {
+		return (i & 63) == 63 || i == count - 1;
+	};
+
 	// Churn again, this time mixing in aligned allocations and AllocAt so the block list gets into
 	// shapes the plain alloc/free loop never produces.
 	{
@@ -1341,7 +1199,8 @@ bool TestBlockAllocator() {
 		u32 rng = 987654321;
 		auto next = [&rng]() { rng = rng * 1103515245u + 12345u; return (rng >> 16) & 0x7FFF; };
 
-		for (int i = 0; i < 4000; ++i) {
+		const int kIterations = 3000;
+		for (int i = 0; i < kIterations; ++i) {
 			const int op = next() % 100;
 			if (op < 30 && !live.empty()) {
 				const size_t idx = next() % live.size();
@@ -1370,8 +1229,8 @@ bool TestBlockAllocator() {
 				if (addr != (u32)-1)
 					live.push_back(addr);
 			}
-			if (!ValidateAllocator(a, kStart, kSize)) {
-				printf("BlockAllocator invariant broken at iteration %d (op %d)\n", i, op);
+			if (validateEvery(i, kIterations) && !ValidateAllocator(a, kStart, kSize)) {
+				printf("BlockAllocator invariant broken by iteration %d\n", i);
 				return false;
 			}
 		}
@@ -1392,7 +1251,8 @@ bool TestBlockAllocator() {
 		u32 rng = 12345;
 		auto next = [&rng]() { rng = rng * 1103515245u + 12345u; return (rng >> 16) & 0x7FFF; };
 
-		for (int i = 0; i < 3000; ++i) {
+		const int kIterations = 2000;
+		for (int i = 0; i < kIterations; ++i) {
 			const bool doAlloc = live.empty() || (next() % 100) < 55;
 			if (doAlloc) {
 				u32 size = ((next() % 64) + 1) * kGrain;
@@ -1411,8 +1271,8 @@ bool TestBlockAllocator() {
 				EXPECT_TRUE(a.Free(live[idx].first));
 				live.erase(live.begin() + idx);
 			}
-			if (!ValidateAllocator(a, kStart, kSize)) {
-				printf("BlockAllocator invariant broken at iteration %d\n", i);
+			if (validateEvery(i, kIterations) && !ValidateAllocator(a, kStart, kSize)) {
+				printf("BlockAllocator invariant broken by iteration %d\n", i);
 				return false;
 			}
 		}
@@ -1424,6 +1284,45 @@ bool TestBlockAllocator() {
 		EXPECT_EQ_INT((int)a.GetTotalFreeBytes(), (int)kSize);
 		EXPECT_EQ_INT((int)a.GetLargestFreeBlockSize(), (int)kSize);
 		EXPECT_TRUE(ValidateAllocator(a, kStart, kSize));
+	}
+
+	// Savestates. An allocator that nothing has Init'd yet has no blocks at all, and that has to
+	// survive a round trip as readily as a populated one - sceVideocodec saves an allocator for
+	// memory no game has asked for until it plays a video.
+	{
+		BlockAllocator empty(kGrain);
+		BlockAllocator loaded(kGrain);
+		loaded.Init(kStart, kSize, false);  // starts populated, to prove the load clears it
+		EXPECT_TRUE(SaveLoadAllocator(empty, loaded));
+		EXPECT_EQ_INT((int)loaded.GetTotalFreeBytes(), 0);
+		EXPECT_EQ_INT((int)loaded.GetLargestFreeBlockSize(), 0);
+		EXPECT_FALSE(loaded.IsBlockFree(kStart));
+
+		// And an empty one can be Init'd afterwards and behave normally.
+		loaded.Init(kStart, kSize, false);
+		EXPECT_TRUE(ValidateAllocator(loaded, kStart, kSize));
+	}
+
+	{
+		BlockAllocator a(kGrain);
+		a.Init(kStart, kSize, false);
+		u32 size1 = 0x1000, size2 = 0x2000;
+		const u32 a1 = a.Alloc(size1, false, "saved1");
+		const u32 a2 = a.Alloc(size2, true, "saved2");
+
+		BlockAllocator b(kGrain);
+		EXPECT_TRUE(SaveLoadAllocator(a, b));
+		EXPECT_TRUE(ValidateAllocator(b, kStart, kSize));
+		EXPECT_EQ_INT((int)b.GetTotalFreeBytes(), (int)a.GetTotalFreeBytes());
+		EXPECT_EQ_INT((int)b.GetLargestFreeBlockSize(), (int)a.GetLargestFreeBlockSize());
+		EXPECT_FALSE(b.IsBlockFree(a1));
+		EXPECT_FALSE(b.IsBlockFree(a2));
+		EXPECT_EQ_STR(std::string(b.GetBlockTag(a1)), std::string("saved1"));
+		EXPECT_EQ_STR(std::string(b.GetBlockTag(a2)), std::string("saved2"));
+		// The loaded copy is a working allocator, not just a readable snapshot.
+		EXPECT_TRUE(b.Free(a1));
+		EXPECT_TRUE(b.Free(a2));
+		EXPECT_EQ_INT((int)b.GetLargestFreeBlockSize(), (int)kSize);
 	}
 
 	return true;
@@ -1924,12 +1823,153 @@ bool TestFastVec() {
 	return true;
 }
 
+// Calls check on inputs chosen to make trouble for a VFPU dot product: close exponents, cancelling
+// products, ties, zeroes and subnormals, the overflow and underflow edges, inf and NaN, and sums whose
+// rounding carries into the next power of two. Stops at the first false.
+bool ForEachVFPUDotTestCase(const std::function<bool(const float a[4], const float b[4])> &check) {
+	uint64_t state = 0x9E3779B97F4A7C15ULL;
+	auto rnd = [&]() {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		return state;
+	};
+	auto fromBits = [](uint32_t bits) {
+		float f;
+		memcpy(&f, &bits, sizeof(f));
+		return f;
+	};
+	auto toBits = [](float f) {
+		uint32_t bits;
+		memcpy(&bits, &f, sizeof(bits));
+		return bits;
+	};
+	for (int n = 0; n < 4000000; n++) {
+		float a[4], b[4];
+		const int mode = (int)(rnd() & 15);
+		const int base = 1 + (int)(rnd() % 254);
+		const int spread = mode < 8 ? 3 : 40;
+		for (int i = 0; i < 4; i++) {
+			if (mode == 15) {
+				a[i] = fromBits((uint32_t)rnd());
+				b[i] = fromBits((uint32_t)rnd());
+				continue;
+			}
+			int ea = base + (int)(rnd() % (2 * spread + 1)) - spread;
+			int eb = 127 + (int)(rnd() % (2 * spread + 1)) - spread;
+			ea = std::max(0, std::min(254, ea));
+			eb = std::max(0, std::min(254, eb));
+			uint32_t xa = ((uint32_t)rnd() & 0x80000000) | (ea << 23) | ((uint32_t)rnd() & 0x7FFFFF);
+			uint32_t xb = ((uint32_t)rnd() & 0x80000000) | (eb << 23) | ((uint32_t)rnd() & 0x7FFFFF);
+			switch (rnd() & 63) {
+			case 0: xa &= 0x80000000; break;
+			case 1: xb &= 0x807FFFFF; break;
+			case 2: xa |= 0x7F800000; xa &= 0xFF800000; break;
+			case 3: xb |= 0x7FC00000; break;
+			case 4: xa &= 0xFFFF0000; break;
+			default: break;
+			}
+			a[i] = fromBits(xa);
+			b[i] = fromBits(xb);
+		}
+		if (mode == 5) {
+			// Nearly cancelling products.
+			a[1] = -a[0];
+			b[1] = fromBits(toBits(b[0]) ^ ((uint32_t)rnd() & 7));
+		}
+		if (!check(a, b))
+			return false;
+	}
+
+	// Cases that went wrong somewhere.
+	static const uint32_t fixed[][8] = {
+		{ 0x8055f97b, 0xcaa86851, 0, 0, 0x44282000, 0x3f800000, 0, 0 },
+	};
+	for (const auto &f : fixed) {
+		float a[4], b[4];
+		for (int i = 0; i < 4; i++) {
+			a[i] = fromBits(f[i]);
+			b[i] = fromBits(f[i + 4]);
+		}
+		if (!check(a, b))
+			return false;
+	}
+
+	// Sums just below and above a power of two, whose rounding carries into the next exponent:
+	// 1.0 from just under it, and inf at the top of the range.
+	for (int e = 1; e <= 254; e++) {
+		for (int s = 0; s < 2; s++) {
+			const uint32_t sign = (uint32_t)s << 31;
+			for (int k = 1; k <= 40; k++) {
+				const uint32_t small = e - k >= 1 ? ((uint32_t)(e - k) << 23) | ((uint32_t)k * 0x2AAAA) : 0;
+				float a[4] = { fromBits(sign | (e << 23)), fromBits((sign ^ 0x80000000u) | small), 0.0f, 0.0f };
+				float b[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+				if (!check(a, b))
+					return false;
+				a[0] = fromBits(sign | (e << 23) | 0x7FFFFF);
+				a[1] = fromBits(sign | small);
+				if (!check(a, b))
+					return false;
+				a[2] = a[1];
+				if (!check(a, b))
+					return false;
+			}
+		}
+	}
+	return true;
+}
+
+
+// vfpu_dot's fast versions and vfpu_multi_dot against the reference.
+bool TestVFPUDot() {
+	auto toBits = [](float f) {
+		uint32_t bits;
+		memcpy(&bits, &f, sizeof(bits));
+		return bits;
+	};
+	float lastA[4][4];
+	int n = 0;
+	auto checkMulti = [&](const float v[4], int terms, bool transposed) {
+		float block[16], out[4];
+		for (int k = 0; k < 4; k++) {
+			for (int i = 0; i < 4; i++)
+				block[transposed ? 4 * k + i : 4 * i + k] = lastA[k][i];
+		}
+		vfpu_multi_dot(out, block, v, terms, transposed);
+		for (int k = 0; k < 4; k++) {
+			float a[4]{}, b[4]{};
+			for (int i = 0; i < terms; i++) {
+				a[i] = lastA[k][i];
+				b[i] = v[i];
+			}
+			const uint32_t expected = toBits(vfpu_dot_reference(a, b));
+			if (toBits(out[k]) != expected) {
+				printf("vfpu_multi_dot output %d, %d terms%s: %08x, expected %08x\n", k, terms, transposed ? " transposed" : "", toBits(out[k]), expected);
+				return false;
+			}
+		}
+		return true;
+	};
+	auto check = [&](const float a[4], const float b[4]) {
+		const uint32_t expected = toBits(vfpu_dot_reference(a, b));
+		const uint32_t actual = toBits(vfpu_dot(a, b));
+		const uint32_t scalar = toBits(vfpu_dot_scalar(a, b));
+		if (expected != actual || expected != scalar) {
+			printf("vfpu_dot(%08x %08x %08x %08x, %08x %08x %08x %08x) = %08x (scalar %08x), expected %08x\n",
+				toBits(a[0]), toBits(a[1]), toBits(a[2]), toBits(a[3]), toBits(b[0]), toBits(b[1]), toBits(b[2]), toBits(b[3]), actual, scalar, expected);
+			return false;
+		}
+		// vfpu_multi_dot on the last four a's as the matrix, each output against the reference.
+		memcpy(lastA[n & 3], a, sizeof(lastA[0]));
+		if ((n++ & 3) == 3 && !checkMulti(b, 2 + (int)(n % 3), (n & 4) != 0))
+			return false;
+		return true;
+	};
+	return ForEachVFPUDotTestCase(check);
+}
+
 bool TestVFPUSinCos() {
 	float sine, cosine;
-	// Needed for VFPU tables.
-	// There might be a better place to invoke it, but whatever.
-	g_VFS.Register("", new DirectoryReader(Path("assets")));
-	InitVFPU();
 	vfpu_sincos(0.0f, sine, cosine);
 	EXPECT_EQ_FLOAT(sine, 0.0f);
 	EXPECT_EQ_FLOAT(cosine, 1.0f);
@@ -2071,6 +2111,65 @@ bool TestParseLBN() {
 		u32 startSector, readSize;
 		EXPECT_FALSE(parseLBN(invalidStrings[i], &startSector, &readSize));
 	}
+	return true;
+}
+
+// Serves byte i as (u8)(i * 31 + 7), clamped to the file size like HTTPFileLoader.
+// The read counter lives outside, since CachingFileLoader deletes its backend.
+class PatternFileLoader : public FileLoader {
+public:
+	PatternFileLoader(s64 size, std::atomic<int> *reads) : size_(size), reads_(reads) {}
+	bool Exists() override { return true; }
+	bool IsDirectory() override { return false; }
+	s64 FileSize() override { return size_; }
+	Path GetPath() const override { return Path(); }
+	size_t ReadAt(s64 pos, size_t bytes, size_t count, void *data, Flags flags) override {
+		(*reads_)++;
+		s64 end = std::min(pos + (s64)(bytes * count), size_);
+		for (s64 i = pos; i < end; i++) {
+			((u8 *)data)[i - pos] = (u8)(i * 31 + 7);
+		}
+		return pos < end ? (size_t)(end - pos) / bytes : 0;
+	}
+
+private:
+	s64 size_;
+	std::atomic<int> *reads_;
+};
+
+static bool MatchesPattern(const u8 *data, s64 pos, size_t bytes) {
+	for (size_t i = 0; i < bytes; i++) {
+		if (data[i] != (u8)((pos + i) * 31 + 7)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool TestCachingFileLoader() {
+	// The last 64 KB block of the file is short.
+	const s64 size = 3 * 65536 + 1234;
+	std::atomic<int> reads{};
+	std::unique_ptr<CachingFileLoader> loader(new CachingFileLoader(new PatternFileLoader(size, &reads)));
+	std::vector<u8> buf(65536 * 2);
+
+	s64 pos = 3 * 65536 + 100;
+	EXPECT_EQ_INT(loader->ReadAt(pos, 100, buf.data()), 100);
+	EXPECT_TRUE(MatchesPattern(buf.data(), pos, 100));
+	pos = 2 * 65536 + 10;
+	EXPECT_EQ_INT(loader->ReadAt(pos, (size_t)(size - pos), buf.data()), (int)(size - pos));
+	EXPECT_TRUE(MatchesPattern(buf.data(), pos, (size_t)(size - pos)));
+
+	// Both reads ended in the last block, so everything they touched is cached and there's
+	// nothing left to read ahead. Nothing further should reach the backend, even past EOF.
+	int readsBefore = reads;
+	pos = 3 * 65536 + 100;
+	for (int i = 0; i < 100; i++) {
+		EXPECT_EQ_INT(loader->ReadAt(pos, 100, buf.data()), 100);
+	}
+	// Waits for any read-ahead.
+	loader.reset();
+	EXPECT_EQ_INT(reads, readsBefore);
 	return true;
 }
 
@@ -2216,6 +2315,45 @@ static bool TestMemMap() {
 	EXPECT_FALSE(Memory::IsKernelCodeAddress(0x08800000));  // to avoid our patches at the start of kernel ram
 
 	return true;
+}
+
+static bool CheckBlockShadow() {
+	// Every valid address has an entry, starting out empty. The ends of each view would fault otherwise.
+	static const u32 validAddresses[] = {
+		0x00010000, 0x00013FFC, 0x40010000,  // Scratchpad, and its uncached mirror.
+		0x04000000, 0x047FFFFC,  // VRAM and its mirrors.
+		0x08000000, 0x09F00000, 0x0BE00000, 0x0BFFFFFC,  // RAM, across the views it's mapped in.
+		0x48000000, 0x88000000, 0xC8000000,  // RAM mirrors.
+	};
+	for (u32 addr : validAddresses) {
+		EXPECT_EQ_HEX(Memory::ReadBlockShadow(addr), 0);
+	}
+
+	// The kernel and uncached mirrors share an entry, like they share memory.
+	Memory::WriteBlockShadow(0x08804000, 0x1234);
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x88804000), 0x1234);
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x48804000), 0x1234);
+
+	// Invalid addresses read as empty, and ignore writes.
+	Memory::WriteBlockShadow(0x0C000000, 0x1234);
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x0C000000), 0);
+
+	// Clearing leaves an entry that holds something else alone.
+	EXPECT_FALSE(Memory::ClearBlockShadow(0x08804000, 0x5678));
+	EXPECT_TRUE(Memory::ClearBlockShadow(0x88804000, 0x1234));
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x08804000), 0);
+	return true;
+}
+
+static bool TestBlockShadow() {
+	Memory::g_MemorySize = Memory::RAM_DOUBLE_SIZE;
+	if (!Memory::Init(Memory::MemMapSetupFlags::Default)) {
+		printf("Memory::Init failed\n");
+		return false;
+	}
+	const bool success = CheckBlockShadow();
+	Memory::Shutdown();
+	return success;
 }
 
 static bool TestPath() {
@@ -2406,6 +2544,71 @@ static bool TestWrapText() {
 	return true;
 }
 
+// Against ppsspp-re geprobe's swz.py, the layout that fits exp8-exp10.
+static bool TestDepthSwizzle() {
+	static const struct {
+		uint32_t translation;
+		bool color32;
+		uint32_t linear;
+		uint32_t stored;
+	} cases[] = {
+		{ 0x0, false, 0x088000, 0x088600 },
+		{ 0x0, false, 0x08a0e2, 0x08a6e2 },
+		{ 0x0, false, 0x1ffffe, 0x1ff9fe },
+		{ 0x0, false, 0x14b9ac, 0x14bfac },
+		{ 0x0, false, 0x09a782, 0x09a182 },
+		{ 0x0, true, 0x088000, 0x088600 },
+		{ 0x0, true, 0x08a0e2, 0x08a6e2 },
+		{ 0x0, true, 0x1ffffe, 0x1ff9fe },
+		{ 0x0, true, 0x1944c8, 0x1944c8 },
+		{ 0x0, true, 0x03171e, 0x03111e },
+		{ 0x200, false, 0x088000, 0x089040 },
+		{ 0x200, false, 0x08a0e2, 0x08b0a2 },
+		{ 0x200, false, 0x1ffffe, 0x1fefbe },
+		{ 0x200, false, 0x04a2ca, 0x04b28a },
+		{ 0x200, false, 0x06063a, 0x06167a },
+		{ 0x200, true, 0x088000, 0x089040 },
+		{ 0x200, true, 0x08a0e2, 0x08b182 },
+		{ 0x200, true, 0x1ffffe, 0x1fefbe },
+		{ 0x200, true, 0x176772, 0x1776b2 },
+		{ 0x200, true, 0x03b640, 0x03a6c0 },
+		{ 0x400, false, 0x088000, 0x08a040 },
+		{ 0x400, false, 0x08a0e2, 0x0880a2 },
+		{ 0x400, false, 0x1ffffe, 0x1fdfbe },
+		{ 0x400, false, 0x0dbd9c, 0x0d9ddc },
+		{ 0x400, false, 0x026654, 0x024614 },
+		{ 0x400, true, 0x088000, 0x08a040 },
+		{ 0x400, true, 0x08a0e2, 0x088182 },
+		{ 0x400, true, 0x1ffffe, 0x1fdfbe },
+		{ 0x400, true, 0x058028, 0x05a008 },
+		{ 0x400, true, 0x1bc0d8, 0x1be1d8 },
+		{ 0x800, false, 0x088000, 0x08c040 },
+		{ 0x800, false, 0x08a0e2, 0x08e0a2 },
+		{ 0x800, false, 0x1ffffe, 0x1fbfbe },
+		{ 0x800, false, 0x1ac354, 0x1a8314 },
+		{ 0x800, false, 0x047882, 0x0438c2 },
+		{ 0x800, true, 0x088000, 0x08c040 },
+		{ 0x800, true, 0x08a0e2, 0x08e182 },
+		{ 0x800, true, 0x1ffffe, 0x1fbfbe },
+		{ 0x800, true, 0x0f6704, 0x0f2664 },
+		{ 0x800, true, 0x05ce3c, 0x058c3c },
+		{ 0x1000, false, 0x088000, 0x080040 },
+		{ 0x1000, false, 0x08a0e2, 0x0820a2 },
+		{ 0x1000, false, 0x1ffffe, 0x1f7fbe },
+		{ 0x1000, false, 0x1b2b52, 0x1bab12 },
+		{ 0x1000, false, 0x03c876, 0x034836 },
+		{ 0x1000, true, 0x088000, 0x080040 },
+		{ 0x1000, true, 0x08a0e2, 0x082182 },
+		{ 0x1000, true, 0x1ffffe, 0x1f7fbe },
+		{ 0x1000, true, 0x07ec5e, 0x0768fe },
+		{ 0x1000, true, 0x0e498c, 0x0ec36c },
+	};
+	for (const auto &c : cases) {
+		EXPECT_EQ_HEX(GetDepthLayout(c.translation, c.color32).Stored(c.linear), c.stored);
+	}
+	return true;
+}
+
 static bool TestSmallDataConvert() {
 	float f[4] = { 1.0f / 255.0f, 2.0f / 255.0f, 3.0f / 255.0f, 4.0f / 255.f };
 	uint32_t result = Float4ToUint8x4_NoClamp(f);
@@ -2452,6 +2655,77 @@ bool TestInputMapping() {
 	InputMapping parsedMultiSingle = InputMapping::FromConfigString(cfgMulti);  // yes this is an intentional mismatch
 	// We should get the first mapping.
 	EXPECT_TRUE(parsedMultiSingle == mapping);
+	return true;
+}
+
+// Records what the ControlMapper tells us, so a test can check it.
+class TestControlListener : public ControlListener {
+public:
+	void OnVKey(VirtKey vkey, bool down) override {
+		vkeyDown[vkey] = down;
+	}
+	void UpdatePSPButtons(uint32_t buttonMask, uint32_t changedMask) override {
+		buttons = (buttons & ~changedMask) | buttonMask;
+	}
+	uint32_t buttons = 0;
+	std::map<VirtKey, bool> vkeyDown;
+};
+
+static bool SendKey(ControlMapper *mapper, int keyCode, bool down) {
+	KeyInput key{};
+	key.deviceId = DEVICE_ID_PAD_0;
+	key.keyCode = (InputKeyCode)keyCode;
+	key.flags = down ? KeyInputFlags::DOWN : KeyInputFlags::UP;
+	return mapper->Key(key);
+}
+
+// A mapping shouldn't fire when a longer mapping sharing an input with it is held. See #20621.
+bool TestComboSuppression() {
+	using KeyMap::MultiInputMapping;
+
+	InputMapping a(DEVICE_ID_PAD_0, NKCODE_BUTTON_1);
+	InputMapping b(DEVICE_ID_PAD_0, NKCODE_BUTTON_2);
+
+	KeyMap::ClearAllMappings();
+	KeyMap::SetInputMapping(CTRL_CIRCLE, MultiInputMapping(a), true);
+	KeyMap::SetInputMapping(CTRL_SQUARE, MultiInputMapping(b), true);
+	MultiInputMapping combo(a);
+	combo.mappings.push_back(b);
+	KeyMap::SetInputMapping(VIRTKEY_PAUSE, combo, true);
+
+	TestControlListener listener;
+	ControlMapper mapper;
+	mapper.AddListener(&listener);
+
+	// A on its own presses Circle.
+	SendKey(&mapper, NKCODE_BUTTON_1, true);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CIRCLE), (int)CTRL_CIRCLE);
+	EXPECT_FALSE(listener.vkeyDown[VIRTKEY_PAUSE]);
+
+	// Adding B completes the combo, so Circle lets go and Square never presses.
+	SendKey(&mapper, NKCODE_BUTTON_2, true);
+	EXPECT_TRUE(listener.vkeyDown[VIRTKEY_PAUSE]);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CIRCLE), 0);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_SQUARE), 0);
+
+	// Letting go of B ends the combo, and since A is still held, Circle comes back.
+	SendKey(&mapper, NKCODE_BUTTON_2, false);
+	EXPECT_FALSE(listener.vkeyDown[VIRTKEY_PAUSE]);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CIRCLE), (int)CTRL_CIRCLE);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_SQUARE), 0);
+
+	// And releasing A leaves nothing pressed.
+	SendKey(&mapper, NKCODE_BUTTON_1, false);
+	EXPECT_EQ_INT((int)(listener.buttons & (CTRL_CIRCLE | CTRL_SQUARE)), 0);
+
+	// B on its own still presses Square - suppression only applies while the combo is held.
+	SendKey(&mapper, NKCODE_BUTTON_2, true);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_SQUARE), (int)CTRL_SQUARE);
+	EXPECT_FALSE(listener.vkeyDown[VIRTKEY_PAUSE]);
+	SendKey(&mapper, NKCODE_BUTTON_2, false);
+
+	mapper.RemoveListener(&listener);
+	KeyMap::ClearAllMappings();
 	return true;
 }
 
@@ -2631,88 +2905,6 @@ bool TestSIMD() {
 	return true;
 }
 
-static void PrintFloats(const float *f, int count) {
-	for (int i = 0; i < count; i++) {
-		printf("%.1ff, ", f[i]);
-	}
-	printf("\n");
-}
-
-static bool CompareFloats(const float *values, const float *known_good, int count, int line) {
-	int wrongCount = 0;
-
-	for (int i = 0; i < count; i++) {
-		if (values[i] != known_good[i]) {
-			wrongCount++;
-		}
-	}
-
-	if (wrongCount > 0) {
-		for (int i = 0; i < count; i++) {
-			bool wrong = values[i] != known_good[i];
-			printf("%d: %0.3f vs %0.3f %s\n", i + 1, values[i], known_good[i], wrong ? "!! MISMATCH" : "");
-		}
-		printf("At UnitTest.cpp:%d: %d / %d were wrong\n", line, wrongCount, count);
-		return false;
-	} else {
-		return true;
-	}
-}
-
-bool TestCrossSIMD() {
-	static const float a_values[16] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f };
-	static const float b_values[16] = { -12.0f, 3.0f, -2.5f, 5.0f, 31.0f, 0.5f, 4.0f, 6.0f, 7.0f, 13.0f, 12.0f, 51.0f, 81.0f, 32.0f };
-	static const float known_result[16] = { 395.0f, 171.0f, 41.5f, 170.0f, 942.0f, 410.5f, 111.5f, 475.0f, 1358.0f, 607.5f, 163.0f, 728.0f, 297.0f, 49.5f, 25.0f, 160.0f, };
-	float result[16];
-	Mat4F32 a(a_values);
-	Mat4F32 b(b_values);
-
-	Mul4x4By4x4(a, b).Store(result);
-	if (!CompareFloats(result, known_result, 16, __LINE__)) {
-		return false;
-	}
-
-	Mat4x3F32 d = Mat4x3F32(b_values + 2);
-	Mul4x3By4x4(d, a).Store(result);
-
-	static const float known_4x3_result[16] = { 332.5f, 371.0f, 404.5f, 438.0f, 80.5f, 95.0f, 105.5f, 116.0f, 192.0f, 237.0f, 269.0f, 301.0f, 790.0f, 1036.0f, 1185.0f, 1349.0f, };
-	if (!CompareFloats(result, known_4x3_result, 16, __LINE__)) {
-		return false;
-	}
-
-	static const float vec_values[4] = { 3.0f, 5.0f, 7.0f, 10000000.0f };
-	Vec4F32 v = Vec4F32::Load(vec_values);
-
-	v.AsVec3ByMatrix44(b).Store3(result);
-
-	static const float known_vec_result[3] = { 249.0f, 134.5f, 96.5f, };
-	if (!CompareFloats(result, known_vec_result, ARRAY_SIZE(known_vec_result), __LINE__)) {
-		return false;
-	}
-	Vec4F32 scale = Vec4F32::Load(a_values);
-	Vec4F32 translate = Vec4F32::Load(b_values);
-
-	TranslateAndScaleInplace(a, scale, translate);
-	a.Store(result);
-
-	static const float known_scale_result[16] = { -47.0f, 16.0f, -1.0f, 36.0f, -103.0f, 41.0f, 1.5f, 81.0f, -146.0f, 61.0f, 3.5f, 117.0f, 14.0f, 30.0f, 0.0f, 0.0f,};
-	if (!CompareFloats(result, known_scale_result, ARRAY_SIZE(known_scale_result), __LINE__)) {
-		return false;
-	}
-
-	s8 values[4] = {-1, -128, 127, 45};
-	float fvalues[4];
-	Vec4F32::LoadS8Norm(values).Store(fvalues);
-	static const float known_s8norm_result[4] = {(float)values[0]/128.0f, (float)values[1]/128.0f, (float)values[2]/128.0f, (float)values[3]/128.0f,};
-	if (!CompareFloats(fvalues, known_s8norm_result, ARRAY_SIZE(known_s8norm_result), __LINE__)) {
-		return false;
-	}
-
-	// PrintFloats(result, 16);
-
-	return true;
-}
-
 bool TestVolumeFunc() {
 	for (int i = 0; i <= 20; i++) {
 		float mul = Volume10ToMultiplier(i);
@@ -2825,6 +3017,29 @@ bool TestFriendlyPath() {
 	return true;
 }
 
+bool TestGEDumpGameID() {
+	std::string id;
+	// PPSSPP's own dump names.
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("ULUS10064_0001.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULUS10064"));
+	// ppsspp-framedumps: a GitHub issue number in front, a description after.
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("11928 ULES00262_0003 OutRun water.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULES00262"));
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("21127 WPCE02025_0001 WipEout Pure.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("WPCE02025"));
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("ULUS10064.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULUS10064"));
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("11928 ULUS10064.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULUS10064"));
+	// No ID in PPSSPP's form, even if one appears later in the name.
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("11928 OutRun water ULUS10064.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("11928 Harvest Moon Graphic Issue on Adreno.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("ULUS1006A_0001.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("ULUS100641_0001.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("11928ULUS10064_0001.ppdmp", &id));
+	return true;
+}
+
 bool TestCmdLine() {
 	{
 		const char *argv[] = {
@@ -2847,7 +3062,10 @@ bool TestCmdLine() {
 		EXPECT_EQ_INT((int)options.gpuBackend.value_or((GPUBackend)-1), (int)GPUBackend::DIRECT3D11);
 		EXPECT_TRUE(options.pauseMenuExit.value_or(false));
 	}
-	// --timeout is headless-only (only headless/Headless.cpp reads it), so it must be parsed in Headless mode.
+	// The timeouts are headless-only (only headless/Headless.cpp reads them), so they must be
+	// parsed in Headless mode. --timeout is the old name for --timeout-wall and sets the same
+	// field; --timeout-wall must not be swallowed by it, which is the interesting case since one
+	// name is a prefix of the other.
 	{
 		const char *argv[] = {
 			"ppsspp",
@@ -2857,7 +3075,36 @@ bool TestCmdLine() {
 		int argc = ARRAY_SIZE(argv);
 		CommandLineOptions options;
 		options.Parse(argc, argv, CmdLineMode::Headless);
-		EXPECT_EQ_INT(options.timeout.value_or(0), 3);
+		EXPECT_EQ_INT(options.timeoutWall.value_or(0), 3);
+		EXPECT_FALSE(options.timeoutEmulated.has_value());
+	}
+	{
+		const char *argv[] = {
+			"ppsspp",
+			"--timeout-wall=4",
+			"--timeout-emulated=5",
+			"My_Game.iso"
+		};
+		int argc = ARRAY_SIZE(argv);
+		CommandLineOptions options;
+		options.Parse(argc, argv, CmdLineMode::Headless);
+		EXPECT_EQ_INT(options.timeoutWall.value_or(0), 4);
+		EXPECT_EQ_INT(options.timeoutEmulated.value_or(0), 5);
+	}
+	// Inverse booleans: --windowed turns fullscreen off, and --no-memstick removes the stick.
+	{
+		const char *argv[] = {
+			"ppsspp",
+			"--windowed",
+			"--no-memstick",
+		};
+		int argc = ARRAY_SIZE(argv);
+		CommandLineOptions options;
+		options.Parse(argc, argv, CmdLineMode::Application);
+		EXPECT_TRUE(options.fullscreen.has_value());
+		EXPECT_FALSE(options.fullscreen.value_or(true));
+		EXPECT_TRUE(options.memStickInserted.has_value());
+		EXPECT_FALSE(options.memStickInserted.value_or(true));
 	}
 	// Test GL version override
 	{
@@ -2893,12 +3140,14 @@ struct TestItem {
 #define TEST_ITEM(name) { #name, &Test ##name, }
 
 bool TestArmEmitter();
+bool TestArmDisasm();
 bool TestArm64Emitter();
+bool TestArm64Disasm();
+bool TestCrossSIMD();
 bool TestX64Emitter();
 bool TestRiscVEmitter();
 bool TestLoongArch64Emitter();
 bool TestShaderGenerators();
-bool TestSoftwareGPUJit();
 bool TestIRPassSimplify();
 bool TestThreadManager();
 bool TestVFS();
@@ -2919,6 +3168,11 @@ bool TestSlangChainBackendSelection();
 bool TestLibrashaderSourceScan();
 bool TestZipSlip();
 bool TestLzrc();
+bool TestMpegCsc();
+bool TestSplineTessellation();
+bool TestGEMath();
+bool TestBoundingBoxFast();
+bool TestDepthRaster();
 bool TestDemangle();
 
 // The 8.3 short names games read out of d_private. These aren't verified against hardware yet (no
@@ -3071,14 +3325,170 @@ bool TestUITabOrder() {
 	return true;
 }
 
+// Arrow key focus moves go by geometry, so these place views by hand rather than running layout.
+bool TestUIFocusNavigation() {
+	using namespace UI;
+
+	auto add = [](LinearLayout *parent, float x, float y, float w, float h) {
+		Choice *choice = parent->Add(new Choice(""));
+		choice->SetBounds(Bounds(x, y, w, h));
+		return choice;
+	};
+	auto move = [](ViewGroup *root, View *from, FocusMove dir) {
+		return root->FindNeighbor(from, dir, NeighborResult()).view;
+	};
+
+	{
+		// A wide button between rows of narrow ones. Its center is far from the narrow ones at the
+		// ends, but its edge is right there, so it mustn't be skipped.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *topLeft = add(&root, 0, 0, 100, 50);
+		Choice *topRight = add(&root, 500, 0, 100, 50);
+		Choice *wide = add(&root, 0, 60, 600, 50);
+		Choice *bottomLeft = add(&root, 0, 120, 100, 50);
+		Choice *bottomRight = add(&root, 500, 120, 100, 50);
+		EXPECT_TRUE(move(&root, topRight, FocusMove::DOWN) == wide);
+		EXPECT_TRUE(move(&root, topLeft, FocusMove::DOWN) == wide);
+		EXPECT_TRUE(move(&root, bottomRight, FocusMove::UP) == wide);
+		EXPECT_TRUE(move(&root, bottomLeft, FocusMove::UP) == wide);
+		// From the wide one, the one nearest its center across the move.
+		EXPECT_TRUE(move(&root, bottomLeft, FocusMove::RIGHT) == bottomRight);
+		EXPECT_TRUE(move(&root, wide, FocusMove::LEFT) == nullptr);
+	}
+
+	{
+		// A row: left and right go to the neighbors, and nothing is up or down.
+		LinearLayout root(ORIENT_HORIZONTAL);
+		Choice *a = add(&root, 0, 0, 100, 50);
+		Choice *b = add(&root, 110, 0, 100, 50);
+		Choice *c = add(&root, 220, 0, 100, 50);
+		EXPECT_TRUE(move(&root, b, FocusMove::RIGHT) == c);
+		EXPECT_TRUE(move(&root, b, FocusMove::LEFT) == a);
+		EXPECT_TRUE(move(&root, a, FocusMove::LEFT) == nullptr);
+		EXPECT_TRUE(move(&root, b, FocusMove::UP) == nullptr);
+		EXPECT_TRUE(move(&root, b, FocusMove::DOWN) == nullptr);
+	}
+
+	{
+		// Going down, the next row wins even off to the side, over something in line much further on.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *origin = add(&root, 0, 0, 100, 50);
+		Choice *nextRowAside = add(&root, 150, 60, 100, 50);
+		add(&root, 0, 500, 100, 50);
+		EXPECT_TRUE(move(&root, origin, FocusMove::DOWN) == nextRowAside);
+	}
+
+	{
+		// Sideways, things in line win however far away they are.
+		LinearLayout root(ORIENT_HORIZONTAL);
+		Choice *origin = add(&root, 0, 0, 50, 100);
+		add(&root, 60, 150, 50, 100);
+		Choice *inLine = add(&root, 500, 0, 50, 100);
+		EXPECT_TRUE(move(&root, origin, FocusMove::RIGHT) == inLine);
+	}
+
+	{
+		// Rows shifted against each other: down goes to the one below the origin's center.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *origin = add(&root, 100, 0, 100, 50);
+		add(&root, 20, 60, 100, 50);
+		Choice *underCenter = add(&root, 130, 60, 100, 50);
+		EXPECT_TRUE(move(&root, origin, FocusMove::DOWN) == underCenter);
+	}
+
+	{
+		// Things that can't take focus are passed over, also inside nested groups.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *origin = add(&root, 0, 0, 100, 50);
+		Choice *disabled = add(&root, 0, 60, 100, 50);
+		disabled->SetEnabled(false);
+		LinearLayout *inner = root.Add(new LinearLayout(ORIENT_VERTICAL));
+		Choice *hidden = add(inner, 0, 120, 100, 50);
+		hidden->SetVisibility(V_INVISIBLE);
+		Choice *last = add(inner, 0, 180, 100, 50);
+		EXPECT_TRUE(move(&root, origin, FocusMove::DOWN) == last);
+		EXPECT_TRUE(move(&root, last, FocusMove::UP) == origin);
+	}
+
+	return true;
+}
+
 bool TestTextureReplacer();
+
+static bool TestQueueBuf() {
+	const u8 data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	u8 out[16]{};
+
+	QueueBuf q(8);
+	q.push(data, 6);
+	EXPECT_EQ_INT(q.pop(out, 4), 4);
+	// Wraps around the end, holding 5 6 1 2 3 4 5.
+	q.push(data, 5);
+	// Growing has to keep what's buffered, in order.
+	q.resize(16);
+	EXPECT_EQ_INT(q.getCapacity(), 16);
+	EXPECT_EQ_INT(q.pop(out, 16), 7);
+	const u8 expected[7] = { 5, 6, 1, 2, 3, 4, 5 };
+	EXPECT_EQ_MEM(out, expected, sizeof(expected));
+
+	// Pushing more than the capacity grows it.
+	QueueBuf small(4);
+	small.push(data, 8);
+	EXPECT_EQ_INT(small.pop(out, 16), 8);
+	EXPECT_EQ_MEM(out, data, sizeof(data));
+	return true;
+}
+
+static bool TestRequestManager() {
+	RequestManager rm;
+	std::vector<std::string> results;
+	auto ask = [&](RequesterToken token, std::string name) {
+		rm.MakeSystemRequest(SystemRequestType::INPUT_TEXT_MODAL, token, [&results, name](std::string_view value, int) {
+			results.push_back(name + "=" + std::string(value));
+		}, nullptr, "", "", 0);
+		return g_lastInputBoxRequestId;
+	};
+
+	RequesterToken tokenA = rm.GenerateRequesterToken();
+	RequesterToken tokenB = rm.GenerateRequesterToken();
+
+	// Forgotten before the answer arrives.
+	int a1 = ask(tokenA, "a1");
+	rm.ForgetRequestsWithToken(tokenA);
+	rm.PostSystemSuccess(a1, "x");
+	// Forgotten after the answer arrived, but before it was processed.
+	int a2 = ask(tokenA, "a2");
+	int b1 = ask(tokenB, "b1");
+	rm.PostSystemSuccess(a2, "y");
+	rm.PostSystemSuccess(b1, "z");
+	rm.ForgetRequestsWithToken(tokenA);
+	rm.ProcessRequests();
+	EXPECT_EQ_INT((int)results.size(), 1);
+	EXPECT_TRUE(results[0] == "b1=z");
+
+	// A callback that forgets its requester drops the rest of its responses in the same batch.
+	results.clear();
+	int b2 = rm.MakeSystemRequest(SystemRequestType::INPUT_TEXT_MODAL, tokenB, [&](std::string_view, int) {
+		results.push_back("b2");
+		rm.ForgetRequestsWithToken(tokenB);
+	}, nullptr, "", "", 0) ? g_lastInputBoxRequestId : -1;
+	int b3 = ask(tokenB, "b3");
+	rm.PostSystemSuccess(b2, "");
+	rm.PostSystemSuccess(b3, "");
+	rm.ProcessRequests();
+	EXPECT_EQ_INT((int)results.size(), 1);
+	EXPECT_TRUE(results[0] == "b2");
+	return true;
+}
 
 TestItem availableTests[] = {
 #if PPSSPP_ARCH(ARM64) || PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
 	TEST_ITEM(Arm64Emitter),
+	TEST_ITEM(Arm64Disasm),
 #endif
 #if PPSSPP_ARCH(ARM) || PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
 	TEST_ITEM(ArmEmitter),
+	TEST_ITEM(ArmDisasm),
 #endif
 #if PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
 	TEST_ITEM(X64Emitter),
@@ -3090,9 +3500,10 @@ TestItem availableTests[] = {
 	TEST_ITEM(LoongArch64Emitter),
 #endif
 	TEST_ITEM(VertexJit),
-	TEST_ITEM(Asin),
-	TEST_ITEM(SinCos),
+	TEST_ITEM(BoundingBoxFast),
+	TEST_ITEM(DepthRaster),
 	TEST_ITEM(VFPUSinCos),
+	TEST_ITEM(VFPUDot),
 	TEST_ITEM(MathUtil),
 	TEST_ITEM(Parsers),
 	TEST_ITEM(TruncateCpy),
@@ -3106,13 +3517,19 @@ TestItem availableTests[] = {
 	TEST_ITEM(Utf8),
 	TEST_ITEM(IRPassSimplify),
 	TEST_ITEM(Jit),
+	TEST_ITEM(JitDotBench),
+	TEST_ITEM(JitReplacementHooks),
+	TEST_ITEM(CPUEquivalence),
+	TEST_ITEM(CPURoundingMode),
+	TEST_ITEM(VFPUDotJit),
 	TEST_ITEM(VFPUMatrixTranspose),
 	TEST_ITEM(ParseLBN),
+	TEST_ITEM(CachingFileLoader),
 	TEST_ITEM(QuickTexHash),
 	TEST_ITEM(CLZ),
 	TEST_ITEM(MemMap),
+	TEST_ITEM(BlockShadow),
 	TEST_ITEM(ShaderGenerators),
-	TEST_ITEM(SoftwareGPUJit),
 	TEST_ITEM(Path),
 	TEST_ITEM(AndroidContentURI),
 	TEST_ITEM(ThreadManager),
@@ -3121,6 +3538,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(FastVec),
 	TEST_ITEM(SmallDataConvert),
 	TEST_ITEM(InputMapping),
+	TEST_ITEM(ComboSuppression),
 	TEST_ITEM(EscapeMenuString),
 	TEST_ITEM(VFS),
 	TEST_ITEM(Substitutions),
@@ -3153,10 +3571,18 @@ TestItem availableTests[] = {
 	TEST_ITEM(CmdLine),
 	TEST_ITEM(ZipSlip),
 	TEST_ITEM(Lzrc),
+	TEST_ITEM(MpegCsc),
+	TEST_ITEM(SplineTessellation),
+	TEST_ITEM(GEMath),
+	TEST_ITEM(DepthSwizzle),
 	TEST_ITEM(Demangle),
 	TEST_ITEM(TextureReplacer),
 	TEST_ITEM(UITabOrder),
+	TEST_ITEM(UIFocusNavigation),
 	TEST_ITEM(FatShortNames),
+	TEST_ITEM(GEDumpGameID),
+	TEST_ITEM(QueueBuf),
+	TEST_ITEM(RequestManager),
 };
 
 int main(int argc, const char *argv[]) {

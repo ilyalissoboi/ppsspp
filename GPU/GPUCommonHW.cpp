@@ -416,11 +416,6 @@ void GPUCommonHW::CheckConfigChanged(const DisplayLayoutConfig &config) {
 		BuildReportingInfo();
 		configChanged_ = false;
 	}
-
-	// Check needed when running tests.
-	if (framebufferManager_) {
-		framebufferManager_->CheckPostShaders(config);
-	}
 }
 
 void GPUCommonHW::CheckDisplayResized() {
@@ -592,6 +587,9 @@ u32 GPUCommonHW::CheckGPUFeatures() const {
 
 	if (draw_->GetDeviceCaps().samplerLodControl) {
 		features |= GPU_USE_SAMPLER_LOD_CONTROL;
+		if (!draw_->GetDeviceCaps().samplerLodBias) {
+			features |= GPU_USE_SHADER_LOD_BIAS;
+		}
 	}
 
 	if (draw_->GetDeviceCaps().framebufferFetchSupported) {
@@ -615,11 +613,13 @@ u32 GPUCommonHW::CheckGPUFeatures() const {
 		features |= GPU_USE_VS_RANGE_CULLING;
 	}
 
-	// Set this to true to easily test our fallback shaders for depth clamp and min/max clipping.
-	// DO NOT check that in! This should be false normally.
-	constexpr bool simulateOldMali = false;
-	if (simulateOldMali) {
-		features &= ~(GPU_USE_CLIP_DISTANCE | GPU_USE_CULL_DISTANCE | GPU_USE_DEPTH_CLAMP);
+	// Headless --disable-gpu-features, to test the fallbacks for GPUs without them (old Mali has none of
+	// clip distance, cull distance and depth clamp).
+	features &= ~PSP_CoreParameter().disabledGPUFeatures;
+	if (!(features & GPU_USE_CLIP_DISTANCE)) {
+		// Hardware depth clamp turns off clipping at the near plane too, which the vertex shader can then only
+		// do with a clip plane. The fragment shader fallback keeps it.
+		features &= ~GPU_USE_DEPTH_CLAMP;
 	}
 
 	return features;
@@ -672,6 +672,9 @@ std::string GPUCommonHW::DebugGetShaderString(std::string id, DebugShaderType ty
 }
 
 bool GPUCommonHW::GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes) {
+	if (type == GPU_DBG_FRAMEBUF_DISPLAY) {
+		return framebufferManager_->GetDisplayFramebuffer(buffer, maxRes);
+	}
 	u32 fb_address = type == GPU_DBG_FRAMEBUF_RENDER ? (gstate.getFrameBufRawAddress() | 0x04000000) : framebufferManager_->DisplayFramebufAddr();
 	int fb_stride = type == GPU_DBG_FRAMEBUF_RENDER ? gstate.FrameBufStride() : framebufferManager_->DisplayFramebufStride();
 	GEBufferFormat format = type == GPU_DBG_FRAMEBUF_RENDER ? gstate_c.framebufFormat : framebufferManager_->DisplayFramebufFormat();
@@ -732,11 +735,21 @@ void GPUCommonHW::CheckDepthUsage(VirtualFramebuffer *vfb) {
 		if (isWritingDepth || isReadingDepth) {
 			gstate_c.usingDepth = true;
 			gstate_c.clearingDepth = isClearingDepth;
-			vfb->last_frame_depth_render = gpuStats.totals.numFlips;
-			if (isWritingDepth) {
-				vfb->last_frame_depth_updated = gpuStats.totals.numFlips;
+			auto markDepthUsed = [&]() {
+				vfb->last_frame_depth_render = gpuStats.totals.numFlips;
+				if (isWritingDepth) {
+					vfb->last_frame_depth_updated = gpuStats.totals.numFlips;
+				}
+			};
+			// SetDepthFrameBuffer copies in depth from a framebuffer sharing it, if that's newer than this one's.
+			// A pass that tests against the depth it finds gets that checked before this buffer's depth counts as
+			// used this frame: Brooktown High clears depth through another framebuffer as the last thing in a frame,
+			// and the next frame tests against it (#7223). A pass that only writes depth doesn't need the copy.
+			if (!isReadingDepth) {
+				markDepthUsed();
 			}
 			framebufferManager_->SetDepthFrameBuffer(isClearingDepth);
+			markDepthUsed();
 		}
 	}
 }
@@ -882,8 +895,10 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	}
 
 	// See the documentation for gstate_c.blueToAlpha.
+	// With framebuffer fetch, the shader applies the masks and logic ops to the real bits, which gets the whole
+	// sequence right (OutRun 2006's water mask comes out like the software renderer's), so it isn't needed there.
 	bool blueToAlpha = false;
-	if (PSP_CoreParameter().compat.flags().BlueToAlpha) {
+	if (PSP_CoreParameter().compat.flags().BlueToAlpha && !gstate_c.Use(GPU_USE_FRAMEBUFFER_FETCH)) {
 		if (gstate_c.framebufFormat == GEBufferFormat::GE_FORMAT_565 && gstate.getColorMask() == 0x0FFFFF && !gstate.isLogicOpEnabled()) {
 			blueToAlpha = true;
 			gstate_c.framebufFormat = GEBufferFormat::GE_FORMAT_4444;
@@ -982,14 +997,13 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 			gstate_c.AdvanceVerts(vertexType, count, bytesRead);
 			return;
 		}
+		cyclesExecuted += EstimateFillCycles(prim, verts, inds, count, decoder, vertexType);
 	}
-
-#define MAX_CULL_CHECK_COUNT 2500
 
 	// For now, turn off culling on platforms where we don't have SIMD bounding box tests, like RISC-V.
 #if PPSSPP_ARCH(ARM_NEON) || PPSSPP_ARCH(SSE2)
 
-#define PASSES_CULLING ((vertexType & (GE_VTYPE_THROUGH_MASK | GE_VTYPE_MORPHCOUNT_MASK | GE_VTYPE_WEIGHT_MASK)) || count > MAX_CULL_CHECK_COUNT)
+#define PASSES_CULLING ((vertexType & (GE_VTYPE_THROUGH_MASK | GE_VTYPE_MORPHCOUNT_MASK | GE_VTYPE_WEIGHT_MASK)) != 0)
 
 #else
 
@@ -999,6 +1013,9 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 
 	// If certain conditions are true, do frustum culling.
 	bool passCulling = PASSES_CULLING;
+	if (passCulling && !(flags & ClipInfoFlags::Valid)) {
+		flags = DrawEngineCommon::UncheckedClipInfoFlags();
+	}
 	if (!passCulling) {
 		// Do software culling.
 		if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags)) {
@@ -1088,6 +1105,9 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 
 			bool passCulling = onePassed || PASSES_CULLING;
 			ClipInfoFlags flags{};
+			if (passCulling) {
+				flags = DrawEngineCommon::UncheckedClipInfoFlags();
+			}
 			if (!passCulling) {
 				// Do software culling.
 				if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags)) {
@@ -1097,6 +1117,9 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 				}
 			}
 			if (passCulling) {
+				if (vertexType & GE_VTYPE_THROUGH_MASK) {
+					cyclesExecuted += EstimateFillCycles(newPrim, verts, inds, count, decoder, vertexType);
+				}
 				if (!drawEngineCommon_->SubmitPrim(verts, inds, newPrim, count, decoder, vertTypeID, clockwise, &bytesRead, flags)) {
 					canExtend = false;
 				}
@@ -1189,13 +1212,18 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 			if ((data & 3) != GE_TEXLEVEL_MODE_AUTO && (0x00FF0000 & data) != 0) {
 				goto bail;
 			}
+			if ((data ^ gstate.cmdmem[GE_CMD_TEXLEVEL]) & 0x00FF0000) {
+				// Like Execute_TexLevel. The bias is a uniform with GPU_USE_SHADER_LOD_BIAS.
+				gstate_c.Dirty(DIRTY_MIPBIAS);
+			}
 			gstate.cmdmem[GE_CMD_TEXLEVEL] = data;
 			break;
 		case GE_CMD_CALL:
 		{
 			// A bone matrix probably. If not we bail.
 			const u32 target = gstate_c.getRelativeAddress(data & 0x00FFFFFC);
-			if ((Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA &&
+			if (currentList->HardwareCallDepth() < 2 &&
+				(Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 11 * 4) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 12 * 4) >> 24) == GE_CMD_RET &&
 				(target > currentList->stall || target + 12 * 4 < currentList->stall) &&
@@ -1229,8 +1257,8 @@ bail:
 	const int cmdCount = src - start;
 	// Skip over the commands we just read out manually.
 	if (cmdCount > 0) {
-		UpdatePC(currentList->pc, currentList->pc + cmdCount * 4);
 		currentList->pc += cmdCount * 4;
+		UpdatePC(currentList->pc, currentList->pc);
 		// flush back cull mode
 		if (cullMode != gstate.getCullMode()) {
 			// We rewrote everything to the old cull mode, so flush first.
@@ -1302,6 +1330,7 @@ void GPUCommonHW::Execute_Bezier(u32 op, u32 diff) {
 	surface.num_patches_v = (surface.num_points_v - 1) / 3;
 	surface.primType = gstate.getPatchPrimitiveType();
 	surface.patchFacing = gstate.patchfacing & 1;
+	surface.geExact = PSP_CoreParameter().compat.flags().AccurateSplines;
 
 	SetDrawType(DRAW_BEZIER, PatchPrimToPrim(surface.primType));
 
@@ -1374,6 +1403,7 @@ void GPUCommonHW::Execute_Spline(u32 op, u32 diff) {
 	surface.num_patches_v = surface.num_points_v - 3;
 	surface.primType = gstate.getPatchPrimitiveType();
 	surface.patchFacing = gstate.patchfacing & 1;
+	surface.geExact = PSP_CoreParameter().compat.flags().AccurateSplines;
 
 	SetDrawType(DRAW_SPLINE, PatchPrimToPrim(surface.primType));
 
@@ -1478,8 +1508,8 @@ void GPUCommonHW::Execute_WorldMtxNum(u32 op, u32 diff) {
 	gstate.worldmtxnum = (GE_CMD_WORLDMATRIXNUMBER << 24) | ((op & 0xF) + count);
 
 	// Skip over the loaded data, it's done now.
-	UpdatePC(currentList->pc, currentList->pc + count * 4);
 	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
 }
 
 void GPUCommonHW::Execute_WorldMtxData(u32 op, u32 diff) {
@@ -1531,8 +1561,8 @@ void GPUCommonHW::Execute_ViewMtxNum(u32 op, u32 diff) {
 	gstate.viewmtxnum = (GE_CMD_VIEWMATRIXNUMBER << 24) | ((op & 0xF) + count);
 
 	// Skip over the loaded data, it's done now.
-	UpdatePC(currentList->pc, currentList->pc + count * 4);
 	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
 }
 
 void GPUCommonHW::Execute_ViewMtxData(u32 op, u32 diff) {
@@ -1584,8 +1614,8 @@ void GPUCommonHW::Execute_ProjMtxNum(u32 op, u32 diff) {
 	gstate.projmtxnum = (GE_CMD_PROJMATRIXNUMBER << 24) | ((op & 0xF) + count);
 
 	// Skip over the loaded data, it's done now.
-	UpdatePC(currentList->pc, currentList->pc + count * 4);
 	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
 }
 
 void GPUCommonHW::Execute_ProjMtxData(u32 op, u32 diff) {
@@ -1639,8 +1669,8 @@ void GPUCommonHW::Execute_TgenMtxNum(u32 op, u32 diff) {
 	gstate.texmtxnum = (GE_CMD_TGENMATRIXNUMBER << 24) | ((op & 0xF) + count);
 
 	// Skip over the loaded data, it's done now.
-	UpdatePC(currentList->pc, currentList->pc + count * 4);
 	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
 }
 
 void GPUCommonHW::Execute_TgenMtxData(u32 op, u32 diff) {
@@ -1687,8 +1717,8 @@ void GPUCommonHW::Execute_BoneMtxNum(u32 op, u32 diff) {
 	gstate.boneMatrixNumber = (GE_CMD_BONEMATRIXNUMBER << 24) | ((op & 0x7F) + count);
 
 	// Skip over the loaded data, it's done now.
-	UpdatePC(currentList->pc, currentList->pc + count * 4);
 	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
 }
 
 void GPUCommonHW::Execute_BoneMtxData(u32 op, u32 diff) {
@@ -1748,8 +1778,8 @@ void GPUCommonHW::FormatGPUStatsCommon(StringWriter &w) {
 		gpuStats.perFrame.vertexGPUCycles + gpuStats.perFrame.otherGPUCycles,
 		vertexAverageCycles);
 	w.F("FBOs active: %d (evaluations: %d, created %d)\n"
-		"Textures: %d (s: %d), dec: %d, invalidated: %d, changed %d, hashed: %d kB, clut %d\n"
-		"readbacks %d (%d non-block), upload %d (cached %d), depal %d\n"
+		"Text: %d (s: %d), dec: %d, invalidated: %d, changed %d, hashed: %d kB, clut %d\n"
+		"readbacks %d (%d non-block), upload %d (cached %d), depal %d, video %d\n"
 		"block transfers: %d\n"
 		"Cpy: depth %d, color %d, reint %d, blend %d, self %d\n",
 		(int)framebufferManager_->NumVFBs(),
@@ -1767,6 +1797,7 @@ void GPUCommonHW::FormatGPUStatsCommon(StringWriter &w) {
 		gpuStats.perFrame.numUploads,
 		gpuStats.perFrame.numCachedUploads,
 		gpuStats.perFrame.numDepal,
+		gpuStats.perFrame.numVideoTextures,
 		gpuStats.perFrame.numBlockTransfers,
 		gpuStats.perFrame.numDepthCopies,
 		gpuStats.perFrame.numColorCopies,

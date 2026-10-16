@@ -42,11 +42,11 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceView;
-import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
+import android.webkit.MimeTypeMap;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.Toast;
@@ -55,6 +55,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.FileProvider;
 import androidx.core.graphics.Insets;
 import androidx.core.view.DisplayCutoutCompat;
 import androidx.core.view.ViewCompat;
@@ -69,6 +70,7 @@ import java.util.List;
 import java.util.Locale;
 import java.io.File;
 import java.io.InputStream;
+import java.lang.ref.WeakReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -78,19 +80,22 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	// Allows us to skip a lot of initialization on secondary calls to onCreate.
 	private static boolean initialized = false;
 
-	// False to use Vulkan, queried from C++ after NativeApp.init.
-	private static boolean javaGL = true;
+	// The activity that owns the native side (the render thread, the audio). Usually the only one alive, but
+	// not always: after a finish() and a quick relaunch, Android creates and resumes the new activity before
+	// the old one's onStop and onDestroy, which then must leave the native side alone. Weak, so this alone
+	// doesn't keep a destroyed activity around.
+	private static WeakReference<PpssppActivity> currentActivity = new WeakReference<>(null);
+	// Numbers the activities, for the log.
+	private static int activityCounter = 0;
+	private int activityNumber = 0;
 
-	// Lifecycle tracker, to detect erroneous states.
-	private final LifeCycle lifeCycle = new LifeCycle();
-
-	// Graphics and audio interfaces for Vulkan (javaGL = false)
+	// The surface we hand to the native render loop thread, for both OpenGL and Vulkan.
 	private NativeSurfaceView mSurfaceView;
+	// Which bars updateSystemUiVisibility hid. Before Android 11, the insets don't tell us: decorFitsSystemWindows(false)
+	// sets LAYOUT_STABLE, so they keep the space of hidden bars.
+	private boolean statusBarsHidden = false;
+	private boolean navigationBarsHidden = false;
 	private Surface mSurface;
-
-	// Graphics and audio interfaces for Java EGL (javaGL = true)
-	private NativeGLSurfaceView mGLSurfaceView;
-	protected NativeRenderer nativeRenderer;
 
 	// For accelerometer sensing.
 	private SensorManager mSensorManager;
@@ -105,8 +110,6 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 	private boolean sustainedPerfSupported;
 
-	private View navigationCallbackView = null;
-
 	// audioFocusChangeListener to listen to changes in audio state
 	private AudioFocusChangeListener audioFocusChangeListener;
 	private AudioManager audioManager;
@@ -116,12 +119,19 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	// switched-away from or rotated etc.
 	private boolean shuttingDown;
 
+	// There's one render loop thread. Whether it runs, and on which activity's surface (activityNumber).
+	// surfaceChanged also fires for rotations and resizes, where the thread just keeps going.
+	private static boolean renderLoopRunning = false;
+	private static int renderLoopActivity = 0;
+
 	// Allow for multiple connected gamepads but just consider them the same for now.
 	// Actually this is not entirely true, see the code.
 	private final ArrayList<InputDeviceState> inputPlayers = new ArrayList<>();
 
 	private PowerSaveModeReceiver mPowerSaveModeReceiver = null;
-	private SizeManager sizeManager = null;
+	// The open input boxes. There can be two, if a game's OSK pops up over a UI one.
+	private final ArrayList<AlertDialog> inputDialogs = new ArrayList<>();
+	private NativeSurfaceManager surfaceManager = null;
 	private static LocationHelper mLocationHelper;
 	private static InfraredHelper mInfraredHelper;
 	private static CameraHelper mCameraHelper;
@@ -252,6 +262,10 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	}
 
 	boolean permissionsGranted(String[] permissions, int[] grantResults) {
+		// Empty arrays mean the request was cancelled (for example by another one arriving).
+		if (grantResults.length == 0 || grantResults.length < permissions.length) {
+			return false;
+		}
 		for (int i = 0; i < permissions.length; i++) {
 			if (grantResults[i] != PackageManager.PERMISSION_GRANTED)
 				return false;
@@ -371,9 +385,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		return info.reqGlEsVersion >= 0x30000;
 	}
 
-	public void Initialize() {
-		// Initialize audio classes. Do this here since detectOptimalAudioSettings()
-		// needs audioManager
+	// What every activity needs for itself, not just the first one (Initialize).
+	private void initActivityServices() {
+		// detectOptimalAudioSettings() needs audioManager.
 		this.audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
 		if (this.audioManager != null) {
 			this.audioFocusChangeListener = new AudioFocusChangeListener();
@@ -390,7 +404,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 				NativeApp.sendMessageFromJava("sustained_perf_supported", "1");
 			}
 		}
+	}
 
+	public void Initialize() {
 		// isLandscape is used to trigger GetAppInfo currently, we
 		boolean landscape = NativeApp.isLandscape();
 		Log.d(TAG, "Landscape: " + landscape);
@@ -453,7 +469,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			dataDir = filesDir.getAbsolutePath();
 		}
 		String apkFilePath = appInfo.sourceDir;
-		String cacheDir = getCacheDir().getAbsolutePath();
+		File cacheDirFile = getCacheDir();
+		// Can be null under the same storage conditions as getFilesDir().
+		String cacheDir = cacheDirFile != null ? cacheDirFile.getAbsolutePath() : null;
 
 		String model = Build.MANUFACTURER + ":" + Build.MODEL;
 		String languageRegion = Locale.getDefault().getLanguage() + "_" + Locale.getDefault().getCountry();
@@ -467,9 +485,6 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		int smallestScreenWidthDp = getResources().getConfiguration().smallestScreenWidthDp;
 		NativeApp.audioConfig(optimalFramesPerBuffer, optimalSampleRate);
 		NativeApp.init(model, deviceType, languageRegion, apkFilePath, dataDir, extStorageDir, externalFilesDir, nativeLibDir, additionalStorageDirs, cacheDir, shortcut, installerName, Build.VERSION.SDK_INT, Build.BOARD, smallestScreenWidthDp);
-
-		// Allow C++ to tell us to use JavaGL or not.
-		javaGL = "true".equalsIgnoreCase(NativeApp.queryConfig("androidJavaGL"));
 
 		sendInitialGrants();
 
@@ -488,19 +503,20 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			}
 		}
 
+		// These are static and outlive the activity, and the system services they look up hang on to
+		// the context they came from. So don't give them the activity.
 		if (mLocationHelper == null) {
-			mLocationHelper = new LocationHelper(this);
+			mLocationHelper = new LocationHelper(getApplicationContext());
 		}
 		try {
 			if (mInfraredHelper == null) {
-				mInfraredHelper = new InfraredHelper(this);
+				mInfraredHelper = new InfraredHelper(getApplicationContext());
 			}
 		} catch (Exception e) {
 			mInfraredHelper = null;
 			Log.i(TAG, "InfraredHelper exception: " + e);
 		}
-		// android.graphics.SurfaceTexture is not available before version 11.
-		mCameraHelper = new CameraHelper(this);
+		mCameraHelper = new CameraHelper(getApplicationContext());
 	}
 
 	@NonNull
@@ -561,7 +577,7 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			return;
 		}
 
-		// WARNING: when adding new modes here, check SizeManager's workaround in surfaceCreated.j
+		// WARNING: when adding new modes here, check NativeSurfaceManager.surfaceCreated.
 
 		int nativeRotation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED;
 		switch (rot) {
@@ -623,33 +639,68 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
 		);
 
-		if (orientation == Configuration.ORIENTATION_LANDSCAPE) {
-			if (useImmersive()) {
-				controller.hide(WindowInsetsCompat.Type.statusBars() | WindowInsetsCompat.Type.navigationBars());
-			} else {
-				controller.hide(WindowInsetsCompat.Type.statusBars());  // we always hide the status bar in landscape.
-				controller.show(WindowInsetsCompat.Type.navigationBars());
-			}
+		// We always hide the status bar in landscape.
+		statusBarsHidden = useImmersive() || orientation == Configuration.ORIENTATION_LANDSCAPE;
+		navigationBarsHidden = useImmersive();
+		if (statusBarsHidden) {
+			controller.hide(WindowInsetsCompat.Type.statusBars());
 		} else {
-			if (useImmersive()) {
-				controller.hide(WindowInsetsCompat.Type.statusBars() | WindowInsetsCompat.Type.navigationBars());
-			} else {
-				controller.show(WindowInsetsCompat.Type.statusBars() | WindowInsetsCompat.Type.navigationBars());
-			}
+			controller.show(WindowInsetsCompat.Type.statusBars());
+		}
+		if (navigationBarsHidden) {
+			controller.hide(WindowInsetsCompat.Type.navigationBars());
+		} else {
+			controller.show(WindowInsetsCompat.Type.navigationBars());
+		}
+		// With LAYOUT_STABLE the insets may not change, so the listener wouldn't pick up what we hid.
+		if (mSurfaceView != null) {
+			ViewCompat.requestApplyInsets(mSurfaceView);
 		}
 
-		sizeManager.checkDisplayMeasurements();
+		surfaceManager.updateDisplayMeasurements();
 	}
 
-	public native boolean runVulkanRenderLoop(Surface surface);
+	// Makes this the activity that owns the native side.
+	private void takeOver() {
+		activityNumber = ++activityCounter;
+		PpssppActivity previous = currentActivity.get();
+		currentActivity = new WeakReference<>(this);
+		if (previous == null) {
+			Log.i(TAG, "Activity #" + activityNumber + " created" + (initialized ? ", adopting the native side left running" : ""));
+		} else if (previous.isDestroyed()) {
+			Log.i(TAG, "Activity #" + activityNumber + " replaces #" + previous.activityNumber + ", which is destroyed");
+		} else {
+			// The finish() and quick relaunch case. Fine, but the old one's lifecycle calls from here on are worth seeing.
+			Log.w(TAG, "Activity #" + activityNumber + " replaces #" + previous.activityNumber + ", which is still alive (finishing: " + previous.isFinishing() + ")");
+		}
+	}
+
+	private boolean isCurrent() {
+		return currentActivity.get() == this;
+	}
+
+	// True if this activity owns the native side, otherwise logs that it skipped what.
+	private boolean checkCurrent(String what) {
+		if (isCurrent()) {
+			return true;
+		}
+		PpssppActivity current = currentActivity.get();
+		Log.w(TAG, "Activity #" + activityNumber + ": skipping " + what + ", " + (current != null ? "#" + current.activityNumber : "no activity") + " owns the native side now");
+		return false;
+	}
+
+	// Starts the native render loop thread, which owns the graphics context and its surface.
+	public native boolean runRenderLoop(Surface surface);
 	// Tells the render loop thread to exit, so we can restart it.
-	public native void requestExitVulkanRenderLoop();
+	public native void requestExitRenderLoop();
 
 	@Override
 	public void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
 
 		if (m_hasNoNativeBinary) {
+			// Nothing else gets set up, so everything else that Android calls has to check for this too
+			// or we'll crash before the user gets to read the message.
 			AlertDialog.Builder builder = new AlertDialog.Builder(this);
 			builder.setMessage("The native part of PPSSPP for ABI " + Build.CPU_ABI + " is missing. Try downloading an official build?")
 				.setTitle("Error starting PPSSPP")
@@ -658,6 +709,8 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 				.show();
 			return;
 		}
+
+		takeOver();
 
 		WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
 
@@ -676,12 +729,12 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			Log.i(TAG, "Found achievements host override");
 		}
 
-		lifeCycle.onCreate();
+		Log.i(TAG, "onCreate begin");
 
 		mSensorManager = (SensorManager)getSystemService(Activity.SENSOR_SERVICE);
 		mAccelerometer = mSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
 
-		sizeManager = new SizeManager(this);
+		surfaceManager = new NativeSurfaceManager(this);
 		TextRenderer.init(this);
 		shuttingDown = false;
 		registerCallbacks();
@@ -689,8 +742,12 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		// This calls NativeApp.setDisplayParameters. Make sure that's done early in order
 		// to be able to set defaults when loading config for the first time. Like figuring out
 		// whether to start at 1x or 2x.
-		sizeManager.updateDisplayMeasurements();
+		surfaceManager.updateDisplayMeasurements();
 
+		initActivityServices();
+
+		// On the first run, the shortcut parameter is passed to NativeApp.init in here.
+		final boolean firstRun = !initialized;
 		if (!initialized) {
 			Initialize();
 			initialized = true;
@@ -709,64 +766,18 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		updateAudioFocus(this.audioManager, this.audioFocusChangeListener);
 		NativeApp.audioInit();
 
-		if (javaGL) {
-			mGLSurfaceView = new NativeGLSurfaceView(this);
-			nativeRenderer = new NativeRenderer();
-			int glesVersion = 2;
-			if (isVRDevice()) {
-				glesVersion = 3;
-			} else {
-				ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
-				ConfigurationInfo ci = am != null ? am.getDeviceConfigurationInfo() : null;
-				if (ci != null && ci.reqGlEsVersion >= 0x30000) {
-					glesVersion = 3;
-				}
-			}
-			Log.i(TAG, "Requesting OpenGL ES client version " + glesVersion);
-			mGLSurfaceView.setEGLContextClientVersion(glesVersion);
+		updateSystemUiVisibility();
 
-			sizeManager.setSurfaceView(mGLSurfaceView);
-			setInsetsListener(mGLSurfaceView);
+		mSurfaceView = new NativeSurfaceView(this);
+		surfaceManager.setSurfaceView(mSurfaceView);
+		setInsetsListener(mSurfaceView);
+		setContentView(mSurfaceView);
 
-			// Setup the GLSurface and ask android for the correct
-			// Number of bits for r, g, b, a, depth and stencil components
-			// The PSP only has 16-bit Z so that should be enough.
-			// Might want to change this for other apps (24-bit might be useful).
-			// Actually, we might be able to do without both stencil and depth in
-			// the back buffer, but that would kill non-buffered rendering.
+		// The render loop thread will be started once we get a surface.
 
-			// It appears some gingerbread devices blow up if you use a config chooser at all ???? (Xperia Play)
-			//if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
-
-			// On some (especially older devices), things blow up later (EGL_BAD_MATCH) if we don't set
-			// the format here, if we specify that we want destination alpha in the config chooser, which we do.
-			// http://grokbase.com/t/gg/android-developers/11bj40jm4w/fall-back
-
-			// Tried to mess around with config choosers (NativeEGLConfigChooser) here but fail completely on Xperia Play.
-
-			// Then I tried to require 8888/16/8 but that backfired too, does not work on Mali 450 which is
-			// used in popular TVs and boxes like Mi Box. So we'll just get what we get, I guess...
-
-			// if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.ICE_CREAM_SANDWICH && !Build.MANUFACTURER.equals("Amazon")) {
-			// mGLSurfaceView.setEGLConfigChooser(8, 8, 8, 8, 16, 8);
-			// }
-
-			mGLSurfaceView.setRenderer(nativeRenderer);
-			setContentView(mGLSurfaceView);
-		} else {
-			updateSystemUiVisibility();
-
-			mSurfaceView = new NativeSurfaceView(this);
-			sizeManager.setSurfaceView(mSurfaceView);
-			setInsetsListener(mSurfaceView);
-			setContentView(mSurfaceView);
-
-			// render loop thread will be started once we get a surface.
-		}
-
-		if (shortcutParam != null && !shortcutParam.isEmpty()) {
+		if (!firstRun && shortcutParam != null && !shortcutParam.isEmpty()) {
+			// The native side is already up, so it didn't see this through NativeApp.init.
 			Log.i(TAG, "Got shortcutParam in onCreate on secondary run: " + shortcutParam);
-			// Make sure we only send it once.
 			NativeApp.sendMessageFromJava("shortcutParam", shortcutParam);
 		}
 
@@ -805,7 +816,7 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 					}
 
 					for (InputDeviceState input : inputPlayers) {
-						if (input.getDevice() == device) {
+						if (input.getDevice().getId() == deviceId) {
 							Log.i(TAG, "Unexpected: Device already registered");
 							return;
 						}
@@ -827,9 +838,8 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 						if (state.getDevice().getId() == deviceId) {
 							Log.i(TAG, "Input device removed: " + state.getDevice().getName());
 
-							// Notify Native layer that this specific device is gone
-							// This is important so the C++ side can clear button states
-							NativeApp.sendMessageFromJava("inputDeviceDisconnectedID", String.valueOf(state.getDeviceId()));
+							// Notifies the native side, and releases whatever the device was holding down.
+							state.Disconnect();
 							inputPlayers.remove(i);
 							break;
 						}
@@ -850,6 +860,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	public void onWindowFocusChanged(boolean hasFocus) {
 		Log.i(TAG, "onWindowFocusChanged");
 		super.onWindowFocusChanged(hasFocus);
+		if (m_hasNoNativeBinary) {
+			return;
+		}
 		updateSustainedPerformanceMode();
 		updateSystemUiVisibility();
 	}
@@ -899,7 +912,14 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		}
 		DisplayCutoutCompat cutout = insetCompat.getDisplayCutout();
 		boolean hasCameraCutout = cutout != null && !cutout.getBoundingRects().isEmpty();
-		Insets insets = insetCompat.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+		int types = WindowInsetsCompat.Type.captionBar() | WindowInsetsCompat.Type.displayCutout();
+		if (!statusBarsHidden) {
+			types |= WindowInsetsCompat.Type.statusBars();
+		}
+		if (!navigationBarsHidden) {
+			types |= WindowInsetsCompat.Type.navigationBars();
+		}
+		Insets insets = insetCompat.getInsets(types);
 		int left = insets.left;
 		int right = insets.right;
 		int top = insets.top;
@@ -910,81 +930,81 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	public void notifySurface(Surface surface) {
 		mSurface = surface;
 
-		if (!javaGL) {
-			if (!initialized) {
-				Log.e(TAG, "notifySurface: Saving surface, but can't start/stop threads while not initialized");
-				return;
-			}
+		if (!initialized) {
+			Log.e(TAG, "notifySurface: Saving surface, but can't start/stop threads while not initialized");
+			return;
+		}
 
-			// If we got a surface, this starts the thread. If not, it doesn't.
-			// NOTE: We do not try to join the thread here
-			if (mSurface != null) {
-				// applyFramerate is called in here.
-				Log.i(TAG, "notifySurface: got surface, starting thread.");
-				startRenderLoopThread();
-			} else {
-				Log.i(TAG, "notifySurface: Notified surface is null, not starting thread.");
-			}
-		} else if (mSurface != null) {
-			// JavaGL path.
-			// TODO: This might not be the best place to do this. Seems to cause a surface recreation
-			// unnecessarily.
-			Log.i(TAG, "notifySurface: Applying framerate.");
-			applyFrameRate(mSurface, 60.0f);
+		// If we got a surface, this starts the thread.
+		if (mSurface != null) {
+			// applyFramerate is called in here.
+			Log.i(TAG, "notifySurface: got surface, starting thread.");
+			startRenderLoopThread();
+		} else {
+			// The surface must not be touched once surfaceDestroyed returns. This is what normally stops the
+			// render loop; onStop does it too, for a stopped activity that keeps its surface.
+			Log.i(TAG, "notifySurface: Surface is gone, making sure the render thread is too.");
+			joinRenderLoopThread();
 		}
 		updateSustainedPerformanceMode();
 	}
 
 	// The render loop thread (EmuThread) is now spawned from the native side.
-	protected synchronized void startRenderLoopThread() {
-		if (javaGL) {
-			Log.e(TAG, "JavaGL mode - should not get into startRenderLoopThread.");
-			return;
-		}
-		if (mSurface == null) {
-			Log.w(TAG, "startRenderLoopThread - not starting thread, needs surface");
-			return;
-		}
+	protected void startRenderLoopThread() {
+		synchronized (PpssppActivity.class) {
+			if (mSurface == null) {
+				Log.i(TAG, "Activity #" + activityNumber + ": not starting the render loop yet, no surface");
+				return;
+			}
+			if (!checkCurrent("starting the render loop")) {
+				return;
+			}
+			if (renderLoopRunning) {
+				if (renderLoopActivity == activityNumber) {
+					Log.i(TAG, "Activity #" + activityNumber + ": render loop already running, surface changed in place");
+					return;
+				}
+				// The previous activity should have stopped it when it finished or lost its surface.
+				Log.e(TAG, "Activity #" + activityNumber + ": the render loop is still running on #" + renderLoopActivity + "'s surface. Stopping it first.");
+				requestExitRenderLoop();
+				renderLoopRunning = false;
+			}
 
-		Log.w(TAG, "startRenderLoopThread: Starting thread");
-
-		applyFrameRate(mSurface, 60.0f);
-		runVulkanRenderLoop(mSurface);
+			Log.i(TAG, "Activity #" + activityNumber + ": starting the render loop");
+			applyFrameRate(mSurface, 60.0f);
+			renderLoopRunning = runRenderLoop(mSurface);
+			renderLoopActivity = activityNumber;
+		}
 	}
 
-	private synchronized void joinRenderLoopThread() {
-		if (javaGL) {
-			Log.e(TAG, "JavaGL - should not get into joinRenderLoopThread.");
-			return;
+	// Stops the render loop if it's running on this activity's surface. Waits until the thread has exited.
+	private void joinRenderLoopThread() {
+		synchronized (PpssppActivity.class) {
+			if (!renderLoopRunning) {
+				return;
+			}
+			if (renderLoopActivity != activityNumber) {
+				// After a finish() and a quick relaunch, the old activity's surface goes away late, with the
+				// loop already running on the new one's.
+				Log.i(TAG, "Activity #" + activityNumber + ": leaving the render loop alone, it's running on #" + renderLoopActivity + "'s surface");
+				return;
+			}
+			Log.i(TAG, "Activity #" + activityNumber + ": stopping the render loop");
+			requestExitRenderLoop();
+			renderLoopRunning = false;
 		}
-
-		// This will wait until the thread has exited.
-		Log.i(TAG, "requestExitVulkanRenderLoop");
-		requestExitVulkanRenderLoop();
-	}
-
-	void setupSystemUiCallback() {
-		final View decorView = getWindow().peekDecorView();
-		if (decorView == null || decorView == navigationCallbackView) {
-			return;
-		}
-
-		sizeManager.setupSystemUiCallback(decorView);
-		navigationCallbackView = decorView;
 	}
 
 	@Override
 	protected void onDestroy() {
 		super.onDestroy();
-		lifeCycle.onDestroy();
-
-		if (javaGL) {
-			nativeRenderer = null;
-			mGLSurfaceView = null;
-		} else {
-			mSurfaceView = null;
-			mSurface = null;
+		if (m_hasNoNativeBinary) {
+			return;
 		}
+		Log.i(TAG, "onDestroy begin");
+
+		mSurfaceView = null;
+		mSurface = null;
 
 		mSensorManager = null;
 		mAccelerometer = null;
@@ -993,25 +1013,39 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		audioFocusChangeListener = null;
 		audioManager = null;
 
-		sizeManager.setSurfaceView(null);
+		surfaceManager.setSurfaceView(null);
 		if (mPowerSaveModeReceiver != null) {
 			mPowerSaveModeReceiver.destroy(this);
 			mPowerSaveModeReceiver = null;
 		}
-
-		// TODO: Can we ensure that the GL thread has stopped rendering here?
-		// I've seen crashes that seem to indicate that sometimes it hasn't...
-		NativeApp.audioShutdown();
-		if (shuttingDown) {
-			Log.i(TAG, "in onDestroy, shutting down. Calling NativeApp.shutdown().");
-			NativeApp.shutdown();
-			unregisterCallbacks();
-			initialized = false;
-		} else {
-			Log.i(TAG, "in onDestroy, but not shutting down.");
+		// Otherwise its window leaks, and its request is never answered. Dismissing answers it as cancelled.
+		for (AlertDialog dlg : new ArrayList<>(inputDialogs)) {
+			dlg.dismiss();
 		}
-		navigationCallbackView = null;
+		inputDialogs.clear();
 
+		// After finish(), Android is free to deliver onDestroy late, after it has already created and resumed a
+		// new activity if the user was quick to relaunch. That one found initialized still set and adopted the
+		// native state, so shutting down here would pull the audio and the graphics context out from under it.
+		// (recreate() is not affected, it destroys the old activity before creating the new one.)
+		if (checkCurrent("shutting down audio and the native side in onDestroy")) {
+			// TODO: Can we ensure that the GL thread has stopped rendering here?
+			// I've seen crashes that seem to indicate that sometimes it hasn't...
+			NativeApp.audioShutdown();
+			if (shuttingDown) {
+				Log.i(TAG, "in onDestroy, shutting down. Calling NativeApp.shutdown().");
+				NativeApp.shutdown();
+				unregisterCallbacks();
+				initialized = false;
+			} else if (!isChangingConfigurations()) {
+				// Backed out of, or destroyed by the system, with the native side left running for the next
+				// activity. Until that one registers, the native side mustn't keep this one alive or call it.
+				Log.i(TAG, "in onDestroy, but not shutting down. Letting go of the activity.");
+				unregisterCallbacks();
+			} else {
+				Log.i(TAG, "in onDestroy, but not shutting down.");
+			}
+		}
 		// Really ugly workaround for VR issues when PPSSPP restarts
 		if (isVRDevice()) {
 			System.exit(0);
@@ -1019,42 +1053,80 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		Log.i(TAG, "onDestroy end");
 	}
 
+	// Emulation, audio and input follow visibility (onStart/onStop) rather than focus (onPause/onResume): a
+	// permission dialog on top, or the other app of a split screen having focus, leaves the game on screen,
+	// and it should keep running and playing. The render loop is really owned by the surface (notifySurface),
+	// which normally goes away with the visibility anyway.
 	@Override
 	protected void onStart() {
 		super.onStart();
-		lifeCycle.onStart();
+		if (m_hasNoNativeBinary) {
+			return;
+		}
+		Log.i(TAG, "onStart begin");
+
+		// A replaced activity shouldn't be started again, but if it is, the native side isn't its to resume.
+		if (checkCurrent("resuming audio and location in onStart")) {
+			if (mLocationHelper != null) {
+				mLocationHelper.resume();
+			}
+			NativeApp.resume();
+		}
+		updateAudioFocus(this.audioManager, this.audioFocusChangeListener);
+		mSensorManager.registerListener(this, mAccelerometer, SensorManager.SENSOR_DELAY_GAME);
+
+		InputManager inputManager = (InputManager)getSystemService(Context.INPUT_SERVICE);
+		inputManager.registerInputDeviceListener(inputDeviceListener, null);
+
+		// In case the surface outlived the stop. Otherwise this waits for surfaceCreated.
+		startRenderLoopThread();
+		Log.i(TAG, "onStart end");
 	}
 
 	@Override
 	protected void onStop() {
 		super.onStop();
-		lifeCycle.onStop();
+		if (m_hasNoNativeBinary) {
+			return;
+		}
+		Log.i(TAG, "onStop begin");
+
+		InputManager inputManager = (InputManager)getSystemService(Context.INPUT_SERVICE);
+		inputManager.unregisterInputDeviceListener(inputDeviceListener);
+
+		// Normally surfaceDestroyed has done this already, but not every device destroys the surface of a
+		// stopped activity, and an invisible game shouldn't keep running.
+		joinRenderLoopThread();
+
+		mSensorManager.unregisterListener(this);
+		loseAudioFocus(this.audioManager, this.audioFocusChangeListener);
+
+		// After a finish() and a quick relaunch, this comes after the new activity's onStart, and the audio and
+		// the location updates are its now.
+		if (checkCurrent("pausing audio and location in onStop")) {
+			Log.i(TAG, "Calling NativeApp.pause...");
+			NativeApp.pause();
+			if (mLocationHelper != null) {
+				mLocationHelper.pause();
+			}
+		}
+		Log.i(TAG, "onStop end");
 	}
 
 	@Override
 	protected void onPause() {
 		super.onPause();
-		lifeCycle.onPause();
-
-		InputManager inputManager = (InputManager)getSystemService(Context.INPUT_SERVICE);
-		inputManager.unregisterInputDeviceListener(inputDeviceListener);
-
-		if (!javaGL) {
-			Log.i(TAG, "Joining render thread...");
-			joinRenderLoopThread();
-			Log.i(TAG, "Joined render thread");
-		} else if (mGLSurfaceView != null) {
-			Log.i(TAG, "mGLSurfaceView.onPause...");
-			mGLSurfaceView.onPause();
+		if (m_hasNoNativeBinary) {
+			return;
 		}
-
-		Log.i(TAG, "mSensorManager.unregisterListener...");
-		mSensorManager.unregisterListener(this);
-
-		loseAudioFocus(this.audioManager, this.audioFocusChangeListener);
-		sizeManager.onPause();
-		Log.i(TAG, "Calling NativeApp.pause...");
-		NativeApp.pause();
+		Log.i(TAG, "onPause begin");
+		if (isFinishing()) {
+			// Gone for good. A quick relaunch creates the next activity before this one's onStop, and the
+			// render thread has to be free for it by then.
+			Log.i(TAG, "Finishing, joining render thread...");
+			joinRenderLoopThread();
+		}
+		// The camera goes to whichever app has focus.
 		if (mCameraHelper != null) {
 			Log.i(TAG, "Calling mCameraHelper.pause");
 			mCameraHelper.pause();
@@ -1065,10 +1137,12 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	@Override
 	protected void onResume() {
 		super.onResume();
-		lifeCycle.onResume();
+		if (m_hasNoNativeBinary) {
+			return;
+		}
+		Log.i(TAG, "onResume begin");
 
 		updateSustainedPerformanceMode();
-		sizeManager.onResume();
 		updateSystemUiVisibility();
 
 		// OK, config should be initialized, we can query for screen rotation.
@@ -1076,21 +1150,6 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 		if (mCameraHelper != null) {
 			mCameraHelper.resume();
-		}
-
-		updateAudioFocus(this.audioManager, this.audioFocusChangeListener);
-		NativeApp.resume();
-		mSensorManager.registerListener(this, mAccelerometer, SensorManager.SENSOR_DELAY_GAME);
-
-		InputManager inputManager =
-			(InputManager)getSystemService(Context.INPUT_SERVICE);
-		inputManager.registerInputDeviceListener(inputDeviceListener, null);
-
-		if (!javaGL) {
-			// Restart the render loop.
-			startRenderLoopThread();
-		} else if (mGLSurfaceView != null) {
-			mGLSurfaceView.onResume();
 		}
 		Log.i(TAG, "onResume end");
 	}
@@ -1109,18 +1168,20 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	}
 
 	@Override
-	public void onAttachedToWindow() {
-		Log.i(TAG, "onAttachedToWindow");
-		super.onAttachedToWindow();
-		setupSystemUiCallback();
-	}
-
-	@Override
 	public void onConfigurationChanged(@NonNull Configuration newConfig) {
 		super.onConfigurationChanged(newConfig);
-		Log.i(TAG, "onConfigurationChanged");
+		Log.i(TAG, "onConfigurationChanged: orientation=" + newConfig.orientation + " density=" + newConfig.densityDpi
+			+ " screen=" + newConfig.screenWidthDp + "x" + newConfig.screenHeightDp + "dp");
+		if (m_hasNoNativeBinary) {
+			return;
+		}
+		// The surface size change that comes with it is what actually updates the native side, except
+		// for this, which the native side was told once at init. Changes on fold/unfold.
+		NativeApp.sendMessageFromJava("smallestScreenWidthDp", String.valueOf(newConfig.smallestScreenWidthDp));
+		// This re-measures the display, so the density check below sees the new value.
 		updateSystemUiVisibility();
-		sizeManager.updateDpi((float)newConfig.densityDpi);
+		// A density change doesn't resize the surface, so it needs separate handling.
+		surfaceManager.densityChanged();
 	}
 
 	@Override
@@ -1128,7 +1189,10 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		// onConfigurationChanged not called on multi-window change
 		Log.i(TAG, "onMultiWindowModeChanged: isInMultiWindowMode = " + isInMultiWindowMode);
 		super.onMultiWindowModeChanged(isInMultiWindowMode, newConfig);
-		sizeManager.checkDisplayMeasurements();
+		if (m_hasNoNativeBinary) {
+			return;
+		}
+		surfaceManager.updateDisplayMeasurements();
 	}
 
 	// keep this static so we can call this even if we don't
@@ -1164,8 +1228,11 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			return null;
 		}
 
+		// Match by ID - InputDevice objects get replaced after device configuration changes, so after one of
+		// those, comparing references would register the same device again.
+		final int id = device.getId();
 		for (InputDeviceState input : inputPlayers) {
-			if (input.getDevice() == device) {
+			if (input.getDevice().getId() == id) {
 				return input;
 			}
 		}
@@ -1179,8 +1246,14 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 	protected String getInputDeviceDebugString() {
 		StringBuilder buffer = new StringBuilder();
-		for (InputDeviceState input : inputPlayers) {
-			buffer.append(input.getDebugString());
+		// Called from the render thread, while the UI thread can add and remove devices. A debug string
+		// isn't worth locking every input event for, and an exception escaping to native kills the app.
+		try {
+			for (InputDeviceState input : inputPlayers) {
+				buffer.append(input.getDebugString());
+			}
+		} catch (RuntimeException e) {
+			return "(devices changing)";
 		}
 		if (buffer.length() == 0) {
 			return "(no devices)";
@@ -1192,6 +1265,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	// distinguish devices.
 	@Override
 	public boolean dispatchKeyEvent(KeyEvent event) {
+		if (m_hasNoNativeBinary) {
+			return super.dispatchKeyEvent(event);
+		}
 		// Log.d(TAG, "key event source: " + event.getSource());
 		if (NativeApp.isFromSource(event, InputDevice.SOURCE_MOUSE)) {
 			Log.i(TAG, "Forwarding key event from mouse: " + event.getKeyCode() + " useModernB2: " + useModernMouseEventsB2);
@@ -1280,6 +1356,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 
 	@Override
 	public boolean onGenericMotionEvent(MotionEvent event) {
+		if (m_hasNoNativeBinary) {
+			return super.onGenericMotionEvent(event);
+		}
 		if (InputDeviceState.inputSourceIsJoystick(event.getSource())) {
 			InputDeviceState state = getInputDeviceState(event);
 			if (state == null) {
@@ -1343,6 +1422,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	@SuppressLint("NewApi")
 	@Override
 	public boolean onKeyDown(int keyCode, KeyEvent event) {
+		if (m_hasNoNativeBinary) {
+			return super.onKeyDown(keyCode, event);
+		}
 		// Eat these keys, to avoid accidental exits / other screwups.
 		// Maybe there's even more we need to eat on tablets?
 		boolean repeat = event.getRepeatCount() > 0;
@@ -1380,6 +1462,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	@SuppressLint("NewApi")
 	@Override
 	public boolean onKeyUp(int keyCode, KeyEvent event) {
+		if (m_hasNoNativeBinary) {
+			return super.onKeyUp(keyCode, event);
+		}
 		switch (keyCode) {
 			case KeyEvent.KEYCODE_BACK:
 				if (event.isAltPressed()) {
@@ -1421,7 +1506,7 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	}
 
 	// The return value is sent to C++ via requestID.
-	public void inputBox(final int requestId, final String title, String defaultText, String defaultAction) {
+	public void inputBox(final int requestId, final String title, String defaultText, boolean passwordMasking, String defaultAction) {
 		final FrameLayout fl = new FrameLayout(this);
 		final EditText input = new EditText(this);
 		input.setGravity(Gravity.CENTER);
@@ -1430,7 +1515,11 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		editBoxLayout.setMargins(2, 20, 2, 20);
 		fl.addView(input, editBoxLayout);
 
-		input.setInputType(InputType.TYPE_CLASS_TEXT);
+		if (passwordMasking) {
+			input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+		} else {
+			input.setInputType(InputType.TYPE_CLASS_TEXT);
+		}
 		input.setImeOptions(EditorInfo.IME_ACTION_DONE);
 		input.setText(defaultText);
 		input.setFocusableInTouchMode(true);
@@ -1438,27 +1527,39 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		input.selectAll();
 		//input.setSelection(input.getText().length());
 
+		// Answered exactly once: OK and Done are followed by a dismiss.
+		final boolean[] answered = { false };
 		AlertDialog.Builder builder = createDialogBuilder()
 			.setView(fl)
 			.setTitle(title)
 			.setPositiveButton(defaultAction, (d, which) -> {
 				Log.i(TAG, "input box successful");
+				answered[0] = true;
 				NativeApp.sendRequestResult(requestId, true, input.getText().toString(), 0);
 				// Dismiss happens automatically.
 			})
 			.setNegativeButton("Cancel", (d, which) -> d.cancel());
 		builder.setOnDismissListener(	d -> {
 			Log.i(TAG, "input box dismissed");
-			// This will be ignored if we already sent a success.
-			NativeApp.sendRequestResult(requestId, false, "", 0);
-			updateSystemUiVisibility();
+			if (!answered[0]) {
+				answered[0] = true;
+				NativeApp.sendRequestResult(requestId, false, "", 0);
+			}
+			inputDialogs.remove(d);
+			// Also comes after onDestroy dismissed it.
+			if (!isDestroyed()) {
+				updateSystemUiVisibility();
+			}
 		});
 
 		AlertDialog dlg = builder.create();
 		input.setOnEditorActionListener((v, actionId, event) -> {
 			if (actionId == EditorInfo.IME_ACTION_DONE) {
 				Log.i(TAG, "input box successful via Keyboard Done");
-				NativeApp.sendRequestResult(requestId, true, input.getText().toString(), 0);
+				if (!answered[0]) {
+					answered[0] = true;
+					NativeApp.sendRequestResult(requestId, true, input.getText().toString(), 0);
+				}
 
 				// We must dismiss the dialog manually here
 				dlg.dismiss();
@@ -1473,14 +1574,20 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		}
 		try {
 			dlg.show();
+			inputDialogs.add(dlg);
 			input.requestFocus();
 		} catch (Exception e) {
 			NativeApp.reportException(e, "AlertDialog");
+			// The dismiss listener won't run, and the native side (maybe a game's OSK) waits for an answer.
+			if (!answered[0]) {
+				answered[0] = true;
+				NativeApp.sendRequestResult(requestId, false, "", 0);
+			}
 		}
 	}
 
 	public boolean processCommand(String command, String params) {
-		SurfaceView surfView = javaGL ? mGLSurfaceView : mSurfaceView;
+		SurfaceView surfView = mSurfaceView;
 		if (command.equals("launchBrowser")) {
 			// Special case for twitter
 			if (params.startsWith("https://twitter.com/#!/")) {
@@ -1605,6 +1712,13 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 				Log.e(TAG, e.toString());
 				return false;
 			}
+		} else if (command.equals("share_file")) {
+			String[] parts = params.split(":@:", 2);
+			if (parts.length != 2) {
+				Log.e(TAG, "share_file: bad parameter '" + params + "'");
+				return false;
+			}
+			return shareFile(parts[1], parts[0]);
 		} else if (command.equals("toast")) {
 			Toast toast = Toast.makeText(this, params, Toast.LENGTH_LONG);
 			toast.show();
@@ -1621,12 +1735,13 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		} else if (command.equals("inputbox")) {
 			String title = "Input";
 			String defString = "";
-			String[] param = params.split(":@:", 3);
+			String[] param = params.split(":@:", 4);
 			int requestID = Integer.parseInt(param[0]);
-			if (param.length > 1 && !param[1].isEmpty())
-				title = param[1];
-			if (param.length > 2)
-				defString = param[2];
+			boolean passwordMasking = param.length > 1 && param[1].equals("1");
+			if (param.length > 2 && !param[2].isEmpty())
+				title = param[2];
+			if (param.length > 3)
+				defString = param[3];
 			// Workaround for issue #13363 to fix Split/Second game start - it requires text input
 			// but we don't support it on VR devices.
 			if (isVRDevice()) {
@@ -1634,8 +1749,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 				NativeApp.sendRequestResult(requestID, false, defString, 0);
 				return true;
 			}
-			Log.i(TAG, "Launching inputbox: #" + requestID + " " + title + " " + defString);
-			inputBox(requestID, title, defString, "OK");
+			// Don't log defString, it can be a password.
+			Log.i(TAG, "Launching inputbox: #" + requestID + " " + title);
+			inputBox(requestID, title, defString, passwordMasking, "OK");
 			return true;
 		} else if (command.equals("vibrate")) {
 			int milliseconds = -1;
@@ -1776,6 +1892,7 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			} else if (params.equals("stopRecording")) {
 				NativeApp.audioRecording_Stop();
 			}
+			return true;
 		} else if (command.equals("set_keep_screen_bright")) {
 			Window window = this.getWindow();
 			if (params.equals("on")) {
@@ -1822,7 +1939,40 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 			Log.w(TAG, "Unknown string command " + command);
 			return false;
 		}
-		return false;
+	}
+
+	// Offers a file to other apps through the share sheet. The receiver gets read access to this file only.
+	private boolean shareFile(String path, String mimeType) {
+		try {
+			Uri uri;
+			if (path.startsWith("content://")) {
+				// In a folder picked through the storage access framework. Our access to it can be passed on.
+				uri = Uri.parse(path);
+			} else {
+				uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", new File(path));
+			}
+			if (mimeType.isEmpty()) {
+				// Document URIs have the path encoded, so decode before looking for the extension.
+				String decoded = Uri.decode(path);
+				String extension = MimeTypeMap.getFileExtensionFromUrl(Uri.encode(decoded.substring(decoded.lastIndexOf('/') + 1)));
+				String guessed = extension.isEmpty() ? null : MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension.toLowerCase(Locale.ROOT));
+				mimeType = guessed != null ? guessed : "application/octet-stream";
+			}
+			Log.i(TAG, "Sharing " + uri + " as " + mimeType);
+			Intent send = new Intent(Intent.ACTION_SEND);
+			send.setType(mimeType);
+			send.putExtra(Intent.EXTRA_STREAM, uri);
+			// Through a chooser, the read grant only reaches the chosen app via the ClipData.
+			send.setClipData(ClipData.newRawUri("", uri));
+			send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+			startActivity(Intent.createChooser(send, null));
+			return true;
+		} catch (Exception e) {
+			// IllegalArgumentException from FileProvider: a path outside file_paths.xml.
+			Log.e(TAG, "shareFile failed for " + path + ": " + e);
+			NativeApp.reportException(e, path);
+			return false;
+		}
 	}
 
 	public static boolean isVRDevice() {
@@ -1870,6 +2020,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	@Override
 	public void onNewIntent(Intent intent) {
 		super.onNewIntent(intent);
+		if (m_hasNoNativeBinary) {
+			return;
+		}
 
 		Log.i(TAG, "onNewIntent: " + intent.toString());
 
@@ -1899,14 +2052,35 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		}
 	}
 
+	// For commands that carry a native request ID (always first in the parameter), answers it as failed, since the
+	// native side waits for an answer.
+	private static void failRequestCommand(String command, String parameter) {
+		if (!command.equals("inputbox") && !command.equals("browse_image") && !command.startsWith("browse_file") && !command.equals("browse_folder")) {
+			return;
+		}
+		try {
+			NativeApp.sendRequestResult(Integer.parseInt(parameter.split(":@:", 2)[0]), false, "", 0);
+		} catch (NumberFormatException e) {
+			Log.e(TAG, "Bad request ID for command '" + command + "'");
+		}
+	}
+
 	// called by the C++ code through JNI. Dispatch anything we can't directly handle
 	// on the gfx thread to the UI thread.
 	@Keep
 	@SuppressWarnings("unused")
 	public void postCommand(String command, String parameter) {
 		runOnUiThread(() -> {
+			// Posted before this activity was destroyed, but runs after.
+			if (isDestroyed()) {
+				Log.w(TAG, "Dropping command '" + command + "' for a destroyed activity");
+				failRequestCommand(command, parameter);
+				return;
+			}
 			if (!processCommand(command, parameter)) {
-				Log.e(TAG, "processCommand failed: cmd: '" + command + "' param: '" + parameter + "'");
+				// Not logging the parameter, an inputbox one can contain a password.
+				Log.e(TAG, "processCommand failed: cmd: '" + command + "'");
+				failRequestCommand(command, parameter);
 			}
 		});
 	}
@@ -1972,6 +2146,8 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		}
 	}
 
+	@Keep
+	@SuppressWarnings("unused")
 	@RequiresApi(api = Build.VERSION_CODES.R)
 	public ArrayList<String> getNativeCrashHistory(int max) {
 		ActivityManager activityManager =

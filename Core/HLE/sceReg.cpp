@@ -1,4 +1,5 @@
 #include <map>
+#include <deque>
 #include <algorithm>
 #include "Core/HLE/sceReg.h"
 #include "Core/HLE/HLE.h"
@@ -58,6 +59,31 @@ struct KeyValue {
 	int intValue;
 	const KeyValue *dirContents;  // intValue is the count.
 };
+
+// Guest-written registry values (sceRegCreateKey / sceRegSetKeyValue), keyed by category path
+// (no leading slash, e.g. "DATA/FONT") then key name. The static dump above is read-only, but
+// plugins like CLANNAD's chfont.prx register their font by creating /DATA/FONT/PROPERTY/INFO18
+// and rewriting /DATA/FONT's path_name and num_fonts at game boot - the game's font library only
+// sees the font if these writes are visible to later reads.
+struct OverlayValue {
+	ValueType type = ValueType::INT;
+	std::string str;  // STR/BIN payload
+	int intValue = 0;
+	bool isDir = false;
+};
+static std::map<std::string, std::map<std::string, OverlayValue>> g_overlay;
+
+// Merged view of a category: static dump entries overridden by g_overlay entries. Cached per
+// path; invalidated whenever the overlay changes. strValue pointers point into strStorage.
+struct MergedCategory {
+	std::vector<KeyValue> keyvals;
+	std::deque<std::string> strStorage;
+};
+static std::map<std::string, MergedCategory> g_mergedCache;
+
+static void InvalidateMergedCache() {
+	g_mergedCache.clear();
+}
 
 // TODO: /DATA/FONT/PROPERTY could just be generated from our fontRegistry in sceFont.cpp.
 
@@ -967,41 +993,42 @@ void __RegInit() {
 	g_openRegistryCount = 0;
 	g_handleGen = 1337;
 	g_openCategories.clear();
+	g_overlay.clear();
+	InvalidateMergedCache();
 }
 
 void __RegShutdown() {
 	g_openCategories.clear();
 	g_openRegistryCount = 0;
+	g_overlay.clear();
+	InvalidateMergedCache();
 }
 
-static const KeyValue *LookupCategory(std::string_view path, int *count) {
-	path = StripPrefix("/", path);
-	std::vector<std::string_view> parts;
-	SplitString(path, '/', parts);
-
+// Walks the static registry dump only (no guest writes applied).
+static const KeyValue *LookupStaticCategory(const std::string &path, int *count) {
 	const KeyValue *curDir = ROOT;
 	int curCount = ARRAY_SIZE(ROOT);
 
-	for (const auto part : parts) {
-		bool found = false;
-		for (int i = 0; i < curCount; i++) {
-			if (equals(curDir[i].name, part)) {
-				// Found the subdir.
-				if (curDir[i].type == ValueType::DIR) {
-					// Must update curCount before curDir, of course (since that line accesses it).
-					curCount = curDir[i].intValue;
-					curDir = curDir[i].dirContents;
-					found = true;
-					break;
-				} else {
-					ERROR_LOG(Log::sceReg, "Not a dir");
-					return nullptr;
+	if (!path.empty()) {
+		std::vector<std::string_view> parts;
+		SplitString(path, '/', parts);
+		for (const auto part : parts) {
+			bool found = false;
+			for (int i = 0; i < curCount; i++) {
+				if (equals(curDir[i].name, part)) {
+					if (curDir[i].type == ValueType::DIR) {
+						curCount = curDir[i].intValue;
+						curDir = curDir[i].dirContents;
+						found = true;
+						break;
+					} else {
+						return nullptr;
+					}
 				}
 			}
-		}
-		if (!found) {
-			WARN_LOG(Log::sceReg, "LookupCategory: Path not found: %.*s", (int)path.size(), path.data());
-			return nullptr;
+			if (!found) {
+				return nullptr;
+			}
 		}
 	}
 
@@ -1009,10 +1036,95 @@ static const KeyValue *LookupCategory(std::string_view path, int *count) {
 	return curDir;
 }
 
+// Merges the static dump entries for path with the overlay entries written by the guest.
+static const MergedCategory &GetMergedCategory(const std::string &path) {
+	auto cached = g_mergedCache.find(path);
+	if (cached != g_mergedCache.end()) {
+		return cached->second;
+	}
+
+	MergedCategory &merged = g_mergedCache[path];
+	int staticCount = 0;
+	const KeyValue *staticKeyvals = LookupStaticCategory(path, &staticCount);
+	if (staticKeyvals) {
+		merged.keyvals.assign(staticKeyvals, staticKeyvals + staticCount);
+	}
+
+	auto overlayIter = g_overlay.find(path);
+	if (overlayIter != g_overlay.end()) {
+		for (const auto &entry : overlayIter->second) {
+			const std::string &keyName = entry.first;
+			const OverlayValue &value = entry.second;
+
+			KeyValue kv;
+			kv.name = keyName;
+			kv.dirContents = nullptr;
+			bool replaced = false;
+			for (auto &existing : merged.keyvals) {
+				if (equals(existing.name, keyName)) {
+					merged.strStorage.push_back(value.str);
+					existing.strValue = merged.strStorage.back().c_str();
+					existing.type = value.type;
+					existing.intValue = value.intValue;
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) {
+				merged.strStorage.push_back(value.str);
+				kv.strValue = merged.strStorage.back().c_str();
+				kv.type = value.type;
+				kv.intValue = value.intValue;
+				merged.keyvals.push_back(kv);
+			}
+		}
+	}
+
+	return merged;
+}
+
+static const KeyValue *LookupCategory(std::string_view path, int *count) {
+	path = StripPrefix("/", path);
+	std::vector<std::string_view> parts;
+	SplitString(path, '/', parts);
+
+	const MergedCategory *cur = &GetMergedCategory("");
+	std::string curPath;
+	for (const auto part : parts) {
+		bool found = false;
+		for (const auto &kv : cur->keyvals) {
+			if (equals(kv.name, part)) {
+				if (kv.type != ValueType::DIR) {
+					ERROR_LOG(Log::sceReg, "Not a dir");
+					return nullptr;
+				}
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			WARN_LOG(Log::sceReg, "LookupCategory: Path not found: %.*s", (int)path.size(), path.data());
+			return nullptr;
+		}
+		if (!curPath.empty()) {
+			curPath += '/';
+		}
+		curPath += std::string(part);
+		cur = &GetMergedCategory(curPath);
+	}
+
+	*count = (int)cur->keyvals.size();
+	return cur->keyvals.data();
+}
+
 void __RegDoState(PointerWrap &p) {
-	auto s = p.Section("sceReg", 0, 2);
-	if (!s)
+	auto s = p.Section("sceReg", 0, 3);
+	if (!s) {
+		if (p.mode == PointerWrap::MODE_READ) {
+			__RegInit();
+		}
 		return;
+	}
 	Do(p, g_openRegistryMode);
 	Do(p, g_openCategories);
 	if (s >= 2) {
@@ -1020,6 +1132,15 @@ void __RegDoState(PointerWrap &p) {
 	} else {
 		// Old states didn't track this. Anything with a category open had the registry open too.
 		g_openRegistryCount = g_openCategories.empty() ? 0 : 1;
+	}
+	if (s >= 3) {
+		Do(p, g_handleGen);
+	} else if (p.mode == PointerWrap::MODE_READ) {
+		// Don't hand out a handle that's still open in the state.
+		g_handleGen = 1337;
+		if (!g_openCategories.empty()) {
+			g_handleGen = std::max(g_handleGen, g_openCategories.rbegin()->first + 1);
+		}
 	}
 }
 
@@ -1036,7 +1157,7 @@ int sceRegOpenRegistry(u32 regParamAddr, int mode, u32 regHandleAddr) {
 		WARN_LOG(Log::HLE, "sceRegOpenRegistry: Opening registry in non-readonly mode. This is not yet supported (we'll simply emulate it as read-only anyway).");
 	}
 
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegCloseRegistry(int regHandle) {
@@ -1049,7 +1170,7 @@ int sceRegCloseRegistry(int regHandle) {
 	if (g_openRegistryCount == 0) {
 		g_openCategories.clear();
 	}
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegFlushRegistry(int regHandle) {
@@ -1057,7 +1178,7 @@ int sceRegFlushRegistry(int regHandle) {
 		return hleLogError(Log::sceReg, SCE_REG_ERROR_REGISTRY_NOT_FOUND);
 	}
 	// For us this is a no-op.
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 // Seems dangerous! Have not dared to test this on hardware.
@@ -1098,7 +1219,7 @@ int sceRegOpenCategory(int regHandle, const char *name, int mode, u32 regHandleA
 	OpenCategory cat{ name, mode };
 	g_openCategories[handle] = cat;
 	Memory::WriteUnchecked_U32(handle, regHandleAddr);
-	return hleLogInfo(Log::sceReg, 0, "open handle: %d", handle);
+	return hleLogDebug(Log::sceReg, 0, "open handle: %d", handle);
 }
 
 int sceRegCloseCategory(int regHandle) {
@@ -1109,7 +1230,7 @@ int sceRegCloseCategory(int regHandle) {
 	}
 
 	g_openCategories.erase(iter);
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegRemoveCategory(int regHandle, const char *name) {
@@ -1140,7 +1261,7 @@ int sceRegGetKeysNum(int catHandle, u32 numAddr) {
 	}
 
 	Memory::WriteUnchecked_U32(count, numAddr);
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegGetKeys(int catHandle, u32 bufAddr, int num) {
@@ -1168,7 +1289,7 @@ int sceRegGetKeys(int catHandle, u32 bufAddr, int num) {
 		strncpy(dest, keyvals[i].name.c_str(), keyLen);
 	}
 
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegGetKeyInfo(int catHandle, const char *name, u32 outKeyHandleAddr, u32 outTypeAddr, u32 outSizeAddr) {
@@ -1210,7 +1331,7 @@ int sceRegGetKeyInfo(int catHandle, const char *name, u32 outKeyHandleAddr, u32 
 				// Let's just make the index the key handle.
 				Memory::WriteUnchecked_U32(size, outSizeAddr);
 			}
-			return hleLogInfo(Log::sceReg, 0, "handle: %d type: %d size: %d", i, (int)keyvals[i].type, size);
+			return hleLogDebug(Log::sceReg, 0, "handle: %d type: %d size: %d", i, (int)keyvals[i].type, size);
 		}
 	}
 
@@ -1249,7 +1370,7 @@ int sceRegGetKeyInfoByName(int catHandle, const char *name, u32 typeAddr, u32 si
 				}
 				Memory::WriteUnchecked_U32(size, sizeAddr);
 			}
-			return hleLogInfo(Log::sceReg, 0, "type: %d size: %d", (int)keyvals[i].type, size);
+			return hleLogDebug(Log::sceReg, 0, "type: %d size: %d", (int)keyvals[i].type, size);
 		}
 	}
 
@@ -1280,13 +1401,13 @@ int sceRegGetKeyValue(int catHandle, int keyHandle, u32 bufAddr, u32 size) {
 	switch (keyval.type) {
 	case ValueType::BIN:
 		Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-		return hleLogInfo(Log::sceReg, 0);
+		return hleLogDebug(Log::sceReg, 0);
 	case ValueType::STR:
 		Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-		return hleLogInfo(Log::sceReg, 0, "value: '%s'", keyval.strValue);
+		return hleLogDebug(Log::sceReg, 0, "value: '%s'", keyval.strValue);
 	case ValueType::INT:
 		Memory::WriteUnchecked_U32(keyval.intValue, bufAddr);
-		return hleLogInfo(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
+		return hleLogDebug(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
 	case ValueType::DIR:
 	case ValueType::FAIL:
 	default:
@@ -1322,14 +1443,14 @@ int sceRegGetKeyValueByName(int catHandle, const char *name, u32 bufAddr, u32 si
 		switch (keyval.type) {
 		case ValueType::BIN:
 			Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-			return hleLogInfo(Log::sceReg, 0);
+			return hleLogDebug(Log::sceReg, 0);
 		case ValueType::STR:
 			Memory::MemcpyUnchecked(bufAddr, keyval.strValue, std::min(size, (u32)keyval.intValue));
-			return hleLogInfo(Log::sceReg, 0, "value: '%s'", keyval.strValue);
+			return hleLogDebug(Log::sceReg, 0, "value: '%s'", keyval.strValue);
 		case ValueType::INT:
 			if (size >= sizeof(u32))
 				Memory::WriteUnchecked_U32(keyval.intValue, bufAddr);
-			return hleLogInfo(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
+			return hleLogDebug(Log::sceReg, 0, "value: %d (0x%08x)", keyval.intValue, keyval.intValue);
 		case ValueType::DIR:
 		case ValueType::FAIL:
 		default:
@@ -1341,11 +1462,117 @@ int sceRegGetKeyValueByName(int catHandle, const char *name, u32 bufAddr, u32 si
 }
 
 int sceRegSetKeyValue(int catHandle, const char *name, u32 bufAddr, u32 size) {
-	return hleLogError(Log::sceReg, 0);
+	if (!name) {
+		return hleLogError(Log::sceReg, -1, "Invalid name pointer");
+	}
+
+	auto iter = g_openCategories.find(catHandle);
+	if (iter == g_openCategories.end()) {
+		return hleLogError(Log::sceReg, 0, "Not an open category");
+	}
+
+	std::string path = iter->second.path;
+	if (!path.empty() && path.front() == '/') {
+		path.erase(path.begin());
+	}
+
+	// A value keeps the type of its key (from sceRegCreateKey or the static dump). The VSH's
+	// registry upgrade rewrites BIN keys like /CONFIG/NP/account_id, and reports the settings as
+	// corrupted if they read back as anything else.
+	ValueType type = ValueType::FAIL;
+	for (const auto &kv : GetMergedCategory(path).keyvals) {
+		if (equals(kv.name, name)) {
+			type = kv.type;
+			break;
+		}
+	}
+
+	if (type == ValueType::FAIL || type == ValueType::DIR) {
+		// chfont.prx (and other callers) pass their whole 32-byte staging buffer as size even for
+		// INT keys, so the size alone doesn't tell the value type. These are all the INT keys of
+		// the font registry entries it writes; anything else falls back to the size heuristic.
+		static const char *const knownIntKeys[] = {
+			"h_size", "v_size", "h_resolution", "v_resolution", "extra_attributes", "weight",
+			"family_code", "style", "sub_style", "language_code", "region_code", "country_code",
+			"expire_date", "shadow_option", "num_fonts",
+		};
+		type = size == sizeof(u32) ? ValueType::INT : ValueType::STR;
+		for (const char *key : knownIntKeys) {
+			if (equals(name, key)) {
+				type = ValueType::INT;
+				break;
+			}
+		}
+	}
+
+	OverlayValue value;
+	value.type = type;
+	if (type == ValueType::INT) {
+		if (!Memory::IsValid4AlignedAddress(bufAddr)) {
+			return hleLogError(Log::sceReg, -1, "bad input addr");
+		}
+		value.intValue = (int)Memory::ReadUnchecked_U32(bufAddr);
+	} else if (Memory::IsValidRange(bufAddr, size)) {
+		const char *str = (const char *)Memory::GetPointerUnchecked(bufAddr);
+		value.str.assign(str, size);
+		// Match the static dump convention: STR lengths include the null terminator.
+		if (type == ValueType::STR && !value.str.empty() && value.str.back() != '\0') {
+			value.str.push_back('\0');
+		}
+		value.intValue = (int)value.str.size();
+	} else {
+		return hleLogError(Log::sceReg, -1, "bad input addr");
+	}
+
+	g_overlay[path][name] = value;
+	InvalidateMergedCache();
+	return hleLogDebug(Log::sceReg, 0, "set %s/%s", path.c_str(), name);
 }
 
 int sceRegCreateKey(int catHandle, const char *name, int type, u32 size) {
-	return hleLogError(Log::sceReg, 0);
+	if (!name) {
+		return hleLogError(Log::sceReg, -1, "Invalid name pointer");
+	}
+
+	auto iter = g_openCategories.find(catHandle);
+	if (iter == g_openCategories.end()) {
+		return hleLogError(Log::sceReg, 0, "Not an open category");
+	}
+
+	OverlayValue value;
+	switch (type) {
+	case REG_TYPE_DIR:
+		value.isDir = true;
+		value.type = ValueType::DIR;
+		break;
+	case REG_TYPE_INT:
+		value.type = ValueType::INT;
+		break;
+	case REG_TYPE_STR:
+		value.type = ValueType::STR;
+		break;
+	case REG_TYPE_BIN:
+		value.type = ValueType::BIN;
+		break;
+	default:
+		return hleLogError(Log::sceReg, -1, "bad type %d", type);
+	}
+
+	std::string path = iter->second.path;
+	if (!path.empty() && path.front() == '/') {
+		path.erase(path.begin());
+	}
+
+	// Creating a key that already exists fails, whatever its type, and leaves the key alone.
+	for (const auto &kv : GetMergedCategory(path).keyvals) {
+		if (equals(kv.name, name)) {
+			return hleLogDebug(Log::sceReg, SCE_REG_ERROR_KEY_ALREADY_EXISTS, "%s/%s already exists", path.c_str(), name);
+		}
+	}
+
+	g_overlay[path][name] = value;
+	InvalidateMergedCache();
+	return hleLogDebug(Log::sceReg, 0, "create %s/%s (type %d)", path.c_str(), name, type);
 }
 // Speculated signature
 int sceRegRemoveKey(int catHandle, int key) {
@@ -1365,7 +1592,7 @@ int sceRegGetCategoryNumAtRoot(int regHandle, u32 numCategoriesPtr) {
 	}
 
 	Memory::WriteUnchecked_U32(numCategories, numCategoriesPtr);
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 int sceRegGetCategoryListAtRoot(int regHandle, u32 bufPtr, int numCategories) {
@@ -1391,7 +1618,7 @@ int sceRegGetCategoryListAtRoot(int regHandle, u32 bufPtr, int numCategories) {
 		}
 	}
 
-	return hleLogInfo(Log::sceReg, 0);
+	return hleLogDebug(Log::sceReg, 0);
 }
 
 const HLEFunction sceReg[] = {

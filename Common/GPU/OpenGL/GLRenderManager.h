@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +31,8 @@ constexpr int MAX_GL_TEXTURE_SLOTS = 8;
 
 class GLRTexture {
 public:
+	GLRTexture(const GLRTexture &) = delete;
+	GLRTexture &operator=(const GLRTexture &) = delete;
 	GLRTexture(const Draw::DeviceCaps &caps, int width, int height, int depth, int numMips);
 	~GLRTexture();
 
@@ -53,6 +56,8 @@ public:
 
 class GLRFramebuffer {
 public:
+	GLRFramebuffer(const GLRFramebuffer &) = delete;
+	GLRFramebuffer &operator=(const GLRFramebuffer &) = delete;
 	GLRFramebuffer(const Draw::DeviceCaps &caps, int _width, int _height, bool z_stencil, const char *tag)
 		: color_texture(caps, _width, _height, 1, 1), z_stencil_texture(caps, _width, _height, 1, 1),
 		width(_width), height(_height), z_stencil_(z_stencil) {
@@ -83,6 +88,8 @@ private:
 
 class GLRShader {
 public:
+	GLRShader(const GLRShader &) = delete;
+	GLRShader &operator=(const GLRShader &) = delete;
 	explicit GLRShader(std::string_view _desc) : desc(_desc) {}
 	~GLRShader() {
 		if (shader) {
@@ -116,6 +123,9 @@ public:
 
 class GLRProgram {
 public:
+	GLRProgram() = default;
+	GLRProgram(const GLRProgram &) = delete;
+	GLRProgram &operator=(const GLRProgram &) = delete;
 	~GLRProgram() {
 		if (deleteCallback_) {
 			deleteCallback_(deleteParam_);
@@ -239,6 +249,11 @@ public:
 	void ThreadStart(Draw::DrawContext *draw);
 	void ThreadEnd();
 	bool ThreadFrame();  // False means it's time to exit.
+	// True if ThreadFrame() has queued work and will not block on an empty queue.
+	bool HasQueuedThreadWork() {
+		std::lock_guard<std::mutex> lock(pushMutex_);
+		return !renderThreadQueue_.empty();
+	}
 
 	void NotifyEmuThreadExit();
 
@@ -798,7 +813,9 @@ public:
 	}
 
 	// Would really love to have a basevertex parameter, but impossible in unextended GLES, without glDrawElementsBaseVertex, unfortunately.
-	void DrawIndexed(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLRBuffer *indexBuffer, uint32_t indexOffset, GLenum mode, int count, GLenum indexType, int instances = 1) {
+	// If maxIndex is known (>= 0), it's passed on to the driver through glDrawRangeElements, which saves drivers that need the index
+	// range (like Panfrost) from scanning the index data on the CPU for every draw.
+	void DrawIndexed(GLRInputLayout *inputLayout, GLRBuffer *vertexBuffer, uint32_t vertexOffset, GLRBuffer *indexBuffer, uint32_t indexOffset, GLenum mode, int count, GLenum indexType, int instances = 1, int maxIndex = -1) {
 		_dbg_assert_(vertexBuffer && indexBuffer && curRenderStep_ && curRenderStep_->stepType == GLRStepType::RENDER);
 		GLRRenderData &data = curRenderStep_->commands.push_uninitialized();
 		data.cmd = GLRRenderCommand::DRAW;
@@ -811,6 +828,7 @@ public:
 		data.draw.count = count;
 		data.draw.indexType = indexType;
 		data.draw.instances = instances;
+		data.draw.maxIndex = maxIndex;
 	}
 
 	enum { MAX_INFLIGHT_FRAMES = 3 };
@@ -827,6 +845,10 @@ public:
 		targetWidth_ = width;
 		targetHeight_ = height;
 		queueRunner_.Resize(width, height);
+	}
+
+	void ForgetBoundFramebuffers() {
+		queueRunner_.ForgetBoundFramebuffers();
 	}
 
 	void UnregisterPushBuffer(GLPushBuffer *buffer) {
@@ -922,7 +944,8 @@ private:
 	bool syncDone_ = false;
 
 	GLDeleter deleter_;
-	bool skipGLCalls_ = false;
+	// Set from either thread, read on the render thread.
+	std::atomic<bool> skipGLCalls_{false};
 
 	int curFrame_ = 0;
 

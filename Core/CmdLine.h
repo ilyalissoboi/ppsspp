@@ -1,6 +1,8 @@
 #pragma once
 
 #include <optional>
+#include <string>
+#include <vector>
 #include "Common/Log.h"
 #include "Core/ConfigValues.h"
 
@@ -41,6 +43,8 @@ struct CommandLineOptions {
 	std::optional<std::string> startScreen;
 
 	std::optional<bool> escapeExit;
+	// Run as if no memory stick were inserted.
+	std::optional<bool> memStickInserted;
 	std::optional<bool> pauseMenuExit;
 
 	// Enables the WebSocket debugger on startup, on this port (0 = pick automatically).
@@ -96,6 +100,10 @@ struct CommandLineOptions {
 	// libraries. Needs a firmware dump under the NAND directory.
 	std::optional<int> disableHLE;
 
+	// The opposite: put our HLE back for libraries that now run the real module by default. The
+	// way to compare the two without editing a config, and the way out if the real one breaks a game.
+	std::optional<int> forceHLE;
+
 	// Headless: install the game update in a .pkg (given as the boot filename) into this
 	// directory, then exit without booting anything. The directory is the game folder itself -
 	// the app puts that under PSP/GAME/<DISC_ID>, but here the caller picks. See
@@ -122,6 +130,15 @@ struct CommandLineOptions {
 	std::optional<std::string> reDecrypt;
 	// Where the plaintext goes. Defaults to "decrypted.bin".
 	std::optional<std::string> reDecryptOut;
+	// The 16-byte secure install ID (32 hex digits) a game patch installed on a PSP was decrypted
+	// with - what the game passes to sceKernelLoadModuleDNAS.
+	std::optional<std::string> reDecryptKey;
+	// The Fuse ID of the PSP a game patch was installed on, overriding the FuseID setting.
+	std::optional<std::string> fuseId;
+	// Headless: copy one file out of the disc image given as the positional argument, to
+	// --dump-file-out, and exit.
+	std::optional<std::string> dumpFile;
+	std::optional<std::string> dumpFileOut;
 
 	std::optional<int> memReadAction;
 	std::optional<int> memWriteAction;
@@ -149,20 +166,40 @@ struct CommandLineOptions {
 	bool optionS = false;   // a legacy option
 
 	std::optional<bool> oldAtrac;
+	std::optional<bool> accurateVdot;
+	std::optional<std::string> jitProfile;
 
 	// Headless options that may also be mildly useful in application mode
 	std::optional<int> resolutionScale;
+	std::optional<int> msaa;
 
 
 	// Headless options
 	std::optional<bool> compare;
 	std::optional<bool> bench;
 	std::optional<bool> verbose;
-	std::optional<double> timeout;
+	// Two independent limits on a headless run, either or both may be set - whichever is reached
+	// first stops it. Wall-clock is what CI wants (a test that hangs must not hang the machine);
+	// emulated is what you want when the question is "has the game had long enough", since a
+	// heavy scene can run tens of times slower than real time and a near-idle one much faster.
+	std::optional<double> timeoutWall;
+	std::optional<double> timeoutEmulated;
 	std::optional<bool> printEqualLines;
+	// Headless: print flips per emulated second at the end, counted from the loaded state (if any).
+	std::optional<bool> frameStats;
 
 	std::optional<std::string> screenshotFilename;
 	std::optional<std::string> screenshotFilenameSave;
+	std::optional<std::string> depthFilenameSave;
+	std::optional<std::string> dumpAudioFilename;
+	std::optional<int> replayEnd;
+	// Headless: apply the game's compatibility settings when replaying a GE frame dump.
+	std::optional<bool> dumpCompat;
+	std::optional<bool> hardwareTransform;
+	std::optional<bool> vertexJit;
+	// Headless: comma-separated clip-distance, cull-distance, depth-clamp, framebuffer-fetch, dual-source-blend.
+	std::optional<std::string> disableGPUFeatures;
+	std::optional<bool> screenshotRenderTarget;
 	std::optional<std::string> screenshotFilenameDiff;
 	// Headless: preserve the alpha channel when saving PNG screenshots.
 	std::optional<bool> screenshotSaveKeepAlpha;
@@ -184,3 +221,6 @@ struct CommandLineOptions {
 	std::optional<double> dpi;
 	std::optional<double> scale;
 };
+
+// Splits a command line string into arguments. Handles double quotes and backslash escapes.
+std::vector<std::string> SplitCommandLine(const std::string &value);
