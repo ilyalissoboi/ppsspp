@@ -583,6 +583,8 @@ OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameT
 			// 30 is an ok value for the max since it's 2^31-1, which is the max value for a signed int. NVIDIA also reports this.
 			caps_.samplerLodControl = true;
 		}
+		// GL_TEXTURE_LOD_BIAS is desktop GL only, so the shader has to apply the bias.
+		caps_.samplerLodBias = false;
 		caps_.texture3DSupported = gl_extensions.GLES3 || gl_extensions.OES_texture_3D;
 		caps_.textureDepthSupported = gl_extensions.GLES3 || gl_extensions.OES_depth_texture;
 	} else {
@@ -625,7 +627,8 @@ OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameT
 	caps_.fragmentShaderStencilWriteSupported = gl_extensions.ARB_shader_stencil_export;
 
 	// GLES has no support for logic framebuffer operations. There doesn't even seem to exist any such extensions.
-	caps_.logicOpSupported = !gl_extensions.IsGLES;
+	// Apple's OpenGL on Apple GPUs (on top of Metal, which has none either) accepts glLogicOp and ignores it.
+	caps_.logicOpSupported = !gl_extensions.IsGLES && gl_extensions.gpuVendor != GPU_VENDOR_APPLE;
 
 	// Always the case in GL (which is what we want for PSP flat shade).
 	caps_.provokingVertexLast = true;
@@ -707,6 +710,10 @@ OpenGLContext::OpenGLContext(bool canChangeSwapInterval) : renderManager_(frameT
 #endif
 
 	shaderLanguageDesc_.Init(GLSL_1xx);
+	// With clip control set up by GLQueueRunner, depth is 0 to w like in Vulkan. Without it, window depth 0
+	// comes from z = -w, where the rasterizer rounds to an ulp of 1.0 rather than of 0: a flat ground at
+	// z = 0 got depths just above 0, and sprites on it that test GEQUAL failed (Puyo Puyo Fever 2).
+	shaderLanguageDesc_.depthMinusOneToOne = !(gl_extensions.ARB_clip_control || gl_extensions.EXT_clip_control);
 
 	shaderLanguageDesc_.glslVersionNumber = gl_extensions.GLSLVersion();
 

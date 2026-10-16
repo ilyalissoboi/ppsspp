@@ -32,16 +32,6 @@
 #include "stddef.h"
 #endif
 
-// Very expensive, time-profiles every block.
-// Not to be released with this enabled.
-//
-// #define IR_PROFILING
-
-// Try to catch obvious misses of be above rule.
-#if defined(IR_PROFILING) && defined(GOLD)
-#error
-#endif
-
 struct IRInst;
 
 namespace MIPSComp {
@@ -68,8 +58,6 @@ public:
 	u32 GetIRArenaOffset() const { return arenaOffset_; }
 	int GetNumIRInstructions() const { return numIRInstructions_; }
 	MIPSOpcode GetOriginalFirstOp() const { return origFirstOpcode_; }
-	bool HasOriginalFirstOp() const;
-	bool RestoreOriginalFirstOp(int number);
 	bool IsValid() const { return origAddr_ != 0 && origFirstOpcode_.encoding != 0x68FFFFFF; }
 	void SetNativeOffset(int offset) {
 		nativeOffset_ = offset;
@@ -99,9 +87,8 @@ public:
 	void Finalize(int number);
 	void Destroy(int number);
 
-#ifdef IR_PROFILING
+	// Only filled in by the IR interpreter, when profiling.
 	JitBlockProfileStats profileStats_{};
-#endif
 
 private:
 	u64 CalculateHash() const;
@@ -163,11 +150,9 @@ public:
 
 	int FindPreloadBlock(u32 em_address);
 
-	// "Cookie" means the 24 bits we inject into the first instruction of each block.
+	// "Cookie" means the value the block shadow holds for a block: its offset into the
+	// IR arena, or into the native code space when compiling to native.
 	int FindByCookie(int cookie);
-
-	std::vector<u32> SaveAndClearEmuHackOps();
-	void RestoreSavedEmuHackOps(const std::vector<u32> &saved);
 
 	JitBlockDebugInfo GetBlockDebugInfo(int blockNum) const override;
 	JitBlockMeta GetBlockMeta(int blockNum) const override {
@@ -179,26 +164,22 @@ public:
 		return meta;
 	}
 	JitBlockProfileStats GetBlockProfileStats(int blockNum) const override {
-#ifdef IR_PROFILING
 		return blocks_[blockNum].profileStats_;
-#else
-		return JitBlockProfileStats{};
-#endif
 	}
 	void ComputeStats(BlockCacheStats &bcStats) const override;
 	int GetBlockNumberFromStartAddress(u32 em_address) const override;
 
 	bool SupportsProfiling() const override {
-#ifdef IR_PROFILING
-		return true;
-#else
-		return false;
-#endif
+		return profiling_;
+	}
+	void SetProfiling(bool profiling) {
+		profiling_ = profiling;
 	}
 
 private:
 	u32 AddressToPage(u32 addr) const;
 	bool compileToNative_;
+	bool profiling_ = false;
 	std::vector<IRBlock> blocks_;
 	std::vector<IRInst> arena_;
 	std::unordered_map<u32, std::vector<int>> byPage_;
@@ -218,13 +199,7 @@ public:
 	void Compile(u32 em_address) override;	// Compiles a block at current MIPS PC
 
 	bool DescribeCodePtr(const u8 *ptr, std::string &name) override;
-	// Not using a regular block cache.
-	JitBlockCache *GetBlockCache() override { return nullptr; }
 	JitBlockCacheDebugInterface *GetBlockCacheDebugInterface() override { return &blocks_; }
-	MIPSOpcode GetOriginalOp(MIPSOpcode op) override;
-
-	std::vector<u32> SaveAndClearEmuHackOps() override { return blocks_.SaveAndClearEmuHackOps(); }
-	void RestoreSavedEmuHackOps(std::vector<u32> saved) override { blocks_.RestoreSavedEmuHackOps(saved); }
 
 	void ClearCache() override;
 	void InvalidateCacheAt(u32 em_address, int length = 4) override;
@@ -237,16 +212,20 @@ public:
 	const u8 *GetDispatcher() const override { return nullptr; }
 	const u8 *GetCrashHandler() const override { return nullptr; }
 
-	void LinkBlock(u8 *exitPoint, const u8 *checkedEntry) override;
-	void UnlinkBlock(u8 *checkedEntry, u32 originalAddress) override;
-
 	// This gets overridden by the native-backed IR jits.
 	const u8 *GetCodeBase() const override { return nullptr; }
 
+	void FlushProfile() override;
+
 protected:
+	template <bool profile>
+	void RunBlocks();
+	virtual void WriteProfileReport();
+
 	bool CompileBlock(u32 em_address, std::vector<IRInst> &instructions, u32 &mipsBytes);
 	virtual bool CompileNativeBlock(IRBlockCache *irBlockCache, int block_num) { return true; }
 	virtual void FinalizeNativeBlock(IRBlockCache *irBlockCache, int block_num) {}
+	virtual void InvalidateNativeBlock(IRBlockCache *irBlockCache, int block_num) {}
 
 	bool compileToNative_;
 
@@ -258,6 +237,8 @@ protected:
 	MIPSState *mips_;
 
 	bool compilerEnabled_ = true;
+	// Set by --jit-profile. The IR interpreter times every block, the native JITs sample the host PC.
+	bool profiling_ = false;
 
 	// where to write branch-likely trampolines. not used atm
 	// u32 blTrampolines_;

@@ -226,15 +226,37 @@ bool DiscIDFromGEDumpPath(const Path &path, FileLoader *fileLoader, std::string 
 		}
 	}
 
-	// Fall back to using the filename.
-	std::string filename = path.GetFilename();
-	// Could be more discerning, but hey..
-	if (filename.size() > 10 && (filename[0] == 'U' || filename[0] == 'N') && filename[9] == '_') {
-		*id = filename.substr(0, 9);
-		return true;
+	// Fall back to the file name.
+	return DiscIDFromGEDumpFilename(path.GetFilename(), id);
+}
+
+// PPSSPP names dumps ULUS10064_0001.ppdmp; the ppsspp-framedumps collection puts the GitHub issue number in
+// front ("11928 ULUS10064_0001 OutRun water.ppdmp").
+bool DiscIDFromGEDumpFilename(std::string_view filename, std::string *id) {
+	size_t start = 0;
+	while (start < filename.size() && filename[start] >= '0' && filename[start] <= '9') {
+		start++;
+	}
+	if (start > 0 && start < filename.size() && filename[start] == ' ') {
+		start++;
 	} else {
+		start = 0;
+	}
+	// The ID is followed by _NNNN, the extension, a description, or nothing.
+	if (filename.size() < start + 9) {
 		return false;
 	}
+	if (filename.size() > start + 9 && filename[start + 9] != '_' && filename[start + 9] != '.' && filename[start + 9] != ' ') {
+		return false;
+	}
+	for (size_t i = 0; i < 9; i++) {
+		const char c = filename[start + i];
+		if (i < 4 ? !(c >= 'A' && c <= 'Z') : !(c >= '0' && c <= '9')) {
+			return false;
+		}
+	}
+	*id = std::string(filename.substr(start, 9));
+	return true;
 }
 
 static void GetBootError(IdentifiedFileType type, std::string *errorString) {
@@ -345,6 +367,7 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 	// Default memory settings
 	// Seems to be the safest place currently..
 	Memory::g_MemorySize = Memory::RAM_NORMAL_SIZE; // 32 MB of ram by default
+	Memory::g_UserPartitionSize = 0;
 
 	g_RemasterMode = false;
 	g_DoubleTextureCoordinates = false;
@@ -396,10 +419,27 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 	case IdentifiedFileType::PSP_PBP_DIRECTORY:
 		// This is normal for homebrew.
 		// ERROR_LOG(Log::Loader, "PBP directory resolution failed.");
-		if (LoadParamSFOFromPBP(fileLoader)) {
+	{
+		const bool hasSFO = LoadParamSFOFromPBP(fileLoader);
+		if (hasSFO) {
 			InitMemorySizeForGame();
 		}
+		// Homebrew written for a PSP-2000+ under custom firmware (e.g. 3.71 M33) can use the top
+		// 32MB of RAM (0x0A000000-0x0C000000) directly, without MEMSIZE=1 in its PARAM.SFO. There
+		// the user partition stays at its normal size, so the heap and thread stacks stay below
+		// 0x0A000000 and the top of RAM is left to the program. NJEMU's slim builds (MVSPSP, CPS2PSP)
+		// work this way (#8925). Map the memory, but don't grow the partition into it: MEMSIZE=1
+		// would, and the program would then overwrite its own heap and stacks.
+		// Homebrew is identified by the MG ("memory stick game") category, or no PARAM.SFO at all.
+		// (g_paramSFO only gets a few keys copied over for a PBP, so the category is in the raw copy.)
+		const bool homebrew = !hasSFO || g_paramSFORaw.GetValueString("CATEGORY") == "MG";
+		if (homebrew && Memory::g_PSPModel != PSP_MODEL_FAT && Memory::g_MemorySize == Memory::RAM_NORMAL_SIZE) {
+			INFO_LOG(Log::Loader, "Homebrew PBP: mapping the PSP-2000 extra RAM, outside the user partition");
+			Memory::g_MemorySize = Memory::RAM_DOUBLE_SIZE;
+			Memory::g_UserPartitionSize = Memory::RAM_NORMAL_SIZE;
+		}
 		break;
+	}
 	case IdentifiedFileType::PSP_ELF:
 		if (Memory::g_PSPModel != PSP_MODEL_FAT) {
 			INFO_LOG(Log::Loader, "ELF, using full PSP-2000 memory access");
@@ -458,7 +498,13 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 	// Homebrew get fake disc IDs assigned to the global paramSFO, so they shouldn't clash with real games.
 
 	std::string discId = g_paramSFO.GetDiscID();
-	g_CoreParameter.compat.Load(discId);
+	if (type == IdentifiedFileType::PPSSPP_GE_DUMP && g_CoreParameter.headLess && !g_CoreParameter.dumpCompat) {
+		// Headless replays frame dumps to compare them with references and with the PSP, which a game's
+		// workarounds would skew: DarkStalkers' present hack replaces the game's final upscale.
+		g_CoreParameter.compat.Clear();
+	} else {
+		g_CoreParameter.compat.Load(discId);
+	}
 	ShowCompatWarnings(g_CoreParameter.compat);
 
 	// This must be before Memory::Init because plugins can override the memory size.
@@ -495,8 +541,6 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 		}
 	}
 
-	InitVFPU();
-
 	LoadSymbolsIfSupported();
 	LoadGameSymbolsIfEnabled();
 
@@ -505,6 +549,10 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 	CoreTiming::Init(&mipsr4k);
 
 	DisplayHWInit();
+
+	// Initialize the HLE state before mounting filesystems. This includes the module tables and
+	// CoreTiming event needed by savestates, but does not inspect any filesystem paths.
+	HLEInit();
 
 	// TODO: Put this somewhere better?
 	if (!g_CoreParameter.mountIso.empty()) {
@@ -518,12 +566,9 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 
 	MountFileSystems();
 
-	// Init all the HLE modules. After the mount, and after the firmware install above, so that the
-	// checks in HLEInit deciding whether a library can run its real module instead of our HLE can
-	// ask the PSP filesystem the way everything else does - and see a firmware this very boot just
-	// installed off the disc. Nothing between CoreTiming::Init above and here touches HLE, and the
-	// kernel and the game's modules both come later, in the switch below.
-	HLEInit();
+	// The module availability checks need the mounted PSP filesystem and the firmware installed
+	// above. Keep them after the mount, before any kernel or game module can be loaded.
+	HLECheckModuleAvailability();
 
 	// Game-specific settings are load from for example Load_PSP_ISO (which calls g_Config.LoadGameConfig).
 	// We can't do things that depend on these before the below switch. So for example, the adjustment of the GPU core

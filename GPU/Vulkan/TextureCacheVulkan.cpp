@@ -143,7 +143,7 @@ VkSampler SamplerCache::GetOrCreateSampler(const SamplerCacheKey &key) {
 
 	if (key.aniso) {
 		// Docs say the min of this value and the supported max are used.
-		samp.maxAnisotropy = 1 << g_Config.iAnisotropyLevel;
+		samp.maxAnisotropy = 1 << key.anisoLevel;
 		samp.anisotropyEnable = true;
 	} else {
 		samp.maxAnisotropy = 1.0f;
@@ -685,7 +685,8 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 	VkFormat actualFmt = plan.scaleFactor > 1 ? VULKAN_8888_FORMAT : dstFmt;
 	bool bcFormat = false;
 	int bcAlign = 0;
-	if (plan.doReplace) {
+	// A replacement of indices for the GPU is uploaded as the CLUT8 format that dstFmt already is.
+	if (plan.doReplace && !plan.decodeToClut8) {
 		Draw::DataFormat fmt = plan.replaced->Format();
 		bcFormat = Draw::DataFormatIsBlockCompressed(fmt, &bcAlign);
 		actualFmt = ToVulkanFormat(fmt);
@@ -837,7 +838,10 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 			// Directly load the replaced image.
 			data = pushBuffer->Allocate(uploadSize, pushAlignment, &texBuf, &bufferOffset);
 			double replaceStart = time_now_d();
-			if (!plan.replaced->CopyLevelTo(plan.baseLevelSrc + i, (uint8_t *)data, uploadSize, byteStride)) {  // If plan.doReplace, this shouldn't fail.
+			const bool copied = plan.decodeToClut8 ?
+				plan.replaced->CopyIndexLevelToPitched(plan.baseLevelSrc + i, (uint8_t *)data, uploadSize, byteStride) :
+				plan.replaced->CopyLevelTo(plan.baseLevelSrc + i, (uint8_t *)data, uploadSize, byteStride);
+			if (!copied) {  // If plan.doReplace, this shouldn't fail.
 				WARN_LOG(Log::G3D, "Failed to copy replaced texture level");
 				// TODO: Fill with some pattern?
 			}
@@ -858,7 +862,18 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 				VkImageView view = entry->vkTex->CreateViewForMip(i);
 				VK_PROFILE_BEGIN(vulkan, cmdInit, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 					"Compute Upload: %dx%d->%dx%d", mipUnscaledWidth, mipUnscaledHeight, mipWidth, mipHeight);
-				ScaleBufferToImage(vulkan, cmdInit, view, texBuf, bufferOffset, srcSize, mipUnscaledWidth, mipUnscaledHeight, mipWidth, mipHeight);
+				if (!ScaleBufferToImage(vulkan, cmdInit, view, texBuf, bufferOffset, srcSize, mipUnscaledWidth, mipUnscaledHeight, mipWidth, mipHeight)) {
+					// Nothing was written to this level. Clear it rather than leave garbage in it.
+					WARN_LOG_ONCE(vkscalefail, Log::G3D, "Hardware texture scaling failed, clearing the texture");
+					VkClearColorValue clear{};
+					VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)i, 1, 0, 1 };
+					vkCmdClearColorImage(cmdInit, entry->vkTex->GetImage(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+					// The barrier at the end of the upload waits on compute, so order the clear before that.
+					VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+					barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+					barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+					vkCmdPipelineBarrier(cmdInit, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+				}
 				VK_PROFILE_END(vulkan, cmdInit, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 				vulkan->Delete().QueueDeleteImageView(view);
 			} else {

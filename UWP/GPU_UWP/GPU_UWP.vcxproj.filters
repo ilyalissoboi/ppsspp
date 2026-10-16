@@ -53,9 +53,9 @@
     <ClCompile Include="..\..\GPU\Software\Sampler.cpp" />
     <ClCompile Include="..\..\GPU\Software\SoftGpu.cpp" />
     <ClCompile Include="..\..\GPU\Software\TransformUnit.cpp" />
+    <ClCompile Include="..\..\GPU\Software\GEMath.cpp" />
     <ClCompile Include="pch.cpp" />
     <ClCompile Include="..\..\GPU\Software\RasterizerRectangle.cpp" />
-    <ClCompile Include="..\..\GPU\Software\RasterizerRegCache.cpp" />
     <ClCompile Include="..\..\GPU\Common\FragmentShaderGenerator.cpp" />
     <ClCompile Include="..\..\GPU\Common\VertexShaderGenerator.cpp" />
     <ClCompile Include="..\..\GPU\Common\ReinterpretFramebuffer.cpp" />
@@ -138,10 +138,11 @@
     <ClInclude Include="..\..\GPU\Software\Sampler.h" />
     <ClInclude Include="..\..\GPU\Software\SoftGpu.h" />
     <ClInclude Include="..\..\GPU\Software\TransformUnit.h" />
+    <ClInclude Include="..\..\GPU\Software\GEMath.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="targetver.h" />
     <ClInclude Include="..\..\GPU\Software\RasterizerRectangle.h" />
-    <ClInclude Include="..\..\GPU\Software\RasterizerRegCache.h" />
+    <ClInclude Include="..\..\GPU\Software\RasterizerTypes.h" />
     <ClInclude Include="..\..\GPU\Common\FragmentShaderGenerator.h" />
     <ClInclude Include="..\..\GPU\Common\VertexShaderGenerator.h" />
     <ClInclude Include="..\..\GPU\Common\ReinterpretFramebuffer.h" />
@@ -175,6 +176,7 @@
       <Filter>Debugger</Filter>
     </ClInclude>
     <ClInclude Include="..\..\GPU\Common\DepthRaster.h" />
+    <ClInclude Include="..\..\GPU\Common\DepthSwizzle.h" />
   </ItemGroup>
   <ItemGroup>
     <Filter Include="Debugger">

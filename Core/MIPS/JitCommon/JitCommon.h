@@ -21,24 +21,24 @@
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
 
 // TODO: Find a better place for these.
 std::vector<std::string> DisassembleArm2(const u8 *data, int size);
 std::vector<std::string> DisassembleArm64(const u8 *data, int size);
-std::vector<std::string> DisassembleX86(const u8 *data, int size);
+// offsets, if given, receives each line's offset from data.
+std::vector<std::string> DisassembleX86(const u8 *data, int size, std::vector<int> *offsets = nullptr);
 std::vector<std::string> DisassembleRV64(const u8 *data, int size);
 std::vector<std::string> DisassembleLA64(const u8 *data, int size);
 
-struct JitBlock;
-class JitBlockCache;
 class JitBlockCacheDebugInterface;
 class PointerWrap;
 
 class MIPSState;
 
 namespace MIPSComp {
-	void JitAt();
+	void JitAt(MIPSState *mips);
 
 	class MIPSFrontendInterface {
 	public:
@@ -47,7 +47,6 @@ namespace MIPSComp {
 		virtual void EatPrefix() = 0;
 
 		virtual void Comp_Generic(MIPSOpcode op) = 0;
-		virtual void Comp_RunBlock(MIPSOpcode op) = 0;
 		virtual void Comp_ReplacementFunc(MIPSOpcode op) = 0;
 		virtual void Comp_ITypeMem(MIPSOpcode op) = 0;
 		virtual void Comp_StoreSync(MIPSOpcode op) = 0;
@@ -127,7 +126,6 @@ namespace MIPSComp {
 		}
 		virtual const u8 *GetDispatcher() const = 0;
 		virtual const u8 *GetCrashHandler() const = 0;
-		virtual JitBlockCache *GetBlockCache() = 0;
 		virtual JitBlockCacheDebugInterface *GetBlockCacheDebugInterface() = 0;
 		virtual void InvalidateCacheAt(u32 em_address, int length = 4) = 0;
 		virtual void DoState(PointerWrap &p) = 0;
@@ -135,17 +133,11 @@ namespace MIPSComp {
 		virtual void Compile(u32 em_address) = 0;
 		virtual void ClearCache() = 0;
 		virtual void UpdateFCR31() = 0;
-		virtual MIPSOpcode GetOriginalOp(MIPSOpcode op) = 0;
-
-		// No jit operations may be run between these calls.
-		// Meant to be used to make memory safe for savestates, memcpy, etc.
-		virtual std::vector<u32> SaveAndClearEmuHackOps() = 0;
-		virtual void RestoreSavedEmuHackOps(std::vector<u32> saved) = 0;
-
-		// Block linking. This may need to work differently for whole-function JITs and stuff
-		// like that.
-		virtual void LinkBlock(u8 *exitPoint, const u8 *entryPoint) = 0;
-		virtual void UnlinkBlock(u8 *checkedEntry, u32 originalAddress) = 0;
+		// Writes out what --jit-profile collected, before the JIT goes away.
+		virtual void FlushProfile() {}
+		// What the block shadow holds for a replacement hook without a compiled block. The
+		// dispatcher has to send this to the compiler.
+		virtual u32 GetBlockShadowHookValue() const { return Memory::BLOCK_SHADOW_HOOK_NO_JIT; }
 	};
 
 	typedef void (MIPSFrontendInterface::*MIPSCompileFunc)(MIPSOpcode opcode);
@@ -172,5 +164,5 @@ namespace MIPSComp {
 
 	void DoDummyJitState(PointerWrap &p);
 
-	JitInterface *CreateNativeJit(MIPSState *mipsState, bool useIR);
+	JitInterface *CreateNativeJit(MIPSState *mipsState);
 }

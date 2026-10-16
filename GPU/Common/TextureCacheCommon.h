@@ -18,6 +18,7 @@
 #pragma once
 
 #include <map>
+#include <unordered_set>
 #include <vector>
 #include <memory>
 
@@ -86,6 +87,8 @@ struct SamplerCacheKey {
 			bool tClamp : 1;
 			bool aniso : 1;
 			bool texture3d : 1;
+			// Baked into the sampler objects, so it has to be part of the key, or a change wouldn't apply.
+			uint8_t anisoLevel;
 		};
 	};
 	bool operator < (const SamplerCacheKey &other) const {
@@ -158,6 +161,9 @@ ENUM_CLASS_BITOPS(TexStatus);
 
 // TODO: Shrink this struct. There is some fluff.
 struct TexCacheEntry {
+	TexCacheEntry() = default;
+	TexCacheEntry(const TexCacheEntry &) = delete;
+	TexCacheEntry &operator=(const TexCacheEntry &) = delete;
 	~TexCacheEntry() {
 #ifdef _DEBUG
 		if (texturePtr || textureName || vkTex)
@@ -306,6 +312,8 @@ struct BuildTexturePlan {
 	// Need to only check once since it can change during the load!
 	bool doReplace;
 	bool saveTexture;
+	// Dump the indices and palette of a CLUT4/CLUT8 texture as a palette PNG (instead of saveTexture).
+	bool saveIndexed;
 
 	// TODO: Expand32 should probably also be decided in PrepareBuildTexture.
 	bool decodeToClut8;
@@ -336,6 +344,8 @@ struct TextureApplyResult {
 
 class TextureCacheCommon {
 public:
+	TextureCacheCommon(const TextureCacheCommon &) = delete;
+	TextureCacheCommon &operator=(const TextureCacheCommon &) = delete;
 	TextureCacheCommon(Draw::DrawContext *draw, Draw2D *draw2D);
 	virtual ~TextureCacheCommon();
 
@@ -362,7 +372,6 @@ public:
 	// FramebufferManager keeps TextureCache updated about what regions of memory are being rendered to,
 	// so that it can invalidate TexCacheEntries pointed at those addresses.
 	void NotifyFramebuffer(VirtualFramebuffer *framebuffer, FramebufferNotification msg);
-	void NotifyWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat fmt);
 
 	int NumLoadedTextures() const {
 		return (int)cache_.size();
@@ -372,9 +381,6 @@ public:
 	}
 	bool IsFakeMipmapChange() {
 		return PSP_CoreParameter().compat.flags().FakeMipmapChange && gstate.getTexLevelMode() == GE_TEXLEVEL_MODE_CONST;
-	}
-	bool VideoIsPlaying() {
-		return !videos_.empty();
 	}
 	virtual bool GetCurrentTextureDebug(GPUDebugBuffer &buffer, int level, bool *isFramebuffer) { return false; }
 
@@ -392,15 +398,6 @@ public:
 	const size_t CacheSizeEstimate() const;
 	const size_t SecondCacheSizeEstimate() const;
 
-	struct VideoInfo {
-		u32 addr;
-		u32 size;
-		int flips;
-	};
-
-	const std::vector<VideoInfo> &Videos() const {
-		return videos_;
-	}
 
 protected:
 	bool PrepareBuildTexture(BuildTexturePlan &plan, TexCacheEntry *entry);
@@ -434,6 +431,14 @@ protected:
 
 	// Return value is mapData normally, but could be another buffer allocated with AllocateAlignedMemory.
 	void LoadTextureLevel(TexCacheEntry &entry, uint8_t *mapData, size_t dataSize, int mapRowPitch, BuildTexturePlan &plan, int srcLevel, Draw::DataFormat dstFmt, TexDecodeFlags texDecFlags);
+	// Colors an indexed replacement with the current CLUT, into 32-bit RGBA padded to the full size.
+	bool CopyIndexedReplacementLevel(ReplacedTexture *replaced, int level, uint8_t *data, size_t dataSize, int stride);
+	// Whether the shader can apply the CLUT of this texture, which an indexed replacement for the GPU needs.
+	bool CanColorIndexedOnGpu(const TexCacheEntry *entry) const;
+	// The current CLUT as RGBA8888, at least 512 entries.
+	const u32 *CurrentClutAsRGBA8888();
+	// Dumps a CLUT4/CLUT8 texture as the indices with the current palette, see saveIndexed in textures.ini.
+	void SaveIndexedTexture(TexCacheEntry *entry, const BuildTexturePlan &plan);
 
 	// This needs to be a member functions just for IsVideo and Replacer.
 	SamplerCacheKey GetSamplingParams(int maxLevel, const TexCacheEntry *entry, bool flatZ, bool pixelMapped);
@@ -470,8 +475,10 @@ protected:
 	TexCache cache_;
 	// The secondary cache uses the texture hash and clut hash as the key.
 	TexCache secondCache_;
+	// Cache keys, with a zero CLUT hash, of the textures that have an indexed replacement colored by the GPU. Those
+	// are looked up without the CLUT hash, so a palette change doesn't build a new texture.
+	std::unordered_set<u64> gpuIndexedKeys_;
 
-	std::vector<VideoInfo> videos_;
 
 	AlignedVector<u32, 16> tmpTexBuf32_;
 	AlignedVector<u32, 16> tmpTexBufRearrange_;

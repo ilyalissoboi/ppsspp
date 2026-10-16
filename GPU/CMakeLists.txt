@@ -3,8 +3,6 @@ list(APPEND GPUArch
 	Common/VertexDecoderArm.cpp
 	Common/VertexDecoderArm64.cpp
 	Common/VertexDecoderX86.cpp
-	Software/DrawPixelX86.cpp
-	Software/SamplerX86.cpp
 	Common/VertexDecoderRiscV.cpp
 	Common/VertexDecoderLoongArch64.cpp
 )
@@ -69,7 +67,10 @@ set(GPU_D3D11
 )
 
 # We build Vulkan even on Apple to avoid annoying build differences.
-set(GPU_IMPLS ${GPU_GLES} ${GPU_VULKAN})
+set(GPU_IMPLS ${GPU_VULKAN})
+if(NOT NO_OPENGL)
+	list(APPEND GPU_IMPLS ${GPU_GLES})
+endif()
 if(WIN32)
 	list(APPEND GPU_IMPLS ${GPU_D3D11})
 endif()
@@ -83,6 +84,7 @@ set(GPU_SOURCES
 	Common/DepthBufferCommon.cpp
 	Common/DepthRaster.cpp
 	Common/DepthRaster.h
+	Common/DepthSwizzle.h
 	Common/TextureShaderCommon.cpp
 	Common/TextureShaderCommon.h
 	Common/DepalettizeShaderCommon.cpp
@@ -114,6 +116,7 @@ set(GPU_SOURCES
 	Common/StencilCommon.cpp
 	Common/StencilCommon.h
 	Common/SoftwareTransformCommon.cpp
+	Common/SoftwareLighting.h
 	Common/SoftwareTransformCommon.h
 	Common/VertexDecoderCommon.cpp
 	Common/VertexDecoderCommon.h
@@ -187,14 +190,15 @@ set(GPU_SOURCES
 	Software/DrawPixel.h
 	Software/FuncId.cpp
 	Software/FuncId.h
+	Software/GEMath.cpp
+	Software/GEMath.h
 	Software/Lighting.cpp
 	Software/Lighting.h
 	Software/Rasterizer.cpp
 	Software/Rasterizer.h
 	Software/RasterizerRectangle.cpp
 	Software/RasterizerRectangle.h
-	Software/RasterizerRegCache.cpp
-	Software/RasterizerRegCache.h
+	Software/RasterizerTypes.h
 	Software/Sampler.cpp
 	Software/Sampler.h
 	Software/SoftGpu.cpp

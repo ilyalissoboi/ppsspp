@@ -35,6 +35,7 @@
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/HLETables.h"
 #include "Core/HLE/ReplaceTables.h"
+#include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HW/GpioMMIO.h"
 
 #define R(i) (mips->r[i])
@@ -66,13 +67,14 @@ static inline void DelayBranchTo(MIPSState *mips, u32 where) {
 }
 
 static inline void SkipLikely(MIPSState *mips) {
-	MIPSInfo delaySlot = MIPSGetInfo(Memory::Read_Instruction(PC + 4, true));
+	const MIPSOpcode delaySlotOp = Memory::Read_Instruction(PC + 4);
 	// Don't actually skip if it is a jump (seen in Brooktown High.)
-	if (delaySlot & IS_JUMP) {
+	if (MIPSGetInfo(delaySlotOp) & IS_JUMP) {
 		PC += 4;
 	} else {
 		PC += 8;
-		--mips->downcount;
+		// The skipped slot costs what it would have run for, as in the IR cores.
+		mips->downcount -= MIPSGetInstructionCycleEstimate(delaySlotOp);
 	}
 }
 
@@ -81,7 +83,7 @@ int MIPS_InterpretSingleStep(MIPSState *mips) {
 		Core_ExecException(mips->pc, mips->	pc, ExecExceptionType::JUMP);
 		return 0;
 	}
-	MIPSOpcode op = Memory::Read_Opcode_JIT(mips->pc);  // now unchecked
+	MIPSOpcode op = ReadExecutedOp(mips->pc);
 	// Same reason as the run loop in MIPSInterpret_RunUntil - see ApplyHostRoundingMode.
 	ApplyHostRoundingMode(mips);
 	if (mips->inDelaySlot) {
@@ -156,6 +158,7 @@ void WriteMMIO_U16(MIPSState *mips, u32 addr, u16 value) {
 void WriteMMIO_U32(MIPSState *mips, u32 addr, u32 value) {
 	if (!Memory::IsKernelCodeAddress(mips->pc)) {
 		Core_MemoryException(addr, 4, mips->pc, MemoryExceptionType::WRITE_WORD, "Kernel mode only");
+		return;
 	}
 	if (GpioMMIO::IsGpioAddress(addr)) {
 		GpioMMIO::Write32(addr, value);
@@ -187,13 +190,15 @@ namespace MIPSInt {
 		switch (func) {
 		// Icache
 		case 8:
+		{
 			// Invalidate the instruction cache at this address.
 			// We assume the CPU won't be reset during this, so no locking.
+			// Let's over invalidate to be super safe.
+			uint32_t alignedAddr = addr & ~0x3F;
+			int size = 0x40 + (addr & 0x3F);
+			// Through MIPSState, which also drops replacement hooks in functions the game changed.
+			mips->InvalidateICacheRangeImmediate(alignedAddr, size);
 			if (MIPSComp::jit) {
-				// Let's over invalidate to be super safe.
-				uint32_t alignedAddr = addr & ~0x3F;
-				int size = 0x40 + (addr & 0x3F);
-				MIPSComp::jit->InvalidateCacheAt(alignedAddr, size);
 				// Using a bool to avoid locking/etc. in case it's slow.
 				if (!loggedAlignment && (addr & 0x3F) != 0) {
 					// These are seen exclusively in Lego games, and are really no big deal. Reporting removed.
@@ -206,6 +211,7 @@ namespace MIPSInt {
 				}
 			}
 			break;
+		}
 
 		// Dcache
 		case 24:
@@ -283,16 +289,18 @@ namespace MIPSInt {
 		int imm = _SIMM16_SHL2;
 		int rs = _RS;
 		u32 addr = PC + imm + 4;
+		// The linking ones test rs from before they link, ra included (cpu/cpu_alu/branch_link_ra).
+		const s32 value = (s32)R(rs);
 
 		switch ((op>>16) & 0x1F) {
-		case 0: if ((s32)R(rs) <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltz
-		case 1: if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgez
-		case 2: if ((s32)R(rs) <  0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzl
-		case 3: if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezl
-		case 16: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltzal
-		case 17: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgezal
-		case 18: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) <	0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzall
-		case 19: R(MIPS_REG_RA) = PC + 8; if ((s32)R(rs) >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezall
+		case 0: if (value <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltz
+		case 1: if (value >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgez
+		case 2: if (value <  0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzl
+		case 3: if (value >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezl
+		case 16: R(MIPS_REG_RA) = PC + 8; if (value <  0) DelayBranchTo(mips, addr); else PC += 4; break;//bltzal
+		case 17: R(MIPS_REG_RA) = PC + 8; if (value >= 0) DelayBranchTo(mips, addr); else PC += 4; break;//bgezal
+		case 18: R(MIPS_REG_RA) = PC + 8; if (value <  0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bltzall
+		case 19: R(MIPS_REG_RA) = PC + 8; if (value >= 0) DelayBranchTo(mips, addr); else SkipLikely(mips); break;//bgezall
 		default:
 			_dbg_assert_msg_(false,"Trying to interpret instruction that can't be interpreted");
 			break;
@@ -743,9 +751,6 @@ namespace MIPSInt {
 					} else {
 						// The interpreter emulates the rounding mode by putting the host FPU in it,
 						// so it has to switch right here rather than at the next block boundary.
-						// Restore first: the new value may be back to the default, which Apply
-						// deliberately doesn't write.
-						RestoreHostRoundingMode();
 						ApplyHostRoundingMode(mips);
 					}
 				} else {
@@ -913,8 +918,9 @@ namespace MIPSInt {
 				s32 a = (s32)R(rs);
 				s32 b = (s32)R(rt);
 				if (a == (s32)0x80000000 && b == -1) {
+					// The one overflow. Hardware leaves the remainder at zero (cpu/cpu_alu/cpu_div).
 					LO = 0x80000000;
-					HI = -1;
+					HI = 0;
 				} else if (b != 0) {
 					LO = (u32)(a / b);
 					HI = (u32)(a % b);
@@ -964,34 +970,26 @@ namespace MIPSInt {
 		{
 		case 0: R(rd) = R(rt) << sa; break; //sll
 		case 2:
-			if (_RS == 0) //srl
-			{
-				R(rd) = R(rt) >> sa;
-				break;
-			}
-			else if (_RS == 1) //rotr
-			{
+			// Only the low bit of the unused rs field counts (cpu/cpu_alu/shift_encodings).
+			if (_RS & 1) { //rotr
 				R(rd) = __rotr(R(rt), sa);
-				break;
+			} else { //srl
+				R(rd) = R(rt) >> sa;
 			}
-			else
-				goto wrong;
+			break;
 
 		case 3: R(rd) = (u32)(((s32)R(rt)) >> sa); break; //sra
 		case 4: R(rd) = R(rt) << (R(rs) & 0x1F); break; //sllv
 		case 6:
-			if (_FD == 0) { //srlv
-				R(rd) = R(rt) >> (R(rs)&0x1F);
-				break;
-			} else if (_FD == 1) { // rotrv
+			// Same for the unused sa field.
+			if (_FD & 1) { // rotrv
 				R(rd) = __rotr(R(rt), R(rs));
-				break;
-			} else {
-				goto wrong;
+			} else { //srlv
+				R(rd) = R(rt) >> (R(rs) & 0x1F);
 			}
+			break;
 		case 7: R(rd) = (u32)(((s32)R(rt)) >> (R(rs) & 0x1F)); break; //srav
 		default:
-			wrong:
 			_dbg_assert_msg_(false,"Trying to interpret instruction that can't be interpreted");
 			break;
 		}
@@ -1008,7 +1006,7 @@ namespace MIPSInt {
 			return;
 		}
 
-		switch ((op >> 6) & 31) {
+		switch (AllegrexBitOp(op)) {
 		case 16: // seb
 			R(rd) = SignExtend8ToU32(R(rt));
 			break;
@@ -1038,11 +1036,11 @@ namespace MIPSInt {
 			return;
 		}
 
-		switch (op & 0x3ff) {
-		case 0xA0: //wsbh
+		switch (AllegrexBitOp(op)) {
+		case 2: //wsbh
 			R(rd) = ((R(rt) & 0xFF00FF00) >> 8) | ((R(rt) & 0x00FF00FF) << 8);
 			break;
-		case 0xE0: //wsbw
+		case 3: //wsbw
 			R(rd) = swap32(R(rt));
 			break;
 		default:
@@ -1052,25 +1050,22 @@ namespace MIPSInt {
 		PC += 4;
 	}
 
+	// The interrupt enable flag, shared with the HLE sceKernelCpuSuspendIntr/ResumeIntr, which on
+	// hardware are just mfic v0, $0; mtic zero, $0 and mtic a0, $0. Only $0 exists.
 	void Int_Special2(MIPSState *mips, MIPSOpcode op) {
-		static int reported = 0;
+		int rt = _RT;
 		switch (op & 0x3F) {
 		case 36:  // mfic
-			// move from interrupt controller, not implemented
-			// See related report https://report.ppsspp.org/logs/kind/316 for possible locations.
-			// Also see https://forums.ps2dev.org/viewtopic.php?p=32700#p32700 .
-			// TODO: Should we actually implement this?
-			if (!reported) {
-				WARN_LOG(Log::CPU, "MFIC Disable/Enable Interrupt CPU instruction");
-				reported = 1;
-			}
+			if (rt != 0)
+				R(rt) = __InterruptsEnabled() ? 1 : 0;
 			break;
 		case 38:  // mtic
-			// move to interrupt controller, not implemented
-			if (!reported) {
-				WARN_LOG(Log::CPU, "MTIC Disable/Enable Interrupt CPU instruction");
-				reported = 1;
-			}
+			// Only bit 0 counts: mtic 2 disables. Pending interrupts run at the next scheduling point,
+			// not right away as with sceKernelCpuResumeIntr.
+			if (R(rt) & 1)
+				__EnableInterrupts();
+			else
+				__DisableInterrupts();
 			break;
 		}
 		PC += 4;
@@ -1120,7 +1115,13 @@ namespace MIPSInt {
 
 		switch (op & 0x3f)
 		{
-		case 4:	F(fd)	= sqrtf(F(fs)); break; //sqrt
+		case 4:	//sqrt
+			F(fd) = sqrtf(F(fs));
+			// A negative input gives a positive NaN, not the host's (cpu/fpu/roundmode).
+			if (F(fs) < 0.0f) {
+				FsI(fd) = 0x7FC00000;
+			}
+			break;
 		case 5:	F(fd)	= fabsf(F(fs)); break; //abs
 		case 6:	F(fd)	= F(fs); break; //mov
 		case 7:	F(fd)	= -F(fs); break; //neg
@@ -1128,46 +1129,25 @@ namespace MIPSInt {
 		case 13:
 		case 14:
 		case 15:
-			if (my_isnanorinf(F(fs)))
-			{
-				FsI(fd) = my_isinf(F(fs)) && F(fs) < 0.0f ? -2147483648LL : 2147483647LL;
-				break;
-			}
 			switch (op & 0x3f)
 			{
 			// round.w.s is round-half-to-even, not half-away-from-zero - and its mode is fixed,
 			// so unlike cvt.w.s below it must not follow fcr31. round_ieee_754 is both.
-			case 12: FsI(fd) = (int)round_ieee_754(F(fs)); break; //round.w.s
-			case 13: //trunc.w.s
-				if (F(fs) >= 0.0f) {
-					FsI(fd) = (int)floorf(F(fs));
-					// Overflow, but it was positive.
-					if (FsI(fd) == -2147483648LL) {
-						FsI(fd) = 2147483647LL;
-					}
-				} else {
-					// Overflow happens to be the right value anyway.
-					FsI(fd) = (int)ceilf(F(fs));
-				}
-				break;
-			case 14: FsI(fd) = (int)ceilf (F(fs)); break; //ceil.w.s
-			case 15: FsI(fd) = (int)floorf(F(fs)); break; //floor.w.s
+			case 12: FsI(fd) = SaturatedFloatToInt(round_ieee_754(FlushForConversion(mips, F(fs)))); break; //round.w.s
+			case 13: FsI(fd) = SaturatedFloatToInt(truncf(FlushForConversion(mips, F(fs)))); break; //trunc.w.s
+			case 14: FsI(fd) = SaturatedFloatToInt(ceilf(FlushForConversion(mips, F(fs)))); break; //ceil.w.s
+			case 15: FsI(fd) = SaturatedFloatToInt(floorf(FlushForConversion(mips, F(fs)))); break; //floor.w.s
 			}
 			break;
 		case 32: F(fd) = (float)FsI(fs); break; //cvt.s.w
 
 		case 36:
-			if (my_isnanorinf(F(fs)))
-			{
-				FsI(fd) = my_isinf(F(fs)) && F(fs) < 0.0f ? -2147483648LL : 2147483647LL;
-				break;
-			}
 			switch (mips->fcr31 & 3)
 			{
-			case 0: FsI(fd) = (int)round_ieee_754(F(fs)); break;  // RINT_0
-			case 1: FsI(fd) = (int)F(fs); break;  // CAST_1
-			case 2: FsI(fd) = (int)ceilf(F(fs)); break;  // CEIL_2
-			case 3: FsI(fd) = (int)floorf(F(fs)); break;  // FLOOR_3
+			case 0: FsI(fd) = SaturatedFloatToInt(round_ieee_754(FlushForConversion(mips, F(fs)))); break;  // RINT_0
+			case 1: FsI(fd) = SaturatedFloatToInt(truncf(FlushForConversion(mips, F(fs)))); break;  // CAST_1
+			case 2: FsI(fd) = SaturatedFloatToInt(ceilf(FlushForConversion(mips, F(fs)))); break;  // CEIL_2
+			case 3: FsI(fd) = SaturatedFloatToInt(floorf(FlushForConversion(mips, F(fs)))); break;  // FLOOR_3
 			}
 			break; //cvt.w.s
 		default:
@@ -1301,15 +1281,18 @@ namespace MIPSInt {
 		PC += 4;
 	}
 
-	void Int_Emuhack(MIPSState *mips, MIPSOpcode op) {
-		if (((op >> 24) & 3) != EMUOP_CALL_REPLACEMENT) {
-			_dbg_assert_msg_(false, "Trying to interpret emuhack instruction that can't be interpreted");
-		}
-
+	void Int_CallReplacement(MIPSState *mips, MIPSOpcode op) {
 		_assert_((PC & 3) == 0);
 
+		// The CPU cores substitute these for replaced instructions, memory never holds them.
+		// If it does, the game is executing data.
+		if (Memory::Read_Instruction(PC).encoding == op.encoding) {
+			Core_ExecException(PC, PC, ExecExceptionType::ILLEGAL);
+			return;
+		}
+
 		// It's a replacement func!
-		int index = op.encoding & 0xFFFFFF;
+		int index = op.encoding & MIPS_REPLACEMENT_INDEX_MASK;
 		const ReplacementTableEntry *entry = GetReplacementFunc(index);
 		if (entry && entry->replaceFunc && (entry->flags & REPFLAG_DISABLED) == 0) {
 			// Like a syscall, a replacement function is host code - see Int_Syscall.
@@ -1319,7 +1302,7 @@ namespace MIPSInt {
 
 			if (entry->flags & (REPFLAG_HOOKENTER | REPFLAG_HOOKEXIT)) {
 				// Interpret the original instruction under the hook.
-				MIPSInterpret(mips, Memory::Read_Instruction(PC, true));
+				MIPSInterpret(mips, Memory::Read_Instruction(PC));
 			} else if (cycles < 0) {
 				// Leave PC unchanged, call the replacement again (assumes args are modified.)
 				mips->downcount += cycles;
@@ -1332,7 +1315,7 @@ namespace MIPSInt {
 				ERROR_LOG(Log::CPU, "Bad replacement function index %i", index);
 			}
 			// Interpret the original instruction under it.
-			MIPSInterpret(mips, Memory::Read_Instruction(PC, true));
+			MIPSInterpret(mips, Memory::Read_Instruction(PC));
 		}
 	}
 }

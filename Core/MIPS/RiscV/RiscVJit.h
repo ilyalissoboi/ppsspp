@@ -41,6 +41,8 @@ public:
 	void InvalidateBlock(IRBlockCache *irBlockCache, int block_num) override;
 
 protected:
+	void GetFixedCodeLabels(std::vector<IRNativeFixedCodeLabel> &labels) const override;
+
 	const CodeBlockCommon &CodeBlock() const override {
 		return *this;
 	}
@@ -67,6 +69,7 @@ private:
 	void CompIR_Assign(IRInst inst) override;
 	void CompIR_Basic(IRInst inst) override;
 	void CompIR_Bits(IRInst inst) override;
+	void EmitBSwap32NoZbb(RiscVGen::RiscVReg dest, RiscVGen::RiscVReg src);
 	void CompIR_Breakpoint(IRInst inst) override;
 	void CompIR_Compare(IRInst inst) override;
 	void CompIR_CondAssign(IRInst inst) override;
@@ -99,7 +102,6 @@ private:
 	void CompIR_Transfer(IRInst inst) override;
 	void CompIR_VecArith(IRInst inst) override;
 	void CompIR_VecAssign(IRInst inst) override;
-	void CompIR_VecClamp(IRInst inst) override;
 	void CompIR_VecHoriz(IRInst inst) override;
 	void CompIR_VecLoad(IRInst inst) override;
 	void CompIR_VecPack(IRInst inst) override;
@@ -125,6 +127,10 @@ private:
 
 	const u8 *saveStaticRegisters_ = nullptr;
 	const u8 *loadStaticRegisters_ = nullptr;
+	// See GenerateRiscVVfpuDotSpecial().
+	const u8 *vfpuDotSpecial_ = nullptr;
+	// See GenerateRiscVVfpuDot().
+	const u8 *vfpuDot_ = nullptr;
 
 	int jitStartOffset_ = 0;
 	int compilingBlockNum_ = -1;

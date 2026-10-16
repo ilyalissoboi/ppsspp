@@ -275,7 +275,19 @@ public:
 			if (pgdInfo)
 				p.DoVoid(pgdInfo, sizeof(PGD_DESC));
 			if (p.mode == p.MODE_READ && pgdInfo) {
-				pgdInfo->block_buf = (u8 *)malloc(pgdInfo->block_size * 2);
+				pgdInfo->block_buf = nullptr;
+				if (pgd_valid_block_size(pgdInfo->block_size)) {
+					pgdInfo->block_buf = (u8 *)malloc(pgdInfo->block_size * 2);
+				}
+				if (!pgdInfo->block_buf) {
+					ERROR_LOG(Log::sceIo, "Savestate has an invalid PGD block size");
+					p.SetError(p.ERROR_FAILURE);
+					pgd_close(pgdInfo);
+					pgdInfo = nullptr;
+					return;
+				}
+				// The buffer isn't saved, so make the next read fill it.
+				pgdInfo->current_block = -1;
 			}
 		}
 
@@ -474,6 +486,9 @@ static void __IoAsyncNotify(u64 userdata, int cyclesLate) {
 		if (f->closePending) {
 			__IoFreeFd(fd, error);
 		}
+		// Like any interrupt that wakes a thread, this dispatches right away, so a better
+		// priority waiter doesn't sit ready until something else happens to reschedule.
+		__KernelReSchedule("async io completed");
 	}
 }
 
@@ -522,6 +537,7 @@ static void __IoSyncNotify(u64 userdata, int cyclesLate) {
 
 	HLEKernel::ResumeFromWait(threadID, WAITTYPE_IO, fd, result);
 	f->waitingSyncThreads.erase(std::remove(f->waitingSyncThreads.begin(), f->waitingSyncThreads.end(), threadID), f->waitingSyncThreads.end());
+	__KernelReSchedule("io completed");
 }
 
 static void __IoAsyncBeginCallback(SceUID threadID, SceUID prevCallbackId) {
@@ -665,6 +681,10 @@ void __IoInit() {
 	lastMemStickFatState = MemoryStick_FatState();
 }
 
+void __IoWaitForAsync() {
+	ioManager.SyncThread();
+}
+
 void __IoShutdown() {
 	ioManagerThreadEnabled = false;
 	ioManager.SyncThread();
@@ -722,6 +742,9 @@ void __IoDoState(PointerWrap &p) {
 	if (s >= 3) {
 		Do(p, lastMemStickState);
 		Do(p, lastMemStickFatState);
+	} else if (p.mode == p.MODE_READ) {
+		lastMemStickState = MemoryStick_State();
+		lastMemStickFatState = MemoryStick_FatState();
 	}
 
 	for (int i = 0; i < PSP_COUNT_FDS; ++i) {
@@ -923,9 +946,21 @@ static void __IoSchedSync(FileNode *f, int fd, int usec) {
 	f->hasAsyncResult = false;
 }
 
+// With the memory stick out, there's no device behind ms0: (pspautotests utility/savedata/nomemstick).
+static bool IsRemovedMemstickPath(const char *path) {
+	if (MemoryStick_State() == PSP_MEMORYSTICK_STATE_INSERTED) {
+		return false;
+	}
+	return startsWithNoCase(path, "ms0:") || startsWithNoCase(path, "fatms0:");
+}
+
 static u32 sceIoGetstat(const char *filename, u32 addr) {
 	// TODO: Improve timing (although this seems normally slow..)
 	int usec = 1000;
+
+	if (IsRemovedMemstickPath(filename)) {
+		return hleDelayResult(hleLogWarning(Log::sceIo, SCE_KERNEL_ERROR_NODEV, "memory stick removed"), "io getstat", usec);
+	}
 
 	// A real PSP refuses to stat the root of a volume - io/stat records sceIoGetstat("ms0:/")
 	// coming back as an invalid argument rather than describing the directory.
@@ -999,7 +1034,7 @@ static u32 npdrmRead(FileNode *f, u8 *data, int size) {
 	PGD_DESC *pgd = f->pgdInfo;
 	if (!pgd) {
 		// When pgdInfo is null, fall back to reading the file in non-encrypted mode
-		WARN_LOG(Log::IO, "npdrmRead: pgdInfo is null for file %s, reading as non-encrypted", f->fullpath.c_str());
+		DEBUG_LOG(Log::IO, "npdrmRead: pgdInfo is null for file %s, reading as non-encrypted", f->fullpath.c_str());
 		return (u32)pspFileSystem.ReadFile(f->handle, data, size);
 	}
 	u32 block, offset, blockPos;
@@ -1042,20 +1077,39 @@ static u32 npdrmRead(FileNode *f, u8 *data, int size) {
 	return size;
 }
 
+// With dispatch suspended, a call fails in the driver when it tries to wait. The memory stick driver
+// returns SCE_KERNEL_ERROR_CAN_NOT_WAIT, while usbhostfs (host0: under PSPLink, what homebrew
+// developers run from) returns -1, which is what host0: does here too.
+static u32 IoDispatchDisabledError(const std::string &filename) {
+	std::string outPath;
+	IFileSystem *system = nullptr;
+	IFileSystem *host = pspFileSystem.GetSystem("host0:");
+	if (host && pspFileSystem.MapFilePath(filename, &outPath, &system) == 0 && system == host) {
+		return (u32)-1;
+	}
+	return SCE_KERNEL_ERROR_CAN_NOT_WAIT;
+}
+
+int __IoOpenDelayUs(const char *filename) {
+	// UMD: Speed varies from 1-6ms.
+	// Card: Path depth matters, but typically between 10-13ms on a standard Pro Duo.
+	return pspFileSystem.FlagsFromFilename(filename) & FileSystemFlags::UMD ? 4000 : 10000;
+}
+
+int __IoReadDelayUs(int size) {
+	int us;
+	if (PSP_CoreParameter().compat.flags().ForceUMDReadSpeed || g_Config.iIOTimingMethod == IOTIMING_UMDSLOWREALISTIC) {
+		us = size / 4.2;
+	} else {
+		us = size / 100;
+	}
+	return std::max(us, 100);
+}
+
 static bool __IoRead(int &result, int id, u32 data_addr, int size, int &us) {
 	PROFILE_THIS_SCOPE("io_rw");
 	// Low estimate, may be improved later from the ReadFile result.
-
-	if (PSP_CoreParameter().compat.flags().ForceUMDReadSpeed || g_Config.iIOTimingMethod == IOTIMING_UMDSLOWREALISTIC) {
-		us = size / 4.2;
-	}
-	else {
-		us = size / 100;
-	}
-
-	if (us < 100) {
-		us = 100;
-	}
+	us = __IoReadDelayUs(size);
 
 	if (id == PSP_STDIN) {
 		DEBUG_LOG(Log::sceIo, "sceIoRead STDIN");
@@ -1136,8 +1190,11 @@ static u32 sceIoRead(int id, u32 data_addr, int size) {
 	}
 
 	if (id > 2) {
+		if (f->asyncBusy()) {
+			return hleLogWarning(Log::sceIo, SCE_KERNEL_ERROR_ASYNC_BUSY, "async busy");
+		}
 		if (!__KernelIsDispatchEnabled()) {
-			return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_CAN_NOT_WAIT, "dispatch disabled");
+			return hleLogError(Log::sceIo, IoDispatchDisabledError(f->fullpath), "dispatch disabled");
 		}
 		if (__IsInInterrupt()) {
 			return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ILLEGAL_CONTEXT, "inside interrupt");
@@ -1187,6 +1244,20 @@ void SanitizeControlChars(std::string &buf) {
 	}
 }
 
+// Output the emulated program wrote to stdout, stderr or a tty. A host that wants it (headless)
+// gets the bytes exactly as written, so its stdout is a faithful copy of the program's. Otherwise
+// it goes in the log, sanitized and with the trailing newline trimmed, since the log adds one.
+static void __IoWriteToHostOutput(DebugOutputChannel channel, const char *str, u32 validSize, int size, const char *name) {
+	if (Core_SendHostOutput(channel, std::string_view(str, validSize))) {
+		return;
+	}
+	const int str_size = size <= 0 || validSize == 0 ? 0 : (str[validSize - 1] == '\n' ? validSize - 1 : validSize);
+	// buffer so we can edit the string.
+	std::string buf(str, str_size);
+	SanitizeControlChars(buf);
+	INFO_LOG(Log::Printf, "%s: %.*s", name, (int)buf.size(), buf.data());
+}
+
 static bool __IoWrite(int &result, int id, u32 data_addr, int size, int &us) {
 	PROFILE_THIS_SCOPE("io_rw");
 	// Low estimate, may be improved later from the WriteFile result.
@@ -1199,12 +1270,8 @@ static bool __IoWrite(int &result, int id, u32 data_addr, int size, int &us) {
 	const u32 validSize = Memory::ClampValidSizeAt(data_addr, size);
 	// Let's handle stdout/stderr specially.
 	if (id == PSP_STDOUT || id == PSP_STDERR) {
-		const char *str = (const char *) data_ptr;
-		const int str_size = size <= 0 ? 0 : (str[validSize - 1] == '\n' ? validSize - 1 : validSize);
-		// buffer so we can edit the string.
-		std::string buf(str, str_size);
-		SanitizeControlChars(buf);
-		INFO_LOG(Log::Printf, "%s: %.*s", id == 1 ? "stdout" : "stderr", (int)buf.size(), buf.data());
+		__IoWriteToHostOutput(id == PSP_STDERR ? DebugOutputChannel::StdErr : DebugOutputChannel::StdOut,
+			(const char *)data_ptr, validSize, size, id == PSP_STDOUT ? "stdout" : "stderr");
 		result = validSize;
 		return true;
 	}
@@ -1228,11 +1295,7 @@ static bool __IoWrite(int &result, int id, u32 data_addr, int size, int &us) {
 		NotifyMemInfo(MemBlockFlags::READ, data_addr, size, tag.c_str(), tag.size());
 
 		if (f->isTTY) {
-			const char *str = (const char *)data_ptr;
-			const int str_size = size <= 0 ? 0 : (str[validSize - 1] == '\n' ? validSize - 1 : validSize);
-			std::string buf(str, str_size);
-			SanitizeControlChars(buf);
-			INFO_LOG(Log::Printf, "%s: %.*s", "tty", (int)buf.size(), buf.data());
+			__IoWriteToHostOutput(DebugOutputChannel::StdOut, (const char *)data_ptr, validSize, size, "tty");
 			result = validSize;
 			return true;
 		}
@@ -1273,7 +1336,7 @@ static u32 sceIoWrite(int id, u32 data_addr, int size) {
 	FileNode *f = __IoGetFd(id, error);
 	if (id > 2 && f != NULL) {
 		if (!__KernelIsDispatchEnabled()) {
-			return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_CAN_NOT_WAIT, "dispatch disabled");
+			return hleLogError(Log::sceIo, IoDispatchDisabledError(f->fullpath), "dispatch disabled");
 		}
 		if (__IsInInterrupt()) {
 			return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ILLEGAL_CONTEXT, "inside interrupt");
@@ -1297,6 +1360,10 @@ static u32 sceIoWrite(int id, u32 data_addr, int size) {
 			// On actual hardware, it would just return this... we just want the log output.
 			if (__IsInInterrupt()) {
 				return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ILLEGAL_CONTEXT);
+			}
+			if (id <= 2) {
+				// A write to stdout or stderr doesn't give up the CPU (pspautotests threads/scheduling/dispatch).
+				return hleLogDebug(Log::sceIo, result);
 			}
 			return hleDelayResult(hleLogDebug(Log::sceIo, result), "io write", us);
 		} else {
@@ -1518,6 +1585,10 @@ static FileNode *__IoOpen(int &error, const char *filename, int flags, int mode)
 		error = SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
 		return nullptr;
 	}
+	if (IsRemovedMemstickPath(filename)) {
+		error = SCE_KERNEL_ERROR_NODEV;
+		return nullptr;
+	}
 
 	int access = FILEACCESS_NONE;
 	if (flags & PSP_O_RDONLY)
@@ -1532,6 +1603,15 @@ static FileNode *__IoOpen(int &error, const char *filename, int flags, int mode)
 		access |= FILEACCESS_TRUNCATE;
 	if (flags & PSP_O_EXCL)
 		access |= FILEACCESS_EXCL;
+
+	// Characters FAT can't store make the memory stick driver reject the path outright rather than
+	// report a missing file (utility/savedata/idlist opens a file under "TEST99901A?C").
+	const char *colon = strchr(filename, ':');
+	if (colon && (pspFileSystem.FlagsFromFilename(filename) & FileSystemFlags::SIMULATE_FAT32) &&
+		strpbrk(colon + 1, "?*<>|\"") != nullptr) {
+		error = SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+		return nullptr;
+	}
 
 	PSPFileInfo info;
 	int h = -1;
@@ -1580,7 +1660,7 @@ static u32 sceIoOpen(const char *filename, int flags, int mode) {
 
 	if (!__KernelIsDispatchEnabled()) {
 		hleEatCycles(48000);
-		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_CAN_NOT_WAIT, "dispatch disabled");
+		return hleLogError(Log::sceIo, IoDispatchDisabledError(filename), "dispatch disabled");
 	}
 
 	int error;
@@ -1615,10 +1695,7 @@ static u32 sceIoOpen(const char *filename, int flags, int mode) {
 			// These are fast to open, no delay or even rescheduling happens.
 			return hleLogDebug(Log::sceIo, id);
 		}
-		// UMD: Speed varies from 1-6ms.
-		// Card: Path depth matters, but typically between 10-13ms on a standard Pro Duo.
-		int delay = pspFileSystem.FlagsFromFilename(filename) & FileSystemFlags::UMD ? 4000 : 10000;
-		return hleDelayResult(hleLogDebug(Log::sceIo, id), "file opened", delay);
+		return hleDelayResult(hleLogDebug(Log::sceIo, id), "file opened", __IoOpenDelayUs(filename));
 	}
 }
 
@@ -2365,10 +2442,9 @@ static int sceIoWaitAsync(int id, u32 address) {
 
 			return hleLogDebug(Log::sceIo, 0, "complete");
 		} else {
-			// This is normal in some games.
-			return hleLogInfo(Log::sceIo, SCE_KERNEL_ERROR_NOASYNC, "no async pending");
+			// This is normal.
+			return hleLogDebug(Log::sceIo, SCE_KERNEL_ERROR_NOASYNC, "no async pending");
 		}
-		return 0; //completed
 	} else {
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_BADF, "invalid fd");
 	}
@@ -2462,6 +2538,13 @@ public:
 		// TODO: Is this the right way for it to wake up?
 		int count = (int) listing.size();
 		Do(p, count);
+		// sceIoDread only checks for index == count.
+		if (count < 0 || index < 0 || index > count || !p.CheckRead(count)) {
+			ERROR_LOG(Log::sceIo, "Savestate has an invalid dir listing");
+			p.SetError(p.ERROR_FAILURE);
+			index = 0;
+			return;
+		}
 		listing.resize(count);
 		for (int i = 0; i < count; ++i) {
 			listing[i].DoState(p);
@@ -2480,6 +2563,10 @@ static u32 sceIoDopen(const char *path) {
 	if (!path) {
 		// Not tested on the PSP. Matches sceIoOpen.
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND, "nullptr file not found");
+	}
+
+	if (IsRemovedMemstickPath(path)) {
+		return hleLogWarning(Log::sceIo, SCE_KERNEL_ERROR_NODEV, "memory stick removed");
 	}
 
 	double startTime = time_now_d();
@@ -2757,7 +2844,7 @@ int __IoIoctl(u32 id, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 out
 	case 0x01020006:
 		// TODO: Should not work for umd0:/, ms0:/, etc.
 		// TODO: Should probably move this to something common between ISOFileSystem and VirtualDiscSystem.
-		INFO_LOG(Log::sceIo, "sceIoIoctl: Asked for start sector of file %i", id);
+		DEBUG_LOG(Log::sceIo, "sceIoIoctl: Asked for start sector of file %i", id);
 		if (Memory::IsValidRange(outdataPtr, 4) && outlen >= 4) {
 			Memory::WriteUnchecked_U32(f->FileInfo().startSector, outdataPtr);
 		} else {
@@ -2769,7 +2856,7 @@ int __IoIoctl(u32 id, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 out
 	case 0x01020007:
 		// TODO: Should not work for umd0:/, ms0:/, etc.
 		// TODO: Should probably move this to something common between ISOFileSystem and VirtualDiscSystem.
-		INFO_LOG(Log::sceIo, "sceIoIoctl: Asked for size of file %i", id);
+		DEBUG_LOG(Log::sceIo, "sceIoIoctl: Asked for size of file %i", id);
 		if (Memory::IsValid4AlignedRange(outdataPtr, 8)) {
 			Memory::WriteUnchecked_U64(f->FileInfo().size, outdataPtr);
 		} else {
@@ -3080,7 +3167,7 @@ const HLEFunction IoFileMgrForUser[] = {
 	{0x68963324, &WrapU_III<sceIoLseek32>,              "sceIoLseek32",                'i', "iii"   },
 	{0X1B385D8F, &WrapU_III<sceIoLseek32Async>,         "sceIoLseek32Async",           'i', "iii"   },
 	{0X71B19E77, &WrapU_II64I<sceIoLseekAsync>,         "sceIoLseekAsync",             'i', "iIi"   },
-	{0x109F50BC, &WrapU_CII<sceIoOpen>,                 "sceIoOpen",                   'i', "sii"   },
+	{0x109F50BC, &WrapU_CII<sceIoOpen>,                 "sceIoOpen",                   'i', "sii",    HLE_NOT_IN_INTERRUPT },
 	{0x89AA9906, &WrapU_CII<sceIoOpenAsync>,            "sceIoOpenAsync",              'i', "sii"   },
 	{0x06A70004, &WrapU_CI<sceIoMkdir>,                 "sceIoMkdir",                  'i', "si"    },
 	{0x3251EA56, &WrapU_IU<sceIoPollAsync>,             "sceIoPollAsync",              'i', "iP"    },

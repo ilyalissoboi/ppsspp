@@ -131,10 +131,7 @@ void DrawEngineGLES::ApplyDrawState(int prim) {
 
 	if (gstate_c.IsDirty(DIRTY_BLEND_STATE)) {
 		if (gstate.isModeClear()) {
-			// Color Test
-			bool colorMask = gstate.isClearModeColorMask();
-			bool alphaMask = gstate.isClearModeAlphaMask();
-			renderManager->SetNoBlendAndMask((colorMask ? 7 : 0) | (alphaMask ? 8 : 0));
+			renderManager->SetNoBlendAndMask(ClearModeChannelMask());
 		} else {
 			pipelineState_.Convert(draw_->GetShaderLanguageDesc().bitwiseOps, gstate_c.Use(GPU_USE_SHADER_BLENDING));
 			GenericMaskState &maskState = pipelineState_.maskState;
@@ -183,9 +180,8 @@ void DrawEngineGLES::ApplyDrawState(int prim) {
 					gstate_c.Dirty(DIRTY_SHADERBLEND);
 				}
 				if (blendState.useBlendColor) {
-					uint32_t color = blendState.blendColor;
 					float col[4];
-					Uint8x4ToFloat4(col, color);
+					blendState.blendColorToFloat4(col);
 					renderManager->SetBlendFactor(col);
 				}
 			}

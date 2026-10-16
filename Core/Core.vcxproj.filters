@@ -85,9 +85,6 @@
     <Filter Include="Ext\libzip">
       <UniqueIdentifier>{0201ff27-4fa8-4cf3-bbb9-accfdc0c7046}</UniqueIdentifier>
     </Filter>
-    <Filter Include="MIPS\fake">
-      <UniqueIdentifier>{678fa299-0ff7-4983-982d-2da47b52e238}</UniqueIdentifier>
-    </Filter>
     <Filter Include="MIPS\RiscV">
       <UniqueIdentifier>{067e3128-3aaf-4ed1-b19e-bab11606abe7}</UniqueIdentifier>
     </Filter>
@@ -135,31 +132,10 @@
     <ClCompile Include="MIPS\MIPSCodeUtils.cpp">
       <Filter>MIPS</Filter>
     </ClCompile>
-    <ClCompile Include="MIPS\x86\CompALU.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\CompBranch.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\CompFPU.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\Jit.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\CompLoadStore.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\Asm.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\RegCache.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\CompVFPU.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
     <ClCompile Include="MIPS\JitCommon\JitCommon.cpp">
+      <Filter>MIPS\JitCommon</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\JitCommon\JitProfiler.cpp">
       <Filter>MIPS\JitCommon</Filter>
     </ClCompile>
     <ClCompile Include="FileSystems\DirectoryFileSystem.cpp">
@@ -444,37 +420,34 @@
     <ClCompile Include="..\ext\snappy\snappy.cpp">
       <Filter>Ext\Snappy</Filter>
     </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmAsm.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmCompALU.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmCompBranch.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmCompFPU.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmCompLoadStore.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmJit.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmRegCache.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmCompVFPU.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
     <ClCompile Include="..\ext\disarm.cpp">
       <Filter>Ext</Filter>
     </ClCompile>
-    <ClCompile Include="MIPS\x86\RegCacheFPU.cpp">
-      <Filter>MIPS\x86</Filter>
+    <ClCompile Include="MIPS\ARM\ArmIRAsm.cpp">
+      <Filter>MIPS\ARM</Filter>
     </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmRegCacheFPU.cpp">
+    <ClCompile Include="MIPS\ARM\ArmIRCompALU.cpp">
+      <Filter>MIPS\ARM</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\ARM\ArmIRCompBranch.cpp">
+      <Filter>MIPS\ARM</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\ARM\ArmIRCompFPU.cpp">
+      <Filter>MIPS\ARM</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\ARM\ArmIRCompLoadStore.cpp">
+      <Filter>MIPS\ARM</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\ARM\ArmIRCompSystem.cpp">
+      <Filter>MIPS\ARM</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\ARM\ArmIRCompVec.cpp">
+      <Filter>MIPS\ARM</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\ARM\ArmIRJit.cpp">
+      <Filter>MIPS\ARM</Filter>
+    </ClCompile>
+    <ClCompile Include="MIPS\ARM\ArmIRRegCache.cpp">
       <Filter>MIPS\ARM</Filter>
     </ClCompile>
     <ClCompile Include="Font\PGF.cpp">
@@ -507,9 +480,6 @@
     </ClCompile>
     <ClCompile Include="HLE\sceMp3.cpp">
       <Filter>HLE\Libraries</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\JitCommon\JitBlockCache.cpp">
-      <Filter>MIPS\JitCommon</Filter>
     </ClCompile>
     <ClCompile Include="Cwcheat.cpp">
       <Filter>Core</Filter>
@@ -556,6 +526,9 @@
     <ClCompile Include="Dialog\PSPNpSigninDialog.cpp">
       <Filter>Dialog</Filter>
     </ClCompile>
+    <ClCompile Include="Dialog\PSPHtmlViewerDialog.cpp">
+      <Filter>Dialog</Filter>
+    </ClCompile>
     <ClCompile Include="Debugger\DisassemblyManager.cpp">
       <Filter>Debugger</Filter>
     </ClCompile>
@@ -568,17 +541,8 @@
     <ClCompile Include="HLE\ReplaceTables.cpp">
       <Filter>HLE</Filter>
     </ClCompile>
-    <ClCompile Include="MIPS\x86\CompReplace.cpp">
-      <Filter>MIPS\x86</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM\ArmCompReplace.cpp">
-      <Filter>MIPS\ARM</Filter>
-    </ClCompile>
     <ClCompile Include="HW\SimpleAudioDec.cpp">
       <Filter>HW</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\x86\JitSafeMem.cpp">
-      <Filter>MIPS\x86</Filter>
     </ClCompile>
     <ClCompile Include="HLE\HLEHelperThread.cpp">
       <Filter>HLE</Filter>
@@ -621,36 +585,6 @@
     </ClCompile>
     <ClCompile Include="HLE\sceSfmt19937.cpp">
       <Filter>HLE\Libraries</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64Asm.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64CompALU.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64CompBranch.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64CompFPU.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64CompLoadStore.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64CompReplace.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64CompVFPU.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64Jit.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64RegCache.cpp">
-      <Filter>MIPS\ARM64</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\ARM64\Arm64RegCacheFPU.cpp">
-      <Filter>MIPS\ARM64</Filter>
     </ClCompile>
     <ClCompile Include="Util\DisArm64.cpp">
       <Filter>Util</Filter>
@@ -988,9 +922,6 @@
     <ClCompile Include="Debugger\WebSocket\InputBroadcaster.cpp">
       <Filter>Debugger\WebSocket</Filter>
     </ClCompile>
-    <ClCompile Include="MIPS\fake\FakeJit.cpp">
-      <Filter>MIPS\fake</Filter>
-    </ClCompile>
     <ClCompile Include="Debugger\LineInfo.cpp">
       <Filter>Debugger</Filter>
     </ClCompile>
@@ -1239,9 +1170,6 @@
     </ClCompile>
     <ClCompile Include="TiltEventProcessor.cpp">
       <Filter>Core</Filter>
-    </ClCompile>
-    <ClCompile Include="MIPS\MIPSVFPUFallbacks.cpp">
-      <Filter>MIPS</Filter>
     </ClCompile>
     <ClCompile Include="ConfigSettings.cpp">
       <Filter>Core</Filter>
@@ -1494,13 +1422,10 @@
     <ClInclude Include="MIPS\MIPSCodeUtils.h">
       <Filter>MIPS</Filter>
     </ClInclude>
-    <ClInclude Include="MIPS\x86\Jit.h">
-      <Filter>MIPS\x86</Filter>
-    </ClInclude>
-    <ClInclude Include="MIPS\x86\RegCache.h">
-      <Filter>MIPS\x86</Filter>
-    </ClInclude>
     <ClInclude Include="MIPS\JitCommon\JitCommon.h">
+      <Filter>MIPS\JitCommon</Filter>
+    </ClInclude>
+    <ClInclude Include="MIPS\JitCommon\JitProfiler.h">
       <Filter>MIPS\JitCommon</Filter>
     </ClInclude>
     <ClInclude Include="FileSystems\DirectoryFileSystem.h">
@@ -1800,16 +1725,13 @@
     <ClInclude Include="..\ext\snappy\snappy-internal.h">
       <Filter>Ext\Snappy</Filter>
     </ClInclude>
-    <ClInclude Include="MIPS\ARM\ArmJit.h">
+    <ClInclude Include="MIPS\ARM\ArmIRJit.h">
       <Filter>MIPS\ARM</Filter>
     </ClInclude>
-    <ClInclude Include="MIPS\ARM\ArmRegCache.h">
+    <ClInclude Include="MIPS\ARM\ArmIRRegCache.h">
       <Filter>MIPS\ARM</Filter>
     </ClInclude>
-    <ClInclude Include="MIPS\x86\RegCacheFPU.h">
-      <Filter>MIPS\x86</Filter>
-    </ClInclude>
-    <ClInclude Include="MIPS\ARM\ArmRegCacheFPU.h">
+    <ClInclude Include="MIPS\ARM\ArmVfpuDot.h">
       <Filter>MIPS\ARM</Filter>
     </ClInclude>
     <ClInclude Include="Font\PGF.h">
@@ -1893,6 +1815,9 @@
     <ClInclude Include="Dialog\PSPNpSigninDialog.h">
       <Filter>Dialog</Filter>
     </ClInclude>
+    <ClInclude Include="Dialog\PSPHtmlViewerDialog.h">
+      <Filter>Dialog</Filter>
+    </ClInclude>
     <ClInclude Include="MIPS\JitCommon\JitState.h">
       <Filter>MIPS\JitCommon</Filter>
     </ClInclude>
@@ -1913,9 +1838,6 @@
     </ClInclude>
     <ClInclude Include="HW\SimpleAudioDec.h">
       <Filter>HW</Filter>
-    </ClInclude>
-    <ClInclude Include="MIPS\x86\JitSafeMem.h">
-      <Filter>MIPS\x86</Filter>
     </ClInclude>
     <ClInclude Include="HLE\HLEHelperThread.h">
       <Filter>HLE</Filter>
@@ -1973,15 +1895,6 @@
     </ClInclude>
     <ClInclude Include="MemMapHelpers.h">
       <Filter>Core</Filter>
-    </ClInclude>
-    <ClInclude Include="MIPS\ARM64\Arm64Jit.h">
-      <Filter>MIPS\ARM64</Filter>
-    </ClInclude>
-    <ClInclude Include="MIPS\ARM64\Arm64RegCache.h">
-      <Filter>MIPS\ARM64</Filter>
-    </ClInclude>
-    <ClInclude Include="MIPS\ARM64\Arm64RegCacheFPU.h">
-      <Filter>MIPS\ARM64</Filter>
     </ClInclude>
     <ClInclude Include="Util\DisArm64.h">
       <Filter>Util</Filter>
@@ -2172,9 +2085,6 @@
     <ClInclude Include="Debugger\WebSocket\InputBroadcaster.h">
       <Filter>Debugger\WebSocket</Filter>
     </ClInclude>
-    <ClInclude Include="MIPS\fake\FakeJit.h">
-      <Filter>MIPS\fake</Filter>
-    </ClInclude>
     <ClInclude Include="Debugger\LineInfo.h">
       <Filter>Debugger</Filter>
     </ClInclude>
@@ -2229,9 +2139,6 @@
     <ClInclude Include="TiltEventProcessor.h">
       <Filter>Core</Filter>
     </ClInclude>
-    <ClInclude Include="MIPS\MIPSVFPUFallbacks.h">
-      <Filter>MIPS</Filter>
-    </ClInclude>
     <ClInclude Include="ConfigSettings.h">
       <Filter>Core</Filter>
     </ClInclude>
@@ -2242,6 +2149,9 @@
       <Filter>MIPS\RiscV</Filter>
     </ClInclude>
     <ClInclude Include="MIPS\RiscV\RiscVRegCache.h">
+      <Filter>MIPS\RiscV</Filter>
+    </ClInclude>
+    <ClInclude Include="MIPS\RiscV\RiscVVfpuDot.h">
       <Filter>MIPS\RiscV</Filter>
     </ClInclude>
     <ClInclude Include="MIPS\IR\IRAnalysis.h">
@@ -2256,6 +2166,9 @@
     <ClInclude Include="MIPS\x86\X64IRRegCache.h">
       <Filter>MIPS\x86</Filter>
     </ClInclude>
+    <ClInclude Include="MIPS\x86\X64VfpuDot.h">
+      <Filter>MIPS\x86</Filter>
+    </ClInclude>
     <ClInclude Include="MIPS\x86\X64IRJit.h">
       <Filter>MIPS\x86</Filter>
     </ClInclude>
@@ -2263,6 +2176,9 @@
       <Filter>MIPS\ARM64</Filter>
     </ClInclude>
     <ClInclude Include="MIPS\ARM64\Arm64IRRegCache.h">
+      <Filter>MIPS\ARM64</Filter>
+    </ClInclude>
+    <ClInclude Include="MIPS\ARM64\Arm64VfpuDot.h">
       <Filter>MIPS\ARM64</Filter>
     </ClInclude>
     <ClInclude Include="Util\GameDB.h">
@@ -2329,6 +2245,9 @@
       <Filter>MIPS\LoongArch64</Filter>
     </ClInclude>
     <ClInclude Include="MIPS\LoongArch64\LoongArch64RegCache.h">
+      <Filter>MIPS\LoongArch64</Filter>
+    </ClInclude>
+    <ClInclude Include="MIPS\LoongArch64\LoongArch64VfpuDot.h">
       <Filter>MIPS\LoongArch64</Filter>
     </ClInclude>
     <ClInclude Include="..\ext\loongarch-disasm.h">
