@@ -871,7 +871,8 @@ void GLQueueRunner::RestoreBaselineStateAfterCallback() {
 			glBindSampler(i, 0);
 	}
 	glActiveTexture(GL_TEXTURE0);
-	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	// Back to the baseline CreateDeviceObjects established, which texture uploads rely on.
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	// GLES 2 has none of these; GLES 3.0 has all four, and gl3stub.h declares the enums for
 	// USING_GLES2 builds, so the guard is purely a runtime one.
 	if (!gl_extensions.IsGLES || gl_extensions.GLES3) {
