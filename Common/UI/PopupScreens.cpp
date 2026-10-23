@@ -836,7 +836,7 @@ void PopupTextInputChoice::HandleClick(EventParams &e) {
 	// Choose method depending on platform capabilities.
 	if (System_GetPropertyBool(SYSPROP_HAS_TEXT_INPUT_DIALOG)) {
 		System_InputBoxGetString(token_, text_, *value_, passwordMasking_, [this](std::string_view enteredValue, int) {
-			*value_ = SanitizeString(StripSpaces(enteredValue), restriction_, minLen_, maxLen_);
+			*value_ = SanitizeString(keepSpaces_ ? enteredValue : StripSpaces(enteredValue), restriction_, minLen_, maxLen_);
 			EventParams params{};
 			params.v = this;
 			OnChange.Trigger(params);
@@ -846,11 +846,14 @@ void PopupTextInputChoice::HandleClick(EventParams &e) {
 
 	TextEditPopupScreen *popupScreen = new TextEditPopupScreen(value_, placeHolder_, ChopTitle(text_), maxLen_);
 	popupScreen->SetPasswordMasking(passwordMasking_);
+	popupScreen->SetKeepSpaces(keepSpaces_);
 	if (System_GetPropertyBool(SYSPROP_KEYBOARD_IS_SOFT)) {
 		popupScreen->SetAlignTop(true);
 	}
 	popupScreen->OnChange.Add([this](EventParams &e) {
-		*value_ = StripSpaces(SanitizeString(*value_, restriction_, minLen_, maxLen_));
+		*value_ = SanitizeString(*value_, restriction_, minLen_, maxLen_);
+		if (!keepSpaces_)
+			*value_ = StripSpaces(*value_);
 		EventParams params{};
 		params.v = this;
 		params.s = *value_;
@@ -1004,7 +1007,7 @@ void TextEditPopupScreen::CreatePopupContents(UI::ViewGroup *parent) {
 
 void TextEditPopupScreen::OnCompleted(DialogResult result) {
 	if (result == DR_OK) {
-		*value_ = StripSpaces(edit_->GetText());
+		*value_ = keepSpaces_ ? std::string(edit_->GetText()) : std::string(StripSpaces(edit_->GetText()));
 		EventParams e{};
 		e.v = edit_;
 		e.s = *value_;

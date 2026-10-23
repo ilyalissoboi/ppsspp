@@ -1771,6 +1771,11 @@ if(UNIX AND NOT ANDROID AND NOT APPLE)
 		TARGETS ${TargetBin}
 		DESTINATION "${CMAKE_INSTALL_BINDIR}"
 	)
+	# Save sync: the emusync library goes where PPSSPP looks for it, next to the program
+	# (cmake/EmuSync.cmake).
+	if(EMUSYNC_RUNTIME)
+		install(FILES "${EMUSYNC_RUNTIME}" DESTINATION "${CMAKE_INSTALL_BINDIR}")
+	endif()
 	install(
 		DIRECTORY "${CMAKE_BINARY_DIR}/assets"
 		DESTINATION "${CMAKE_INSTALL_DATADIR}/ppsspp"

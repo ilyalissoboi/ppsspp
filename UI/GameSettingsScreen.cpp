@@ -1533,13 +1533,34 @@ void GameSettingsScreen::CreateSystemSettings(UI::ViewGroup *systemSettings) {
 
 namespace {
 
-// The save sync status line. It refreshes itself as the screen draws (syncing happens in the
-// background), and keeps the secret fields' "Saved"/"Not set" in step with the store.
-class SaveSyncStatusView : public UI::TextView {
+// The storage address, shown on one row: a long address has no spaces to wrap at, so it would run
+// into the label. Shown without its options (?region=...) and cropped in the middle, keeping the
+// start (the bucket) and the end (the folder); the full address is in the text field.
+class StorageAddressChoice : public UI::PopupTextInputChoice {
 public:
-	SaveSyncStatusView(UI::PopupTextInputChoice *secret, UI::PopupTextInputChoice *passphrase)
-		: UI::TextView("", ALIGN_LEFT | FLAG_WRAP_TEXT, true, new UI::LinearLayoutParams(UI::FILL_PARENT, UI::WRAP_CONTENT)),
-		  secret_(secret), passphrase_(passphrase) {}
+	using UI::PopupTextInputChoice::PopupTextInputChoice;
+
+protected:
+	std::string ValueText(bool *shadow) const override {
+		std::string text = UI::PopupTextInputChoice::ValueText(shadow);
+		if (*shadow)
+			return text;
+		text = text.substr(0, text.find('?'));
+		constexpr size_t MAX_LENGTH = 32;
+		const bool ascii = std::all_of(text.begin(), text.end(), [](char c) { return (unsigned char)c < 0x80; });
+		if (text.size() <= MAX_LENGTH || !ascii)
+			return text;
+		return text.substr(0, 16) + "..." + text.substr(text.size() - (MAX_LENGTH - 19));
+	}
+};
+
+// The save sync status line, drawn as a hint of the "Sync saves" row like the other settings' tips,
+// so it sits inside the section. It refreshes itself as the screen draws (syncing happens in the
+// background), and keeps the secret fields' "Saved"/"Not set" in step with the store.
+class SaveSyncStatusView : public SettingHint {
+public:
+	SaveSyncStatusView(UI::View *setting, UI::PopupTextInputChoice *secret, UI::PopupTextInputChoice *passphrase)
+		: SettingHint("", setting), secret_(secret), passphrase_(passphrase) {}
 
 	void Update() override {
 		auto sy = GetI18NCategory(I18NCat::SYSTEM);
@@ -1562,7 +1583,7 @@ public:
 		SetText(text);
 		secret_->SetShadowText(SaveSync::HasSecret(SaveSync::SECRET_ACCESS_KEY) ? sy->T("Saved") : sy->T("Not set"));
 		passphrase_->SetShadowText(SaveSync::HasSecret(SaveSync::ENCRYPTION_PASSPHRASE) ? sy->T("Saved") : sy->T("None"));
-		TextView::Update();
+		SettingHint::Update();
 	}
 
 private:
@@ -1588,7 +1609,7 @@ void GameSettingsScreen::CreateSaveSyncSettings(UI::ViewGroup *systemSettings) {
 	enabled->SetEnabledFunc(available);
 	systemSettings->Add(new SettingHint(sy->T("Save sync Tip", "Saves made on your other devices are put on the memory stick before a game starts, and yours upload as the game saves them. Uses storage you own: Amazon S3 or an S3-compatible service."), enabled));
 
-	PopupTextInputChoice *storage = systemSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sSaveSyncRemoteURI, sy->T("Storage"), "s3://bucket/folder?region=eu-west-1", 512, screenManager()));
+	PopupTextInputChoice *storage = systemSettings->Add(new StorageAddressChoice(GetRequesterToken(), &g_Config.sSaveSyncRemoteURI, sy->T("Storage"), "s3://bucket/folder?region=eu-west-1", 512, screenManager()));
 	storage->OnChange.Add(apply);
 	storage->SetEnabledFunc(available);
 	systemSettings->Add(new SettingHint(sy->T("Save sync storage Tip", "Bucket and folder, e.g. s3://my-saves/emusync/v1?region=eu-west-1. Use the same on every device. S3-compatible services take an endpoint: s3://bucket/folder?endpoint=https://...&region=auto"), storage));
@@ -1610,6 +1631,8 @@ void GameSettingsScreen::CreateSaveSyncSettings(UI::ViewGroup *systemSettings) {
 
 	PopupTextInputChoice *passphrase = systemSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &saveSyncPassphrase_, sy->T("Encryption passphrase"), "", 256, screenManager()));
 	passphrase->SetPasswordDisplay();
+	// Spaces at either end are part of a passphrase: it has to match on every device.
+	passphrase->SetKeepSpaces(true);
 	passphrase->SetEnabledFunc(available);
 	passphrase->OnChange.Add([this](EventParams &) {
 		// Not trimmed: spaces can be part of a passphrase, and it has to match on every device.
@@ -1660,7 +1683,9 @@ void GameSettingsScreen::CreateSaveSyncSettings(UI::ViewGroup *systemSettings) {
 	syncNow->OnClick.Add([](EventParams &) { SaveSync::SyncNow(); });
 	syncNow->SetEnabledFunc([]() { return SaveSync::IsRunning() && !SaveSync::IsApplying(); });
 
-	systemSettings->Add(new SaveSyncStatusView(secret, passphrase));
+	// Under Sync now, with the enabled state (and so the color) of the switch, which is on whenever
+	// the build has save sync.
+	systemSettings->Add(new SaveSyncStatusView(enabled, secret, passphrase));
 }
 
 void GameSettingsScreen::CreateVRSettings(UI::ViewGroup *vrSettings) {

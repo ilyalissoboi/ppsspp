@@ -241,6 +241,10 @@ public:
 	void SetPasswordMasking(bool masking) {
 		passwordMasking_ = masking;
 	}
+	// Leading and trailing spaces are part of the value (a passphrase), instead of being stripped.
+	void SetKeepSpaces(bool keep) {
+		keepSpaces_ = keep;
+	}
 
 	Event OnChange;
 
@@ -257,6 +261,7 @@ private:
 	int maxLen_;
 	SoftKeyboardState kbState_{};
 	bool passwordMasking_ = false;
+	bool keepSpaces_ = false;
 };
 
 struct ContextMenuItem {
@@ -541,6 +546,11 @@ public:
 		shadowText_ = text;
 	}
 
+	// Leading and trailing spaces are part of the value (a passphrase), instead of being stripped.
+	void SetKeepSpaces(bool keep) {
+		keepSpaces_ = keep;
+	}
+
 protected:
 	std::string ValueText(bool *shadow) const override;
 
@@ -555,6 +565,7 @@ private:
 	int maxLen_;
 	int minLen_ = 0;
 	bool restoreFocus_ = false;
+	bool keepSpaces_ = false;
 	StringRestriction restriction_;
 };
 
