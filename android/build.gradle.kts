@@ -65,8 +65,8 @@ val gitVersionCode =
 // SaveSync loads at run time on Android 7.0 and later (the AAR's minSdk; PPSSPP keeps 21: see
 // AndroidManifest.xml), and the Keystore-backed settings class SaveSyncSecrets uses. Keep the
 // version in step with ext/emusync.
-val emusyncVersion = "0.2.0"
-val emusyncAarSha256 = "bd69015c6d46cb1bca108e3b085a8efb1507b3f6ca31c504523dd23c4fa6be59"
+val emusyncVersion = "0.2.1"
+val emusyncAarSha256 = "2082033f77f5c6e654e1be1f35f13c01c831ffb83294fdb6334b17345a441045"
 val emusyncAar = layout.buildDirectory.file("emusync/emusync-$emusyncVersion.aar")
 val downloadEmusync = tasks.register("downloadEmusync") {
 	val url = "https://github.com/ilyalissoboi/emusync/releases/download/v$emusyncVersion/emusync-$emusyncVersion.aar"
