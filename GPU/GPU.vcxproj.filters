@@ -54,6 +54,9 @@
     <ClInclude Include="Software\TransformUnit.h">
       <Filter>Software</Filter>
     </ClInclude>
+    <ClInclude Include="Software\GEMath.h">
+      <Filter>Software</Filter>
+    </ClInclude>
     <ClInclude Include="Common\VertexDecoderCommon.h">
       <Filter>Common</Filter>
     </ClInclude>
@@ -246,7 +249,7 @@
     <ClInclude Include="Software\DrawPixel.h">
       <Filter>Software</Filter>
     </ClInclude>
-    <ClInclude Include="Software\RasterizerRegCache.h">
+    <ClInclude Include="Software\RasterizerTypes.h">
       <Filter>Software</Filter>
     </ClInclude>
     <ClInclude Include="Software\BinManager.h">
@@ -277,6 +280,9 @@
       <Filter>Debugger</Filter>
     </ClInclude>
     <ClInclude Include="Common\DepthRaster.h">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="Common\DepthSwizzle.h">
       <Filter>Common</Filter>
     </ClInclude>
     <ClInclude Include="GPUStateSIMDUtil.h">
@@ -312,6 +318,9 @@
       <Filter>Software</Filter>
     </ClCompile>
     <ClCompile Include="Software\TransformUnit.cpp">
+      <Filter>Software</Filter>
+    </ClCompile>
+    <ClCompile Include="Software\GEMath.cpp">
       <Filter>Software</Filter>
     </ClCompile>
     <ClCompile Include="Common\VertexDecoderCommon.cpp">
@@ -455,9 +464,6 @@
     <ClCompile Include="Software\Sampler.cpp">
       <Filter>Software</Filter>
     </ClCompile>
-    <ClCompile Include="Software\SamplerX86.cpp">
-      <Filter>Software</Filter>
-    </ClCompile>
     <ClCompile Include="Debugger\Record.cpp">
       <Filter>Debugger</Filter>
     </ClCompile>
@@ -519,12 +525,6 @@
       <Filter>Software</Filter>
     </ClCompile>
     <ClCompile Include="Software\DrawPixel.cpp">
-      <Filter>Software</Filter>
-    </ClCompile>
-    <ClCompile Include="Software\DrawPixelX86.cpp">
-      <Filter>Software</Filter>
-    </ClCompile>
-    <ClCompile Include="Software\RasterizerRegCache.cpp">
       <Filter>Software</Filter>
     </ClCompile>
     <ClCompile Include="Software\BinManager.cpp">

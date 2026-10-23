@@ -18,6 +18,7 @@
 #include <set>
 
 #include "Common/System/Display.h"
+#include "Common/Serialize/Serializer.h"
 #include "Common/GPU/OpenGL/GLFeatures.h"
 
 #include "GPU/GPUState.h"
@@ -54,7 +55,7 @@ constexpr int FB_HEIGHT = 272;
 
 uint8_t clut[1024];
 FormatBuffer fb;
-FormatBuffer depthbuf;
+DepthBuffer depthbuf;
 
 struct CommandInfo {
 	uint64_t flags;
@@ -111,7 +112,7 @@ const SoftwareCommandTableEntry softgpuCommandTable[] = {
 	{ GE_CMD_FOGENABLE, 0, SoftDirty::PIXEL_BASIC | SoftDirty::PIXEL_CACHED | SoftDirty::TRANSFORM_BASIC | SoftDirty::TRANSFORM_FOG | SoftDirty::TRANSFORM_MATRIX },
 	{ GE_CMD_TEXMODE, 0, SoftDirty::SAMPLER_BASIC | SoftDirty::SAMPLER_TEXLIST | SoftDirty::RAST_TEX },
 	// Currently this doesn't affect any state, but maybe it should.
-	{ GE_CMD_TEXSHADELS },
+	{ GE_CMD_TEXSHADELS, 0, SoftDirty::TRANSFORM_BASIC },
 	{ GE_CMD_SHADEMODE, 0, SoftDirty::RAST_BASIC },
 	{ GE_CMD_TEXFUNC, 0, SoftDirty::SAMPLER_BASIC },
 	{ GE_CMD_COLORTEST, 0, SoftDirty::PIXEL_BASIC | SoftDirty::PIXEL_CACHED },
@@ -163,10 +164,10 @@ const SoftwareCommandTableEntry softgpuCommandTable[] = {
 	{ GE_CMD_TEXMAPMODE, 0, SoftDirty::TRANSFORM_BASIC | SoftDirty::RAST_TEX },
 
 	// These are read on every SubmitPrim, no need for dirtying or flushing.
-	{ GE_CMD_TEXSCALEU },
-	{ GE_CMD_TEXSCALEV },
-	{ GE_CMD_TEXOFFSETU },
-	{ GE_CMD_TEXOFFSETV },
+	{ GE_CMD_TEXSCALEU, 0, SoftDirty::TRANSFORM_BASIC },
+	{ GE_CMD_TEXSCALEV, 0, SoftDirty::TRANSFORM_BASIC },
+	{ GE_CMD_TEXOFFSETU, 0, SoftDirty::TRANSFORM_BASIC },
+	{ GE_CMD_TEXOFFSETV, 0, SoftDirty::TRANSFORM_BASIC },
 
 	{ GE_CMD_TEXSIZE0, 0, SoftDirty::SAMPLER_TEXLIST | SoftDirty::BINNER_OVERLAP },
 	{ GE_CMD_TEXSIZE1, 0, SoftDirty::SAMPLER_TEXLIST | SoftDirty::BINNER_OVERLAP },
@@ -317,8 +318,9 @@ const SoftwareCommandTableEntry softgpuCommandTable[] = {
 	{ GE_CMD_LDC3, 0, SoftDirty::LIGHT_BASIC | SoftDirty::LIGHT_MATERIAL | SoftDirty::LIGHT_3 },
 	{ GE_CMD_LSC3, 0, SoftDirty::LIGHT_BASIC | SoftDirty::LIGHT_MATERIAL | SoftDirty::LIGHT_3 },
 
+	{ GE_CMD_TEXFLUSH, FLAG_EXECUTE, SoftDirty::NONE, &SoftGPU::Execute_TexFlush },
+
 	// These are currently ignored, but might do flushing later.
-	{ GE_CMD_TEXFLUSH },
 	{ GE_CMD_TEXSYNC },
 
 	// These are just nop or part of other later commands.
@@ -396,7 +398,8 @@ SoftGPU::SoftGPU(GraphicsContext *gfxCtx, Draw::DrawContext *draw)
 	: GPUCommon(gfxCtx, draw)
 {
 	fb.data = Memory::GetPointerWriteOrException(0x44000000); // TODO: correct default address?
-	depthbuf.data = Memory::GetPointerWriteOrException(0x44000000); // TODO: correct default address?
+	depthbuf.vram = Memory::GetPointerWriteOrException(0x04000000);
+	UpdateDepthBuffer();
 
 	memset(softgpuCmdInfo, 0, sizeof(softgpuCmdInfo));
 
@@ -429,8 +432,6 @@ SoftGPU::SoftGPU(GraphicsContext *gfxCtx, Draw::DrawContext *draw)
 	displayStride_ = 512;
 	displayFormat_ = GE_FORMAT_8888;
 
-	Rasterizer::Init();
-	Sampler::Init();
 	drawEngine_ = new SoftwareDrawEngine();
 	drawEngine_->SetGPUCommon(this);
 	drawEngine_->Init();
@@ -472,6 +473,8 @@ void SoftGPU::DeviceRestore(Draw::DrawContext *draw) {
 }
 
 SoftGPU::~SoftGPU() {
+	// The firmware's default, until the next software renderer sets it.
+	Memory::g_depthTranslationIndex = DepthTranslationIndex(0x400);
 	if (fbTex) {
 		fbTex->Release();
 		fbTex = nullptr;
@@ -479,9 +482,6 @@ SoftGPU::~SoftGPU() {
 
 	delete presentation_;
 	delete drawEngine_;
-
-	Sampler::Shutdown();
-	Rasterizer::Shutdown();
 }
 
 void SoftGPU::SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format) {
@@ -494,6 +494,55 @@ void SoftGPU::SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat for
 }
 
 DSStretch g_DarkStalkerStretch;
+
+// With the DarkStalkers hack, the game's stretch blit is skipped and we present its 384x224 source image directly.
+static const u32 DS_SOURCE_ADDR = 0x04088000;
+
+bool SoftGPU::DarkStalkersStretchActive() const {
+	return PSP_CoreParameter().compat.flags().DarkStalkersPresentHack && displayFormat_ == GE_FORMAT_5551 && g_DarkStalkerStretch != DSStretch::Off;
+}
+
+// Does the stretch blit we skipped, so screenshots see what the game would have displayed.
+void SoftGPU::GetDarkStalkersDisplay(GPUDebugBuffer &buffer) {
+	const u16 *src = (const u16 *)Memory::GetPointerOrException(DS_SOURCE_ADDR);
+	const int srcStride = displayStride_ == 0 ? 512 : displayStride_;
+	const int srcX = 64, srcY = 16, srcW = 384, srcH = 224;
+	// Same rectangles as the game's own blits (see RectangleFastPath).
+	const int dstX = g_DarkStalkerStretch == DSStretch::Normal ? 48 : 0;
+	const int dstW = g_DarkStalkerStretch == DSStretch::Normal ? 384 : 480;
+
+	buffer.Allocate(480, 272, GE_FORMAT_8888);
+	u32 *dst = (u32 *)buffer.GetData();
+	for (int y = 0; y < 272; ++y) {
+		float sy = std::clamp((y + 0.5f) * srcH / 272.0f - 0.5f, 0.0f, (float)(srcH - 1));
+		int y0 = (int)sy;
+		int y1 = std::min(y0 + 1, srcH - 1);
+		float fy = sy - y0;
+		const u16 *row0 = src + (srcY + y0) * srcStride + srcX;
+		const u16 *row1 = src + (srcY + y1) * srcStride + srcX;
+		for (int x = 0; x < 480; ++x) {
+			if (x < dstX || x >= dstX + dstW) {
+				dst[y * 480 + x] = 0xFF000000;
+				continue;
+			}
+			float sx = std::clamp((x - dstX + 0.5f) * srcW / dstW - 0.5f, 0.0f, (float)(srcW - 1));
+			int x0 = (int)sx;
+			int x1 = std::min(x0 + 1, srcW - 1);
+			float fx = sx - x0;
+			const u32 c00 = RGBA5551ToRGBA8888(row0[x0]);
+			const u32 c01 = RGBA5551ToRGBA8888(row0[x1]);
+			const u32 c10 = RGBA5551ToRGBA8888(row1[x0]);
+			const u32 c11 = RGBA5551ToRGBA8888(row1[x1]);
+			u32 result = 0xFF000000;
+			for (int shift = 0; shift < 24; shift += 8) {
+				float top = ((c00 >> shift) & 0xFF) * (1.0f - fx) + ((c01 >> shift) & 0xFF) * fx;
+				float bottom = ((c10 >> shift) & 0xFF) * (1.0f - fx) + ((c11 >> shift) & 0xFF) * fx;
+				result |= (u32)(top * (1.0f - fy) + bottom * fy + 0.5f) << shift;
+			}
+			dst[y * 480 + x] = result;
+		}
+	}
+}
 
 void SoftGPU::ConvertTextureDescFrom16(Draw::TextureDesc &desc, int srcwidth, int srcheight, const uint16_t *overrideData) {
 	// TODO: This should probably be converted in a shader instead..
@@ -563,8 +612,8 @@ void SoftGPU::CopyToCurrentFboFromDisplayRam(const DisplayLayoutConfig &config, 
 	OutputFlags outputFlags = config.iDisplayFilter == SCALE_NEAREST ? OutputFlags::NEAREST : OutputFlags::LINEAR;
 	bool hasPostShader = presentation_ && presentation_->HasPostShader();
 
-	if (PSP_CoreParameter().compat.flags().DarkStalkersPresentHack && displayFormat_ == GE_FORMAT_5551 && g_DarkStalkerStretch != DSStretch::Off) {
-		const u8 *data = Memory::GetPointerWriteOrException(0x04088000);
+	if (DarkStalkersStretchActive()) {
+		const u8 *data = Memory::GetPointerWriteOrException(DS_SOURCE_ADDR);
 		bool fillDesc = true;
 		if (draw_->GetDataFormatSupport(Draw::DataFormat::A1B5G5R5_UNORM_PACK16) & Draw::FMT_TEXTURE) {
 			// The perfect one.
@@ -825,9 +874,12 @@ void SoftGPU::Execute_BlockTransferStart(u32 op, u32 diff) {
 	const uint32_t dstSize = (height - 1) * (dstStride + width) * bpp;
 
 	// Need to flush both source and target, so we overwrite properly.
-	if (Memory::IsValidRange(src, srcSize) && Memory::IsValidRange(dst, dstSize)) {
-		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", false, src, srcStride, width * bpp, height);
-		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", true, dst, dstStride, width * bpp, height);
+	if (Memory::IsDepthTexVRAMAddress(srcBasePtr) || Memory::IsDepthTexVRAMAddress(dstBasePtr)) {
+		// Through the depth layout (CopyBlockTransfer), which the ranges don't follow.
+		drawEngine_->transformUnit.Flush(this, "blockxfer_depth");
+	} else if (Memory::IsValidRange(src, srcSize) && Memory::IsValidRange(dst, dstSize)) {
+		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", false, src, srcStride * bpp, width * bpp, height);
+		drawEngine_->transformUnit.FlushIfOverlap(this, "blockxfer", true, dst, dstStride * bpp, width * bpp, height);
 	} else {
 		drawEngine_->transformUnit.Flush(this, "blockxfer_wrap");
 	}
@@ -836,6 +888,47 @@ void SoftGPU::Execute_BlockTransferStart(u32 op, u32 diff) {
 
 	// Could theoretically dirty the framebuffer.
 	MarkDirty(dst, dstSize, SoftGPUVRAMDirty::DIRTY | SoftGPUVRAMDirty::REALLY_DIRTY);
+}
+
+// A block transfer from or to VRAM's 0x04200000 or 0x04600000 mirror goes through the depth layout there, as the
+// CPU's accesses do: Hayate no Gotoku restores its depth buffer through 0x04600000 (#17878).
+bool SoftGPU::CopyBlockTransfer(u32 srcBasePtr, u32 srcStride, int srcX, int srcY, u32 dstBasePtr, u32 dstStride, int dstX, int dstY, int width, int height, int bpp) {
+	if (!Memory::IsDepthTexVRAMAddress(srcBasePtr) && !Memory::IsDepthTexVRAMAddress(dstBasePtr))
+		return false;
+	const DepthLayout layout16 = GetDepthLayout(GetAddrTranslation(), false);
+	const DepthLayout layout32 = GetDepthLayout(GetAddrTranslation(), true);
+	// The memory of each run of a row, which the layout keeps together within 32 aligned bytes. Past VRAM's end, a
+	// transfer wraps to its start, which isn't a swizzled mirror.
+	auto run = [&](u32 addr) -> u8 * {
+		if ((addr & 0x04800000) == 0x04800000)
+			addr &= ~0x00800000;
+		if (Memory::IsDepthTexVRAMAddress(addr))
+			return depthbuf.vram + ((addr & 0x00400000) ? layout32 : layout16).Stored(addr & 0x001FFFFF);
+		return Memory::IsValidAddress(addr) ? Memory::GetPointerWriteUnchecked(addr) : nullptr;
+	};
+	const u32 bytes = width * bpp;
+	std::vector<u8> row(bytes);
+	for (int y = 0; y < height; ++y) {
+		const u32 srcRow = srcBasePtr + ((y + srcY) * srcStride + srcX) * bpp;
+		const u32 dstRow = dstBasePtr + ((y + dstY) * dstStride + dstX) * bpp;
+		for (u32 pos = 0; pos < bytes; ) {
+			const u32 n = std::min(32 - ((srcRow + pos) & 31), bytes - pos);
+			const u8 *p = run(srcRow + pos);
+			if (p)
+				memcpy(row.data() + pos, p, n);
+			else
+				memset(row.data() + pos, 0, n);
+			pos += n;
+		}
+		for (u32 pos = 0; pos < bytes; ) {
+			const u32 n = std::min(32 - ((dstRow + pos) & 31), bytes - pos);
+			u8 *p = run(dstRow + pos);
+			if (p)
+				memcpy(p, row.data() + pos, n);
+			pos += n;
+		}
+	}
+	return true;
 }
 
 void SoftGPU::Execute_Prim(u32 op, u32 diff) {
@@ -863,10 +956,19 @@ void SoftGPU::Execute_Prim(u32 op, u32 diff) {
 		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
 	}
 
-	cyclesExecuted += EstimatePerVertexCost() * count;
+	if (gstate.isModeThrough()) {
+		cyclesExecuted += EstimateFillCycles(prim, verts, indices, count, drawEngine_->FindVertexDecoder(vertType), vertType);
+	}
+	if (!PSP_CoreParameter().compat.flags().FastEmulatedGPU) {
+		cyclesExecuted += EstimatePerVertexCost() * count;
+	}
 	int bytesRead;
 	drawEngine_->transformUnit.SetDirty(dirtyFlags_);
-	drawEngine_->transformUnit.SubmitPrimitive(verts, indices, prim, count, vertType, &bytesRead, drawEngine_);
+	// The vertices of a run of draws, for the transform to do together (when it isn't in one already).
+	int runCount = 0;
+	if (!indices && !drawEngine_->transformUnit.InRun(verts, vertType))
+		runCount = RunVertexCount(count, drawEngine_->FindVertexDecoder(vertType)->VertexSize());
+	drawEngine_->transformUnit.SubmitPrimitive(verts, indices, prim, count, vertType, &bytesRead, drawEngine_, runCount);
 	dirtyFlags_ = drawEngine_->transformUnit.GetDirty();
 
 	SoftGPUVRAMDirty mark = (gstate_c.skipDrawReason & SKIPDRAW_SKIPFRAME) != 0 ? SoftGPUVRAMDirty::DIRTY : SoftGPUVRAMDirty::DIRTY | SoftGPUVRAMDirty::REALLY_DIRTY;
@@ -876,6 +978,38 @@ void SoftGPU::Execute_Prim(u32 op, u32 diff) {
 	// Some games rely on this, they don't bother reloading VADDR and IADDR.
 	// The VADDR/IADDR registers are NOT updated.
 	gstate_c.AdvanceVerts(vertType, count, bytesRead);
+}
+
+// The vertices this draw and the ones right after it read, when those continue where it leaves off with
+// nothing changed in between (God of War draws thousands of short strips like that). Only commands that can't
+// change anything are skipped over: NOPs, unchanged state, and VADDR to where the vertices continue anyway.
+int SoftGPU::RunVertexCount(u32 count, u32 vertexSize) {
+	constexpr int MAX_LOOKAHEAD = 1024;
+	u32 total = count;
+	u32 nextAddr = gstate_c.vertexAddr + count * vertexSize;
+	u32 pc = currentList->pc + 4;
+	// downcount counts this PRIM and the commands up to the stall address.
+	const int commands = std::min(downcount - 1, MAX_LOOKAHEAD);
+	if (commands <= 0 || !Memory::IsValidRange(pc, commands * 4))
+		return (int)count;
+	for (int i = 0; i < commands; ++i, pc += 4) {
+		const u32 op = Memory::ReadUnchecked_U32(pc);
+		const u32 cmd = op >> 24;
+		if (cmd == GE_CMD_PRIM) {
+			const u32 n = op & 0xFFFF;
+			total += n;
+			nextAddr += n * vertexSize;
+		} else if (cmd == GE_CMD_VADDR) {
+			if (gstate_c.getRelativeAddress(op & 0x00FFFFFF) != nextAddr)
+				break;
+		} else if (op != gstate.cmdmem[cmd] || (softgpuCmdInfo[cmd].flags & (FLAG_EXECUTE | FLAG_READS_PC | FLAG_WRITES_PC))) {
+			break;
+		}
+	}
+	// They're all read at once, so they have to be valid.
+	if (!Memory::IsValidRange(gstate_c.vertexAddr, total * vertexSize))
+		return (int)count;
+	return (int)total;
 }
 
 void SoftGPU::Execute_Bezier(u32 op, u32 diff) {
@@ -914,6 +1048,7 @@ void SoftGPU::Execute_Bezier(u32 op, u32 diff) {
 	surface.num_patches_v = (surface.num_points_v - 1) / 3;
 	surface.primType = gstate.getPatchPrimitiveType();
 	surface.patchFacing = gstate.patchfacing & 1;
+	surface.geExact = true;
 
 	SetDrawType(DRAW_BEZIER, PatchPrimToPrim(surface.primType));
 
@@ -968,6 +1103,7 @@ void SoftGPU::Execute_Spline(u32 op, u32 diff) {
 	surface.num_patches_v = surface.num_points_v - 3;
 	surface.primType = gstate.getPatchPrimitiveType();
 	surface.patchFacing = gstate.patchfacing & 1;
+	surface.geExact = true;
 
 	SetDrawType(DRAW_SPLINE, PatchPrimToPrim(surface.primType));
 
@@ -1027,18 +1163,53 @@ void SoftGPU::Execute_FramebufPtr(u32 op, u32 diff) {
 
 void SoftGPU::Execute_FramebufFormat(u32 op, u32 diff) {
 	// We should flush, because ranges within bins may change.
-	if (diff)
+	if (diff) {
 		drawEngine_->transformUnit.Flush(this, "framebuf");
+		// The depth layout depends on the color format.
+		UpdateDepthBuffer();
+	}
+}
+
+void SoftGPU::Execute_TexFlush(u32 op, u32 diff) {
+	drawEngine_->transformUnit.NotifyTexFlush();
 }
 
 void SoftGPU::Execute_ZbufPtr(u32 op, u32 diff) {
-	// We assume depthbuf.data won't change while we're drawing.
+	// We assume depthbuf won't change while we're drawing.
 	if (diff) {
 		drawEngine_->transformUnit.Flush(this, "depthbuf");
-		// For the pointer, ignore memory mirrors.  This also gives some buffer for draws that go outside.
-		// TODO: Confirm how wrapping is handled in drawing.  Adjust if we ever handle VRAM mirrors more accurately.
-		depthbuf.data = Memory::GetPointerWriteOrException(gstate.getDepthBufAddress() & 0x041FFFF0);
+		UpdateDepthBuffer();
 	}
+}
+
+// Call with nothing queued: the threads draw with depthbuf.
+void SoftGPU::UpdateDepthBuffer() {
+	// The GE ignores the mirror bits of its own pointers (exp89). Draws that go outside reach the mirrors,
+	// which map back to VRAM.
+	depthbuf.base = gstate.getDepthBufAddress() & 0x001FFFF0;
+	depthbuf.translation = GetAddrTranslation();
+	depthbuf.layout = GetDepthLayout(depthbuf.translation, gstate.FrameBufFormat() == GE_FORMAT_8888);
+	Memory::g_depthTranslationIndex = DepthTranslationIndex(depthbuf.translation);
+}
+
+void SoftGPU::DoState(PointerWrap &p) {
+	GPUCommon::DoState(p);
+	// The translation comes back without SetAddrTranslation.
+	if (p.mode == PointerWrap::MODE_READ)
+		UpdateDepthBuffer();
+}
+
+uint32_t SoftGPU::SetAddrTranslation(uint32_t value) {
+	if (value != GetAddrTranslation()) {
+		// Queued drawing uses the old layout.
+		drawEngine_->transformUnit.Flush(this, "translation");
+		const uint32_t previous = GPUCommon::SetAddrTranslation(value);
+		UpdateDepthBuffer();
+		dirtyFlags_ |= SoftDirty::PIXEL_BASIC;
+		drawEngine_->transformUnit.SetDirty(SoftDirty::PIXEL_BASIC);
+		return previous;
+	}
+	return GPUCommon::SetAddrTranslation(value);
 }
 
 void SoftGPU::Execute_VertexType(u32 op, u32 diff) {
@@ -1145,8 +1316,8 @@ void SoftGPU::Execute_TgenMtxData(u32 op, u32 diff) {
 		u32 newVal = op << 8;
 		if (newVal != *target) {
 			*target = newVal;
-			// This is mainly used in vertex read, but also affects if we enable texture projection.
-			dirtyFlags_ |= SoftDirty::RAST_TEX;
+			// TransformState keeps its rows, and it also affects if we enable texture projection.
+			dirtyFlags_ |= SoftDirty::TRANSFORM_MATRIX | SoftDirty::RAST_TEX;
 		}
 	}
 
@@ -1241,21 +1412,33 @@ void SoftGPU::Execute_Call(u32 op, u32 diff) {
 	}
 
 	const u32 retval = currentList->pc + 4;
-	if (currentList->stackptr == ARRAY_SIZE(currentList->stack)) {
+	if (currentList->HardwareCallDepth() >= 2) {
+		// See GPUCommon::DoExecuteCall.
+		DEBUG_LOG(Log::G3D, "CALL to %08x: skipped, already two levels deep", target);
+	} else if (currentList->stackptr == ARRAY_SIZE(currentList->stack)) {
 		ERROR_LOG(Log::G3D, "CALL: Stack full!");
 	} else {
 		auto &stackEntry = currentList->stack[currentList->stackptr++];
 		stackEntry.pc = retval;
 		stackEntry.offsetAddr = gstate_c.offsetAddr;
-		// The base address is NOT saved/restored for a regular call.
+		// The base address is NOT saved/restored for a regular call, and 0 marks it as one.
+		stackEntry.baseAddr = 0;
 		UpdatePC(currentList->pc, target - 4);
 		currentList->pc = target - 4;	// pc will be increased after we return, counteract that
 	}
 }
 
 void SoftGPU::FinishDeferred() {
-	// Need to flush before going back to CPU, so drawing is appropriately visible.
+	// Need to flush before going back to CPU, so drawing is appropriately visible. Not at a stall: the list
+	// isn't done, and games that build theirs as they go (Wipeout Pure) stall a hundred times a frame. Syncs,
+	// the display, and memory copies, sets and transfers that overlap the queued drawing still flush.
+	if (gpuState == GPUSTATE_STALL)
+		return;
 	drawEngine_->transformUnit.Flush(this, "finish");
+}
+
+void SoftGPU::FlushPendingDrawing() {
+	drawEngine_->transformUnit.Flush(this, "pending");
 }
 
 int SoftGPU::ListSync(int listid, int mode) {
@@ -1279,13 +1462,16 @@ void SoftGPU::InvalidateCache(u32 addr, int size, GPUInvalidationType type)
 	// Nothing to invalidate.
 }
 
-void SoftGPU::PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format)
+void SoftGPU::PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat format, int rectWidth)
 {
-	// Ignore.
+	// Nothing to update, but remember it for EstimateFillCycles.
+	NoteVideoRange(addr, (u32)size);
 }
 
 bool SoftGPU::PerformMemoryCopy(u32 dest, u32 src, int size, GPUCopyFlag flags) {
-	// Nothing to update.
+	// Drawing can still be queued after a list stalled (FinishDeferred).
+	drawEngine_->transformUnit.FlushIfOverlap(this, "memcpy", false, src, size, size, 1);
+	drawEngine_->transformUnit.FlushIfOverlap(this, "memcpy", true, dest, size, size, 1);
 	InvalidateCache(dest, size, GPU_INVALIDATE_HINT);
 	if (!(flags & GPUCopyFlag::DEBUG_NOTIFIED))
 		recorder_.NotifyMemcpy(dest, src, size);
@@ -1296,7 +1482,7 @@ bool SoftGPU::PerformMemoryCopy(u32 dest, u32 src, int size, GPUCopyFlag flags) 
 
 bool SoftGPU::PerformMemorySet(u32 dest, u8 v, int size)
 {
-	// Nothing to update.
+	drawEngine_->transformUnit.FlushIfOverlap(this, "memset", true, dest, size, size, 1);
 	InvalidateCache(dest, size, GPU_INVALIDATE_HINT);
 	recorder_.NotifyMemset(dest, v, size);
 	// Let's just be safe.
@@ -1306,14 +1492,20 @@ bool SoftGPU::PerformMemorySet(u32 dest, u8 v, int size)
 
 bool SoftGPU::PerformReadbackToMemory(u32 dest, int size)
 {
-	// Nothing to update.
+	drawEngine_->transformUnit.FlushIfOverlap(this, "readback", false, dest, size, size, 1);
 	InvalidateCache(dest, size, GPU_INVALIDATE_HINT);
+	return false;
+}
+
+bool SoftGPU::PerformReadbackStencilToMemory(u32 dest, int size) {
+	// Stencil is already in RAM, once any queued drawing is done.
+	drawEngine_->transformUnit.FlushIfOverlap(this, "readback", false, dest, size, size, 1);
 	return false;
 }
 
 bool SoftGPU::PerformWriteColorFromMemory(u32 dest, int size)
 {
-	// Nothing to update.
+	drawEngine_->transformUnit.FlushIfOverlap(this, "upload", true, dest, size, size, 1);
 	InvalidateCache(dest, size, GPU_INVALIDATE_HINT);
 	recorder_.NotifyUpload(dest, size);
 	return false;
@@ -1360,6 +1552,11 @@ bool SoftGPU::GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferT
 	if (!Memory::IsValidAddress(displayFramebuf_))
 		return false;
 
+	if (type == GPU_DBG_FRAMEBUF_DISPLAY && DarkStalkersStretchActive()) {
+		GetDarkStalkersDisplay(buffer);
+		return true;
+	}
+
 	if (type == GPU_DBG_FRAMEBUF_DISPLAY) {
 		size.x = 480;
 		size.y = 272;
@@ -1389,13 +1586,10 @@ bool SoftGPU::GetCurrentDepthbuffer(GPUDebugBuffer &buffer) {
 	DrawingCoords size = GetTargetSize(gstate.DepthBufStride());
 	buffer.Allocate(size.x, size.y, GPU_DBG_FORMAT_16BIT);
 
-	const int depth = 2;
-	const u8 *src = depthbuf.data;
-	u8 *dst = buffer.GetData();
+	u16 *dst = (u16 *)buffer.GetData();
 	for (int16_t y = 0; y < size.y; ++y) {
-		memcpy(dst, src, size.x * depth);
-		dst += size.x * depth;
-		src += gstate.DepthBufStride() * depth;
+		for (int16_t x = 0; x < size.x; ++x)
+			*dst++ = depthbuf.Get16(x, y, gstate.DepthBufStride());
 	}
 	return true;
 }
@@ -1441,15 +1635,3 @@ bool SoftGPU::GetCurrentClut(GPUDebugBuffer &buffer) {
 	return true;
 }
 
-bool SoftGPU::DescribeCodePtr(const u8 *ptr, std::string &name) {
-	std::string subname;
-	if (Sampler::DescribeCodePtr(ptr, subname)) {
-		name = "SamplerJit:" + subname;
-		return true;
-	}
-	if (Rasterizer::DescribeCodePtr(ptr, subname)) {
-		name = "RasterizerJit:" + subname;
-		return true;
-	}
-	return GPUCommon::DescribeCodePtr(ptr, name);
-}

@@ -46,6 +46,7 @@
 #include "GPU/GPUState.h"
 #include "GPU/ge_constants.h"
 #include "GPU/Common/ShaderUniforms.h"
+#include "GPU/Common/TransformCommon.h"
 #include "GPU/GLES/ShaderManagerGLES.h"
 #include "GPU/GLES/DrawEngineGLES.h"
 
@@ -170,36 +171,31 @@ LinkedShader::LinkedShader(GLRenderManager *render, VShaderID VSID, Shader *vs, 
 		queries.push_back({ &u_lightspecular[i], lightspecular_names[i] });
 	}
 
-	// We need to fetch these unconditionally, gstate_c.spline or bezier will not be set if we
-	// create this shader at load time from the shader cache.
-	queries.push_back({ &u_tess_points, "u_tess_points" });
-	queries.push_back({ &u_tess_weights_u, "u_tess_weights_u" });
-	queries.push_back({ &u_tess_weights_v, "u_tess_weights_v" });
-	queries.push_back({ &u_spline_counts, "u_spline_counts" });
 	queries.push_back({ &u_depal_mask_shift_off_fmt, "u_depal_mask_shift_off_fmt" });
 	queries.push_back({ &u_mipBias, "u_mipBias" });
+	queries.push_back({ &u_texLodBias, "u_texLodBias" });
 
 	attrMask = vs->GetAttrMask();
 	availableUniforms = vs->GetUniformMask() | fs->GetUniformMask();
 
 	std::vector<GLRProgram::Initializer> initialize;
-	initialize.reserve(7);
+	initialize.reserve(4);
 	initialize.push_back({ &u_tex,          0, TEX_SLOT_PSP_TEXTURE });
 	initialize.push_back({ &u_fbotex,       0, TEX_SLOT_SHADERBLEND_SRC });
 	initialize.push_back({ &u_testtex,      0, TEX_SLOT_ALPHATEST });
 	initialize.push_back({ &u_pal,          0, TEX_SLOT_CLUT }); // CLUT
-	initialize.push_back({ &u_tess_points,  0, TEX_SLOT_SPLINE_POINTS }); // Control Points
-	initialize.push_back({ &u_tess_weights_u, 0, TEX_SLOT_SPLINE_WEIGHTS_U });
-	initialize.push_back({ &u_tess_weights_v, 0, TEX_SLOT_SPLINE_WEIGHTS_V });
 
 	GLRProgramFlags flags{};
 	flags.supportDualSource = gstate_c.Use(GPU_USE_DUALSOURCE_BLEND);
-	if (!VSID.Bit(VS_BIT_IS_THROUGH) && gstate_c.Use(GPU_USE_DEPTH_CLAMP)) {
-		flags.useClipDistance0 = true;
-		if (VSID.Bit(VS_BIT_VERTEX_RANGE_CULLING) && gstate_c.Use(GPU_USE_CLIP_DISTANCE))
+	// Must match the planes GenerateVertexShader writes: min/max Z in 0 and 1, the near plane in 2.
+	if (gstate_c.Use(GPU_USE_CLIP_DISTANCE)) {
+		if (!VSID.Bit(VS_BIT_IS_THROUGH)) {
+			flags.useClipDistance0 = true;
 			flags.useClipDistance1 = true;
-	} else if (VSID.Bit(VS_BIT_VERTEX_RANGE_CULLING) && gstate_c.Use(GPU_USE_CLIP_DISTANCE)) {
-		flags.useClipDistance0 = true;
+		}
+		if (VSID.Bit(VS_BIT_USE_HW_TRANSFORM)) {
+			flags.useClipDistance2 = true;
+		}
 	}
 
 	program = render->CreateProgram(shaders, semantics, queries, initialize, nullptr, flags);
@@ -452,36 +448,27 @@ void LinkedShader::UpdateUniforms(const ShaderID &vsid, const ShaderLanguageDesc
 		render_->SetUniformF(&u_uvscaleoffset, 4, uvscaleoff);
 	}
 
-	if ((dirty & DIRTY_TEXCLAMP) && u_texclamp != -1) {
-		const float invW = 1.0f / (float)gstate_c.curTextureWidth;
-		const float invH = 1.0f / (float)gstate_c.curTextureHeight;
-		const int w = gstate.getTextureWidth(0);
-		const int h = gstate.getTextureHeight(0);
-		const float widthFactor = (float)w * invW;
-		const float heightFactor = (float)h * invH;
-
-		// First wrap xy, then half texel xy (for clamp.)
-		const float texclamp[4] = {
-			widthFactor,
-			heightFactor,
-			invW * 0.5f,
-			invH * 0.5f,
-		};
-		const float texclampoff[2] = {
-			gstate_c.curTextureXOffset * invW,
-			gstate_c.curTextureYOffset * invH,
-		};
+	// No checks for a location of -1 here: the GL thread fills the locations in when it links the program, which
+	// may be after this runs, and skips the uniforms a program doesn't have itself. Skipping them here dropped the
+	// values for good on drivers that link slowly (PowerVR and Mali sampled Harvest Moon's framebuffer at one
+	// point, with no texture clamp values).
+	if (dirty & DIRTY_TEXCLAMP) {
+		float texclamp[4];
+		float texclampoff[2];
+		CalcTexClamp(texclamp, texclampoff);
 		render_->SetUniformF(&u_texclamp, 4, texclamp);
-		if (u_texclampoff != -1) {
-			render_->SetUniformF(&u_texclampoff, 2, texclampoff);
-		}
+		render_->SetUniformF(&u_texclampoff, 2, texclampoff);
 	}
 
-	if ((dirty & DIRTY_MIPBIAS) && u_mipBias != -1) {
+	if (dirty & DIRTY_MIPBIAS) {
 		float mipBias = (float)gstate.getTexLevelOffset16() * (1.0 / 16.0f);
 		mipBias = (mipBias + 0.5f) / (float)(gstate.getTextureMaxLevel() + 1);
 
 		render_->SetUniformF(&u_mipBias, 1, &mipBias);
+
+		// For GPU_USE_SHADER_LOD_BIAS, like ShaderUniforms.cpp: the sampler applies the bias only in auto mode.
+		float lodBias = gstate.getTexLevelMode() == GE_TEXLEVEL_MODE_AUTO ? (float)gstate.getTexLevelOffset16() * (1.0f / 16.0f) : 0.0f;
+		render_->SetUniformF(&u_texLodBias, 1, &lodBias);
 	}
 
 	// Transform
@@ -540,20 +527,14 @@ void LinkedShader::UpdateUniforms(const ShaderID &vsid, const ShaderLanguageDesc
 	}
 
 	if (dirty & DIRTY_SHADERBLEND) {
-		if (u_blendFixA != -1) {
-			SetColorUniform3(render_, &u_blendFixA, gstate.getFixA());
-		}
-		if (u_blendFixB != -1) {
-			SetColorUniform3(render_, &u_blendFixB, gstate.getFixB());
-		}
+		SetColorUniform3(render_, &u_blendFixA, gstate.getFixA());
+		SetColorUniform3(render_, &u_blendFixB, gstate.getFixB());
 
 		const float fbotexSize[2] = {
 			1.0f / (float)gstate_c.curRTRenderWidth,
 			1.0f / (float)gstate_c.curRTRenderHeight,
 		};
-		if (u_fbotexSize != -1) {
-			render_->SetUniformF(&u_fbotexSize, 2, fbotexSize);
-		}
+		render_->SetUniformF(&u_fbotexSize, 2, fbotexSize);
 	}
 
 	// Lighting
@@ -573,7 +554,7 @@ void LinkedShader::UpdateUniforms(const ShaderID &vsid, const ShaderLanguageDesc
 		SetColorUniform3(render_, &u_matemissive, gstate.materialemissive);
 	}
 	if (dirty & DIRTY_MATSPECULAR) {
-		SetColorUniform3ExtraFloat(render_, &u_matspecular, gstate.materialspecular, getFloat24(gstate.materialspecularcoef));
+		SetColorUniform3ExtraFloat(render_, &u_matspecular, gstate.materialspecular, PSPLightExponent(getFloat24(gstate.materialspecularcoef)));
 	}
 
 	for (int i = 0; i < 4; i++) {
@@ -584,15 +565,13 @@ void LinkedShader::UpdateUniforms(const ShaderID &vsid, const ShaderLanguageDesc
 			} else {
 				SetFloat24Uniform3(render_, &u_lightpos[i], &gstate.lpos[i * 3]);
 			}
-			if (u_lightdir[i] != -1) SetFloat24Uniform3Normalized(render_, &u_lightdir[i], &gstate.ldir[i * 3]);
-			if (u_lightatt[i] != -1) SetFloat24Uniform3(render_, &u_lightatt[i], &gstate.latt[i * 3]);
-			if (u_lightangle_spotCoef[i] != -1) {
-				float lightangle_spotCoef[2] = { getFloat24(gstate.lcutoff[i]), getFloat24(gstate.lconv[i]) };
-				SetFloatUniform2(render_, &u_lightangle_spotCoef[i], lightangle_spotCoef);
-			}
-			if (u_lightambient[i] != -1) SetColorUniform3(render_, &u_lightambient[i], gstate.lcolor[i * 3]);
-			if (u_lightdiffuse[i] != -1) SetColorUniform3(render_, &u_lightdiffuse[i], gstate.lcolor[i * 3 + 1]);
-			if (u_lightspecular[i] != -1) SetColorUniform3(render_, &u_lightspecular[i], gstate.lcolor[i * 3 + 2]);
+			SetFloat24Uniform3Normalized(render_, &u_lightdir[i], &gstate.ldir[i * 3]);
+			SetFloat24Uniform3(render_, &u_lightatt[i], &gstate.latt[i * 3]);
+			float lightangle_spotCoef[2] = { getFloat24(gstate.lcutoff[i]), PSPLightExponent(getFloat24(gstate.lconv[i])) };
+			SetFloatUniform2(render_, &u_lightangle_spotCoef[i], lightangle_spotCoef);
+			SetColorUniform3(render_, &u_lightambient[i], gstate.lcolor[i * 3]);
+			SetColorUniform3(render_, &u_lightdiffuse[i], gstate.lcolor[i * 3 + 1]);
+			SetColorUniform3(render_, &u_lightspecular[i], gstate.lcolor[i * 3 + 2]);
 		}
 	}
 }
@@ -879,7 +858,7 @@ enum class CacheDetectFlags {
 };
 
 #define CACHE_HEADER_MAGIC 0x83277592
-#define CACHE_VERSION 43
+#define CACHE_VERSION 46
 
 struct CacheHeader {
 	uint32_t magic;

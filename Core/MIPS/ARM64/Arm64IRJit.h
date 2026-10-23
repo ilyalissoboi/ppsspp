@@ -47,6 +47,8 @@ public:
 	void UpdateFCR31(MIPSState *mipsState) override;
 
 protected:
+	void GetFixedCodeLabels(std::vector<IRNativeFixedCodeLabel> &labels) const override;
+
 	const CodeBlockCommon &CodeBlock() const override {
 		return *this;
 	}
@@ -108,7 +110,6 @@ private:
 	void CompIR_Transfer(IRInst inst) override;
 	void CompIR_VecArith(IRInst inst) override;
 	void CompIR_VecAssign(IRInst inst) override;
-	void CompIR_VecClamp(IRInst inst) override;
 	void CompIR_VecHoriz(IRInst inst) override;
 	void CompIR_VecLoad(IRInst inst) override;
 	void CompIR_VecPack(IRInst inst) override;
@@ -124,6 +125,9 @@ private:
 		bool signExtendRegOffset = false;
 	};
 	LoadStoreArg PrepareSrc1Address(IRInst inst);
+	// Compiles inst together with the next instruction as one LDP/STP when they access adjacent
+	// words through the same base. The next instruction is then skipped.
+	bool TryCompileLoadStorePair(IRInst inst);
 
 	JitOptions &jo;
 	Arm64IRRegCache regs_;
@@ -143,12 +147,23 @@ private:
 
 	// Indexed by FPCR FZ:RN bits for convenience.  Uses SCRATCH2.
 	const u8 *convertS0ToSCRATCH1_[8];
+	// See GenerateArm64VfpuDotSpecial().
+	const u8 *vfpuDotSpecial_ = nullptr;
+	// See GenerateArm64VfpuDotCall().
+	const u8 *vfpuDot_ = nullptr;
+	// See GenerateArm64VfpuMultiDot(), by the number of terms.
+	const u8 *vfpuMultiDot_[5]{};
 
 	// Note: mutable state used at runtime.
 	const u8 *currentRoundingFunc_ = nullptr;
 
 	int jitStartOffset_ = 0;
 	int compilingBlockNum_ = -1;
+	// The block's instructions while compiling, for looking at the next one.
+	const IRInst *compilingInsts_ = nullptr;
+	int compilingIndex_ = 0;
+	int compilingCount_ = 0;
+	bool skipNextInst_ = false;
 	int logBlocks_ = 0;
 	// Only useful in breakpoints, where it's set immediately prior.
 	uint32_t lastConstPC_ = 0;

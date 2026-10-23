@@ -111,6 +111,13 @@ static void CALLBACK
 callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInformation, DWORD statusInfoLength) {
     InternalResponse* res = (InternalResponse*)context;
 
+    // PPSSPP: once we've reported the request as complete the caller is free to close it, so
+    // don't start any more I/O against it - anything still in flight would be writing into a
+    // response that's being freed.
+    if (res->complete) {
+        return;
+    }
+
     switch (status) {
         case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: {
             // PPSSPP: the sizing call only fills in bufSize when it fails with
@@ -154,7 +161,7 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
 
             if (!WinHttpQueryDataAvailable(request, NULL)) {
                 res->code = naettProtocolError;
-                res->complete = 1;
+                naettSetComplete(res);
             }
         } break;
 
@@ -162,14 +169,14 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
             DWORD* available = (DWORD*)statusInformation;
             res->bytesLeft = *available;
             if (res->bytesLeft == 0) {
-                res->complete = 1;
+                naettSetComplete(res);
                 break;
             }
 
             size_t bytesToRead = min(res->bytesLeft, sizeof(res->buffer));
             if (!WinHttpReadData(request, res->buffer, (DWORD)bytesToRead, NULL)) {
                 res->code = naettReadError;
-                res->complete = 1;
+                naettSetComplete(res);
             }
         } break;
 
@@ -177,9 +184,17 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
             size_t bytesRead = statusInfoLength;
 
             InternalRequest* req = res->request;
+            if (req == NULL) {
+                return;
+            }
             if (req->options.bodyWriter(res->buffer, (int)bytesRead, req->options.bodyWriterData) != bytesRead) {
+                // PPSSPP: the writer failed the request - it couldn't grow, or the caller is
+                // cancelling. Upstream marked it complete and then queued another read anyway,
+                // which both kept the transfer running and left WinHTTP writing into a response
+                // the caller was by then free to close.
                 res->code = naettReadError;
-                res->complete = 1;
+                naettSetComplete(res);
+                break;
             }
             res->totalBytesRead += (int)bytesRead;
             // PPSSPP: bytesLeft is unsigned, so a read longer than announced used to wrap it
@@ -189,12 +204,12 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
                 size_t bytesToRead = min(res->bytesLeft, sizeof(res->buffer));
                 if (!WinHttpReadData(request, res->buffer, (DWORD)bytesToRead, NULL)) {
                     res->code = naettReadError;
-                    res->complete = 1;
+                    naettSetComplete(res);
                 }
             } else {
                 if (!WinHttpQueryDataAvailable(request, NULL)) {
                     res->code = naettProtocolError;
-                    res->complete = 1;
+                    naettSetComplete(res);
                 }
             }
         } break;
@@ -204,11 +219,16 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
             int bytesRead = res->request->options.bodyReader(
                 res->buffer, sizeof(res->buffer), res->request->options.bodyReaderData);
             if (bytesRead) {
-                WinHttpWriteData(request, res->buffer, bytesRead, NULL);
+                // PPSSPP: upstream ignored a failure here, and with no further callback coming,
+                // the request never completed.
+                if (!WinHttpWriteData(request, res->buffer, bytesRead, NULL)) {
+                    res->code = naettWriteError;
+                    naettSetComplete(res);
+                }
             } else {
                 if (!WinHttpReceiveResponse(request, NULL)) {
                     res->code = naettReadError;
-                    res->complete = 1;
+                    naettSetComplete(res);
                 }
             }
         } break;
@@ -232,7 +252,7 @@ callback(HINTERNET request, DWORD_PTR context, DWORD status, LPVOID statusInform
                     res->code = naettGenericError;
             }
 
-            res->complete = 1;
+            naettSetComplete(res);
         } break;
     }
 }
@@ -335,7 +355,7 @@ void naettPlatformMakeRequest(InternalResponse* res) {
 
     if (!WinHttpSendRequest(req->request, extraHeaders, -1, NULL, 0, 0, (DWORD_PTR)res)) {
         res->code = naettConnectionError;
-        res->complete = 1;
+        naettSetComplete(res);
     }
 }
 

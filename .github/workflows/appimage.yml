@@ -42,6 +42,8 @@ jobs:
     container: ghcr.io/pkgforge-dev/archlinux:latest
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
+      # Unlimited, a cache once reached 1.2 GB.
+      CCACHE_MAXSIZE: 500M
       CCACHE_COMPILERCHECK: content
       CCACHE_SLOPPINESS: time_macros
     steps:
@@ -51,7 +53,6 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          submodules: recursive
 
       - name: Check Valid Version Tags
         id: valid-tags
@@ -68,8 +69,17 @@ jobs:
           git remote add upstream https://github.com/hrydgard/ppsspp.git # fetching from official repo as a fallback
           git fetch --deepen=15000 --no-recurse-submodules --tags --force upstream || exit 0
 
+      # Only the FFmpeg libraries this build uses. See the script.
+      - name: Check out submodules
+        shell: bash
+        run: |
+          # The container runs as another user than the one that owns the checkout.
+          git config --global --add safe.directory '*'
+          .github/checkout-submodules.sh /linux/${{ matrix.id }}/
+
+      # Only master saves the cache (see build.yml), so restoring and saving are separate.
       - name: Set up ccache for ${{ matrix.id }}
-        uses: actions/cache@v6.1.0
+        uses: actions/cache/restore@v6.1.0
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ runner.os }}-ccache-${{ matrix.id }}-${{ github.sha }}
@@ -136,6 +146,30 @@ jobs:
             chmod +x ./get-debloated-pkgs.sh
             ./get-debloated-pkgs.sh --add-mesa libxml2-mini opus-mini llvm-libs-nano
 
+      # librashader is dlopen'd at runtime, so it has to be built and shipped inside the AppImage or
+      # slang shaders silently do nothing. The cache key covers the pinned tag, which lives in the script.
+      - name: Cache librashader
+        id: librashader
+        uses: actions/cache@v6.1.0
+        with:
+          path: build-librashader
+          key: librashader-${{ matrix.id }}-${{ hashFiles('scripts/build-librashader.sh') }}
+
+      - name: Install Rust for librashader
+        if: steps.librashader.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # rustup rather than Arch's rust package: that one pulls in the full llvm-libs, which would
+          # undo the llvm-libs-nano debloat above and bloat the mesa libraries sharun bundles.
+          pacman -S --noconfirm rustup
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build librashader
+        if: steps.librashader.outputs.cache-hit != 'true'
+        shell: bash
+        run: scripts/build-librashader.sh
+
       - name: Build Release
         id: version
         env:
@@ -165,10 +199,17 @@ jobs:
           #./b.sh --release --no-sdl2 --no-png
           mkdir -p build
           pushd build
-          cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_SYSTEM_LIBPNG=OFF -DUSE_SYSTEM_FFMPEG=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache .. 
+          cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_SYSTEM_LIBPNG=OFF -DUSE_SYSTEM_FFMPEG=OFF -DLIBRASHADER_PREBUILT="$GITHUB_WORKSPACE/build-librashader/librashader.so" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ..
           make -j$(nproc)
           popd
           ccache -s -v
+
+      - name: Save ccache for ${{ matrix.id }}
+        if: github.ref == 'refs/heads/master'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.os }}-ccache-${{ matrix.id }}-${{ github.sha }}
 
       - name: Create AppImage
         shell: bash

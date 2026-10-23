@@ -494,6 +494,9 @@ void VulkanRenderManager::StopThreads() {
 	for (int i = 0; i < vulkan_->GetInflightFrames(); i++) {
 		auto &frameData = frameData_[i];
 		// Zero the queries so we don't try to pull them later.
+		if (insideFrame_ && i == vulkan_->GetCurFrame()) {
+			continue;
+		}
 		frameData.profile.timestampDescriptions.clear();
 	}
 
@@ -581,6 +584,7 @@ void VulkanRenderManager::CompileThreadFunc() {
 			}
 			toCompile = std::move(compileQueue_);
 			compileQueue_.clear();
+			compileScheduling_ = true;
 			if (!runCompileThread_) {
 				exitAfterCompile = true;
 			}
@@ -624,6 +628,11 @@ void VulkanRenderManager::CompileThreadFunc() {
 
 			Task *task = new CreateMultiPipelinesTask(vulkan_, entries);
 			g_threadManager.EnqueueTask(task);
+		}
+
+		{
+			std::unique_lock<std::mutex> lock(compileQueueMutex_);
+			compileScheduling_ = false;
 		}
 
 		if (exitAfterCompile) {
@@ -676,7 +685,7 @@ void VulkanRenderManager::RenderThreadFunc() {
 void VulkanRenderManager::PresentWaitThreadFunc() {
 	SetCurrentThreadName("PresentWait");
 
-#if !PPSSPP_PLATFORM(IOS_APP_STORE)
+#if !PPSSPP_VK_STATIC
 	_dbg_assert_(vkWaitForPresentKHR != nullptr);
 
 	uint64_t waitedId = frameIdGen_;
@@ -904,6 +913,16 @@ void VulkanRenderManager::ReportBadStateForDraw() {
 }
 
 int VulkanRenderManager::WaitForPipelines() {
+	// Pipelines still in the queue, or taken off it but not yet made into tasks, aren't in flight yet.
+	while (true) {
+		{
+			std::unique_lock<std::mutex> lock(compileQueueMutex_);
+			if (compileQueue_.empty() && !compileScheduling_) {
+				break;
+			}
+		}
+		sleep_ms(2, "pipeline-queue-wait");
+	}
 	return CreateMultiPipelinesTask::WaitForAll();
 }
 
@@ -1211,6 +1230,12 @@ void VulkanRenderManager::BindFramebufferAsRenderTarget(VKRFramebuffer *fb, VKRR
 bool VulkanRenderManager::CopyFramebufferToMemory(VKRFramebuffer *src, VkImageAspectFlags aspectBits, int x, int y, int w, int h, Draw::DataFormat destFormat, uint8_t *pixels, int pixelStride, Draw::ReadbackMode mode, const char *tag) {
 	_dbg_assert_(insideFrame_);
 
+	if (!src && mode == Draw::ReadbackMode::OLD_DATA_OK) {
+		// The backbuffer is a different image every frame, so there's no earlier copy of it to hand back.
+		_dbg_assert_msg_(false, "Delayed readback of the backbuffer (%s)", tag);
+		return false;
+	}
+
 	for (int i = (int)steps_.size() - 1; i >= 0; i--) {
 		if (steps_[i]->stepType == VKRStepType::RENDER && steps_[i]->render.framebuffer == src) {
 			steps_[i]->render.numReads++;
@@ -1272,7 +1297,7 @@ bool VulkanRenderManager::CopyFramebufferToMemory(VKRFramebuffer *src, VkImageAs
 
 	// Need to call this after FlushSync so the pixels are guaranteed to be ready in CPU-accessible VRAM.
 	return queueRunner_.CopyReadbackBuffer(frameData_[vulkan_->GetCurFrame()],
-		mode == Draw::ReadbackMode::OLD_DATA_OK ? src : nullptr, w, h, srcFormat, destFormat, pixelStride, pixels);
+		mode == Draw::ReadbackMode::OLD_DATA_OK ? src : nullptr, x, y, w, h, aspectBits, srcFormat, destFormat, pixelStride, pixels);
 }
 
 void VulkanRenderManager::CopyImageToMemorySync(VkImage image, int mipLevel, int x, int y, int w, int h, Draw::DataFormat destFormat, uint8_t *pixels, int pixelStride, const char *tag) {
@@ -1291,7 +1316,7 @@ void VulkanRenderManager::CopyImageToMemorySync(VkImage image, int mipLevel, int
 	FlushSync();
 
 	// Need to call this after FlushSync so the pixels are guaranteed to be ready in CPU-accessible VRAM.
-	queueRunner_.CopyReadbackBuffer(frameData_[vulkan_->GetCurFrame()], nullptr, w, h, destFormat, destFormat, pixelStride, pixels);
+	queueRunner_.CopyReadbackBuffer(frameData_[vulkan_->GetCurFrame()], nullptr, x, y, w, h, VK_IMAGE_ASPECT_COLOR_BIT, destFormat, destFormat, pixelStride, pixels);
 
 	_dbg_assert_(steps_.empty());
 }
@@ -1563,7 +1588,7 @@ void VulkanRenderManager::RunNativeCallback(VKRFramebuffer *src, VKRFramebuffer 
 	steps_.push_back(step);
 }
 
-VkImageView VulkanRenderManager::BindFramebufferAsTexture(VKRFramebuffer *fb, int binding, VkImageAspectFlags aspectBit, int layer) {
+VkImageView VulkanRenderManager::BindFramebufferAsTexture(VKRFramebuffer *fb, int binding, VkImageAspectFlags aspectBit, int layer, bool samples) {
 	_dbg_assert_(curRenderStep_ != nullptr);
 	_dbg_assert_(fb != nullptr);
 
@@ -1571,6 +1596,13 @@ VkImageView VulkanRenderManager::BindFramebufferAsTexture(VKRFramebuffer *fb, in
 	_dbg_assert_(aspectBit == VK_IMAGE_ASPECT_COLOR_BIT || aspectBit == VK_IMAGE_ASPECT_DEPTH_BIT);
 
 	// Mark the dependency, check for required transitions, and return the image.
+	if (samples && fb->msaaColor.image != VK_NULL_HANDLE) {
+		_dbg_assert_(aspectBit == VK_IMAGE_ASPECT_COLOR_BIT);
+		curRenderStep_->dependencies.insert(fb);
+		TransitionRequest rq{ fb, aspectBit, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, true };
+		curRenderStep_->preTransitions.insert(rq);
+		return layer == -1 ? fb->msaaColor.texAllLayersView : fb->msaaColor.texLayerViews[layer];
+	}
 
 	// Optimization: If possible, use final*Layout to put the texture into the correct layout "early".
 	for (int i = (int)steps_.size() - 1; i >= 0; i--) {
@@ -1684,7 +1716,9 @@ void VulkanRenderManager::Run(VKRRenderThreadTask &task) {
 				// Do the increment.
 				outOfDateFrames_++;
 			} else if (res == VK_SUBOPTIMAL_KHR) {
-				outOfDateFrames_++;
+				if (!vulkan_->SwapchainTransformMismatch()) {
+					outOfDateFrames_++;
+				}
 			} else if (res == VK_ERROR_SURFACE_LOST_KHR) {
 				// _dbg_assert_msg_(false, "vkQueuePresentKHR failed with VK_ERROR_SURFACE_LOST_KHR! result=%s", VulkanResultToString(res));
 				// Can't really do anything about this here, but let's try to continue anyway, maybe the app is in the process of being switched
@@ -1735,14 +1769,15 @@ void VulkanRenderManager::Run(VKRRenderThreadTask &task) {
 	frameData.profile.descWriteTime = time_now_d() - descStart;
 
 	queueRunner_.PreprocessSteps(task.steps);
-	// Likely during shutdown, happens in headless.
-	if (task.steps.empty() && !frameData.hasAcquired)
-		frameData.skipSwap = true;
 	//queueRunner_.LogSteps(stepsOnThread, false);
 	queueRunner_.RunSteps(task.steps, task.frame, frameData, frameDataShared_);
 
 	switch (task.runType) {
 	case VKRRunType::SUBMIT:
+		// A frame that never drew to the backbuffer never acquired an image, so there's nothing to
+		// wait for or present. Headless has such frames, and so does shutdown.
+		if (!frameData.hasAcquired)
+			frameData.skipSwap = true;
 		frameData.Submit(vulkan_, FrameSubmitType::FinishFrame, frameDataShared_);
 		break;
 

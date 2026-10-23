@@ -245,20 +245,28 @@ static MIPSExceptionInfo g_exceptionInfo;
 // This is called on EmuThread before RunLoop.
 static bool Core_ProcessStepping(MIPSDebugInterface *cpu);
 
-static std::function<void(std::string_view)> g_debugOutputListener;
+static std::function<void(DebugOutputChannel, std::string_view)> g_debugOutputListener;
 static std::function<void(const DebugScreenshotDesc &)> g_debugScreenshotListener;
 
-void Core_RegisterDebugOutputListeners(std::function<void(std::string_view)> listener, std::function<void(const DebugScreenshotDesc &)> screenshotListener) {
+void Core_RegisterDebugOutputListeners(std::function<void(DebugOutputChannel, std::string_view)> listener, std::function<void(const DebugScreenshotDesc &)> screenshotListener) {
 	g_debugOutputListener = std::move(listener);
 	g_debugScreenshotListener = std::move(screenshotListener);
 }
 
 void Core_SendDebugOutput(LogLevel level, std::string_view string) {
 	if (g_debugOutputListener) {
-		g_debugOutputListener(string);
+		g_debugOutputListener(DebugOutputChannel::Debug, string);
 	} else {
 		GENERIC_LOG(Log::sceIo, level, "%.*s", STR_VIEW(string));
 	}
+}
+
+bool Core_SendHostOutput(DebugOutputChannel channel, std::string_view string) {
+	if (!g_debugOutputListener) {
+		return false;
+	}
+	g_debugOutputListener(channel, string);
+	return true;
 }
 
 void Core_SendDebugScreenshot(const DebugScreenshotDesc &desc) {
@@ -709,6 +717,7 @@ void Core_Resume() {
 
 	// Handle resuming from GE.
 	if (coreState == CORE_STEPPING_GE) {
+		GPUStepping::ResumeFromStepping();
 		coreState = CORE_RUNNING_GE;
 		Core_WakeIdleCPUThread();
 		return;
@@ -771,6 +780,7 @@ const char *ExceptionTypeAsString(MIPSExceptionType type) {
 	case MIPSExceptionType::BREAK: return "Break";
 	case MIPSExceptionType::BAD_EXEC_ADDR: return "Bad Execution Address";
 	case MIPSExceptionType::FPU: return "FPU Exception";
+	case MIPSExceptionType::HLE: return "HLE Error";
 	default: return "N/A";
 	}
 }
@@ -827,7 +837,7 @@ static std::string ModuleAddressSuffix(u32 address) {
 	}
 }
 
-void Core_MemoryException(u32 address, u32 accessSize, u32 pc, MemoryExceptionType type, std::string_view additionalInfo) {
+void Core_MemoryException(u32 address, u32 accessSize, u32 pc, MemoryExceptionType type, std::string_view additionalInfo, bool halting) {
 	// In jit, we only flush PC when bIgnoreBadMemAccess is off.
 	char pcDetails[128];
 	pcDetails[0] = 0;
@@ -868,14 +878,14 @@ void Core_MemoryException(u32 address, u32 accessSize, u32 pc, MemoryExceptionTy
 	const char *desc = MemoryExceptionTypeAsString(type);
 	char msg[512];
 	snprintf(msg, sizeof(msg), "%s: SIGSEGV at %08x%s (size: %d bytes) %s\nHost:%.*s", desc, address, addressSuffix.c_str(), accessSize, pcDetails, STR_VIEW(additionalInfo));
-	if (action == ExceptionAction::Ignore) {
+	if (action == ExceptionAction::Ignore && !halting) {
 		Core_SendDebugOutput(LogLevel::LWARNING, msg);
 		return;
 	}
 	const std::string stackTrace = FormatStackTrace(WalkCurrentStack(-1));
 	// Do the most detailed logging we can.
 	Core_SendDebugOutput(LogLevel::LERROR, StringFromFormat("%sMIPS call stack:\n%s", msg, stackTrace.c_str()));
-	if (action == ExceptionAction::Break) {
+	if (action == ExceptionAction::Break || halting) {
 		MIPSExceptionInfo &e = g_exceptionInfo;
 		e = {};
 		e.type = MIPSExceptionType::MEMORY;
@@ -1050,6 +1060,20 @@ void Core_BreakException(u32 pc) {
 	if (action == ExceptionAction::Break) {
 		Core_Break(BreakReason::BreakInstruction, currentMIPS->pc);
 	}
+}
+
+void Core_HLEError(std::string_view message) {
+	const std::string stackTrace = FormatStackTrace(WalkCurrentStack(-1));
+	Core_SendDebugOutput(LogLevel::LERROR, StringFromFormat("HLE error: %.*s\n%s", STR_VIEW(message), stackTrace.c_str()));
+
+	MIPSExceptionInfo &e = g_exceptionInfo;
+	e = {};
+	e.type = MIPSExceptionType::HLE;
+	e.info = message;
+	e.stackTrace = stackTrace;
+	e.pc = currentMIPS->pc;
+	e.ra = currentMIPS->r[MIPS_REG_RA];
+	Core_UpdateState(CORE_RUNTIME_ERROR);
 }
 
 // We can't actually deliver the trap to the game's exception handler - nothing in PPSSPP emulates

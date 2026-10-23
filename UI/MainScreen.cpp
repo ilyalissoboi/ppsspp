@@ -21,7 +21,7 @@
 
 #include "ppsspp_config.h"
 
-#include "Common/System/Display.h"
+#include "Common/CPUDetect.h"
 #include "Common/System/System.h"
 #include "Common/UI/Root.h"
 #include "Common/UI/Context.h"
@@ -33,9 +33,6 @@
 #include "Common/StringUtils.h"
 #include "Core/System.h"
 #include "Core/Util/RecentFiles.h"
-#include "Core/Reporting.h"
-#include "Core/HLE/sceCtrl.h"
-#include "Core/ELF/PBPReader.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/Util/GameManager.h"
 
@@ -75,9 +72,10 @@ static void LaunchFile(ScreenManager *screenManager, Screen *currentScreen, cons
 		// Check if we already know that this game isn't playable.
 		// If coming from the main screen, the info will already be computed here since the icon is displayed etc.
 		// Otherwise (launching from a file association, a shortcut, drag-and-drop...) we have to block until
-		// it's available - we can't decide what to do below without it.
+		// it's available - we can't decide what to do below without it. HIGH, so we don't wait behind
+		// whatever else is queued, like a search's loads for every game in a big list.
 		const GameInfoFlags neededFlags = GameInfoFlags::FILE_TYPE | GameInfoFlags::PARAM_SFO;
-		std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(nullptr, path, neededFlags);
+		std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(nullptr, path, neededFlags, nullptr, GameInfoFlags::EMPTY, TaskPriority::HIGH);
 		info->WaitUntilReady(neededFlags);
 
 		switch (info->fileType) {
@@ -179,7 +177,7 @@ void MainScreen::CreateRecentTab() {
 	bool portrait = GetDeviceOrientation() == DeviceOrientation::Portrait;
 
 	GameBrowser *tabRecentGames = new GameBrowser(GetRequesterToken(),
-		Path("!RECENT"), BrowseFlags::NONE, portrait, &g_Config.bGridView1, screenManager(), "", "",
+		Path("!RECENT"), BrowseFlags::NONE, portrait, &g_Config.iGameBrowserView1, screenManager(), "", "",
 		new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
 	tabRecentGames->SetSearchBar(search);
 
@@ -192,7 +190,7 @@ void MainScreen::CreateRecentTab() {
 	tabRecentGames->OnHighlight.Handle(this, &MainScreen::OnGameHighlight);
 }
 
-GameBrowser *MainScreen::CreateBrowserTab(const Path &path, std::string_view title, std::string_view howToTitle, std::string_view howToUri, BrowseFlags browseFlags, bool *bGridView, float *scrollPos) {
+GameBrowser *MainScreen::CreateBrowserTab(const Path &path, std::string_view title, std::string_view howToTitle, std::string_view howToUri, BrowseFlags browseFlags, int *viewMode, float *scrollPos) {
 	using namespace UI;
 	auto mm = GetI18NCategory(I18NCat::MAINMENU);
 
@@ -205,7 +203,7 @@ GameBrowser *MainScreen::CreateBrowserTab(const Path &path, std::string_view tit
 	ScrollView *scrollView = tabContainer->Add(new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 1.0f)));
 	scrollView->SetTag(title);  // Re-use title as tag, should be fine.
 
-	GameBrowser *gameBrowser = new GameBrowser(GetRequesterToken(), path, browseFlags, portrait, bGridView, screenManager(),
+	GameBrowser *gameBrowser = new GameBrowser(GetRequesterToken(), path, browseFlags, portrait, viewMode, screenManager(),
 		mm->T(howToTitle), howToUri,
 		new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
 
@@ -362,6 +360,9 @@ void MainScreen::CreateViews() {
 
 	auto mm = GetI18NCategory(I18NCat::MAINMENU);
 
+	// Thie is the true root, leaves room for persistent notifications.
+	root_ = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
+
 	tabHolder_ = new TabHolder(ORIENT_HORIZONTAL, 64, TabHolderFlags::Default, nullptr, nullptr, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 1.0f));
 	ViewGroup *leftColumn = tabHolder_;
 	tabHolder_->SetTag("MainScreenGames");
@@ -383,12 +384,12 @@ void MainScreen::CreateViews() {
 
 	Button *focusButton = nullptr;
 	if (hasStorageAccess) {
-		CreateBrowserTab(Path(g_Config.currentDirectory), "Games", "How to get games", getGamesUri, BrowseFlags::STANDARD, &g_Config.bGridView2, &g_Config.fGameListScrollPosition);
-		CreateBrowserTab(GetSysDirectory(DIRECTORY_GAME), "Homebrew & Demos", "How to get homebrew & demos", getHomebrewUri, BrowseFlags::HOMEBREW_STORE, &g_Config.bGridView3, &g_Config.fHomebrewScrollPosition);
+		CreateBrowserTab(Path(g_Config.currentDirectory), "Games", "How to get games", getGamesUri, BrowseFlags::STANDARD, &g_Config.iGameBrowserView2, &g_Config.fGameListScrollPosition);
+		CreateBrowserTab(GetSysDirectory(DIRECTORY_GAME), "Homebrew & Demos", "How to get homebrew & demos", getHomebrewUri, BrowseFlags::HOMEBREW_STORE, &g_Config.iGameBrowserView3, &g_Config.fHomebrewScrollPosition);
 
 		if (g_Config.bRemoteTab && !g_Config.sLastRemoteISOServer.empty()) {
 			Path remotePath(FormatRemoteISOUrl(g_Config.sLastRemoteISOServer.c_str(), g_Config.iLastRemoteISOPort, RemoteSubdir().c_str()));
-			GameBrowser *remoteBrowser = CreateBrowserTab(remotePath, "Remote disc streaming", "Remote disc streaming", remoteGamesUri, BrowseFlags::NAVIGATE, &g_Config.bGridView4, &g_Config.fRemoteScrollPosition);
+			GameBrowser *remoteBrowser = CreateBrowserTab(remotePath, "Remote disc streaming", "Remote disc streaming", remoteGamesUri, BrowseFlags::NAVIGATE, &g_Config.iGameBrowserView4, &g_Config.fRemoteScrollPosition);
 			remoteBrowser->SetHomePath(remotePath);
 		}
 
@@ -454,13 +455,13 @@ void MainScreen::CreateViews() {
 		CreateMainButtons(buttonGroup, vertical);
 		header->Add(buttonGroup);
 
-		LinearLayout *rootLayout = new LinearLayout(ORIENT_VERTICAL);
+		LinearLayout *rootLayout = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(1.0f));
 		rootLayout->SetSpacing(0.0f);
 
 		leftColumn->ReplaceLayoutParams(new LinearLayoutParams(1.0f));
 		rootLayout->Add(header);
 		rootLayout->Add(leftColumn);
-		root_ = rootLayout;
+		root_->Add(rootLayout);
 
 		// no space for a fullscreen button!
 	} else {
@@ -489,9 +490,10 @@ void MainScreen::CreateViews() {
 
 		rightColumn->Add(rightColumnItems);
 
-		root_ = new LinearLayout(ORIENT_HORIZONTAL);
-		root_->Add(leftColumn);
-		root_->Add(rightColumn);
+		LinearLayout *columns = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(1.0f));
+		columns->Add(leftColumn);
+		columns->Add(rightColumn);
+		root_->Add(columns);
 	}
 
 	if (focusButton) {
@@ -502,40 +504,56 @@ void MainScreen::CreateViews() {
 
 	root_->SetTag("mainroot");
 
-	if (!g_Config.sUpgradeMessage.empty()) {
-		auto di = GetI18NCategory(I18NCat::DIALOG);
+	const UI::Drawable dismissableBackground = screenManager()->getUIContext()->GetTheme().itemDownStyle.background;
+
+	auto CreateDismissableBar = [this, vertical, dismissableBackground](std::string_view message, std::string_view action, std::function<void()> onDismiss) {
 		Margins margins(0, 0);
-		if (vertical) {
-			margins.bottom = ITEM_HEIGHT;
-		}
-		UI::LinearLayout *upgradeBar = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, margins));
+		UI::LinearLayout *bar = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, margins));
 
 		UI::Margins textMargins(10, 5);
 		UI::Margins buttonMargins(5, 0);
-		UI::Drawable solid(0xFFbd9939);
-		upgradeBar->SetSpacing(5.0f);
-		upgradeBar->SetBG(solid);
-		std::string upgradeMessage(di->T("New version of PPSSPP available"));
-		if (!vertical) {
-			// The version only really fits in the horizontal layout.
-			upgradeMessage += ": " + g_Config.sUpgradeVersion;
+		UI::Drawable solid(dismissableBackground);
+		bar->SetSpacing(5.0f);
+		bar->SetBG(solid);
+
+		bar->Add(new TextView(message, FLAG_WRAP_TEXT, false, new LinearLayoutParams(1.0f, UI::Gravity::G_VCENTER, textMargins)));
+		if (!action.empty()) {
+			bar->Add(new Choice(action, new LinearLayoutParams(0.0f, UI::Gravity::G_VCENTER, buttonMargins)))->OnClick.Handle(this, &MainScreen::OnDownloadUpgrade);
 		}
-		upgradeBar->Add(new TextView(upgradeMessage, new LinearLayoutParams(1.0f, UI::Gravity::G_VCENTER, textMargins)));
-		upgradeBar->Add(new Choice(di->T("Download"), new LinearLayoutParams(buttonMargins)))->OnClick.Handle(this, &MainScreen::OnDownloadUpgrade);
-		Choice *dismiss = upgradeBar->Add(new Choice("", ImageID("I_CROSS"), new LinearLayoutParams(buttonMargins)));
-		dismiss->OnClick.Add([this](UI::EventParams &e) {
-			g_Config.DismissUpgrade();
-			g_Config.Save("dismissupgrade");
+
+		Choice *dismiss = bar->Add(new Choice("", ImageID("I_CROSS"), new LinearLayoutParams(0.0f, UI::Gravity::G_VCENTER, buttonMargins)));
+		dismiss->OnClick.Add([this, onDismiss](UI::EventParams &e) {
+			onDismiss();
 			RecreateViews();
 		});
+		return bar;
+	};
 
-		// Slip in under root_
-		LinearLayout *newRoot = new LinearLayout(ORIENT_VERTICAL);
-		newRoot->Add(root_);
-		newRoot->Add(upgradeBar);
-		root_->ReplaceLayoutParams(new LinearLayoutParams(1.0));
-		root_ = newRoot;
+	if (!g_Config.sUpgradeMessage.empty()) {
+		auto di = GetI18NCategory(I18NCat::DIALOG);
+		std::string upgradeMessage(di->T("New version of PPSSPP available"));
+		// The version only really fits in the horizontal layout.
+		upgradeMessage += ": " + g_Config.sUpgradeVersion;
+		UI::LinearLayout *upgradeBar = CreateDismissableBar(upgradeMessage, di->T("Download"), [this]() {
+			g_Config.DismissUpgrade();
+			g_Config.Save("dismissupgrade");
+		});
+
+		// Slip in at the top.
+		root_->Insert(0, upgradeBar);
 	}
+
+#if PPSSPP_PLATFORM(WINDOWS) && PPSSPP_ARCH(X86)
+	if (cpu_info.OS64bit && !g_Config.bWow64WarningDismissed) {
+		auto di = GetI18NCategory(I18NCat::DIALOG);
+		std::string_view message = di->T("You're running the 32-bit version. Use PPSSPPWindows64.exe instead for best performance.");
+		UI::LinearLayout *upgradeBar = CreateDismissableBar(message, "", [this]() {
+			g_Config.bWow64WarningDismissed = true;
+			g_Config.Save("dismisswow64");
+		});
+		root_->Insert(0, upgradeBar);
+	}
+#endif
 }
 
 bool MainScreen::key(const KeyInput &key) {
@@ -779,7 +797,14 @@ void MainScreen::dialogFinished(const Screen *dialog, DialogResult result) {
 		backFromStore_ = true;
 		RecreateViews();
 	} else if (tag == "Game") {
-		if (!restoreFocusGamePath_.empty() && UI::IsFocusMovementEnabled()) {
+		if (static_cast<const GameScreen *>(dialog)->GameRemoved()) {
+			// Deleted or removed from recents. The recents tab recreates itself on RECENT_FILES_CHANGED.
+			restoreFocusGamePath_.clear();
+			g_BackgroundAudio.SetGame(Path());
+			for (auto browser : gameBrowsers_) {
+				browser->RequestRefresh();
+			}
+		} else if (!restoreFocusGamePath_.empty() && UI::IsFocusMovementEnabled()) {
 			// Prevent the background from fading, since we just were displaying it.
 			InstantHighlight(restoreFocusGamePath_);
 
@@ -835,7 +860,7 @@ void UmdReplaceScreen::CreateViews() {
 		ScrollView *scrollRecentGames = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
 		scrollRecentGames->SetTag("UmdReplaceRecentGames");
 		GameBrowser *tabRecentGames = new GameBrowser(GetRequesterToken(),
-			Path("!RECENT"), BrowseFlags::NONE, portrait, &g_Config.bGridView1, screenManager(), "", "",
+			Path("!RECENT"), BrowseFlags::NONE, portrait, &g_Config.iGameBrowserView1, screenManager(), "", "",
 			new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
 		scrollRecentGames->Add(tabRecentGames);
 		leftColumn->AddTab(mm->T("Recent"), ImageID::invalid(), scrollRecentGames);
@@ -845,7 +870,7 @@ void UmdReplaceScreen::CreateViews() {
 	ScrollView *scrollAllGames = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
 	scrollAllGames->SetTag("UmdReplaceAllGames");
 
-	GameBrowser *tabAllGames = new GameBrowser(GetRequesterToken(), Path(g_Config.currentDirectory), BrowseFlags::STANDARD, portrait, &g_Config.bGridView2, screenManager(),
+	GameBrowser *tabAllGames = new GameBrowser(GetRequesterToken(), Path(g_Config.currentDirectory), BrowseFlags::STANDARD, portrait, &g_Config.iGameBrowserView2, screenManager(),
 		mm->T("How to get games"), "https://www.ppsspp.org/getgames.html",
 		new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
 
@@ -907,13 +932,15 @@ void GridSettingsPopupScreen::CreatePopupContents(UI::ViewGroup *parent) {
 	LinearLayout *items = new LinearLayoutList(ORIENT_VERTICAL);
 	items->SetSpacing(0.0f);
 
-	items->Add(new CheckBox(&g_Config.bGridView1, sy->T("Display Recent on a grid")));
-	items->Add(new CheckBox(&g_Config.bGridView2, sy->T("Display Games on a grid")));
-	items->Add(new CheckBox(&g_Config.bGridView3, sy->T("Display Homebrew on a grid")));
+	// Same order as GameBrowserViewMode.
+	static const char *viewModes[] = { "Grid", "List", "Large list" };
+	items->Add(new PopupMultiChoice(&g_Config.iGameBrowserView1, mm->T("Recent"), viewModes, 0, ARRAY_SIZE(viewModes), I18NCat::SYSTEM, screenManager()));
+	items->Add(new PopupMultiChoice(&g_Config.iGameBrowserView2, mm->T("Games"), viewModes, 0, ARRAY_SIZE(viewModes), I18NCat::SYSTEM, screenManager()));
+	items->Add(new PopupMultiChoice(&g_Config.iGameBrowserView3, mm->T("Homebrew & Demos"), viewModes, 0, ARRAY_SIZE(viewModes), I18NCat::SYSTEM, screenManager()));
 	static const char *defaultTabs[] = { "Recent", "Games", "Homebrew & Demos" };
 	PopupMultiChoice *beziersChoice = items->Add(new PopupMultiChoice(&g_Config.iDefaultTab, sy->T("Default tab"), defaultTabs, 0, ARRAY_SIZE(defaultTabs), I18NCat::MAINMENU, screenManager()));
 
-	items->Add(new ItemHeader(sy->T("Grid icon size")));
+	items->Add(new ItemHeader(sy->T("Icon size")));
 	items->Add(new Choice(sy->T("Increase size")))->OnClick.Handle(this, &GridSettingsPopupScreen::GridPlusClick);
 	items->Add(new Choice(sy->T("Decrease size")))->OnClick.Handle(this, &GridSettingsPopupScreen::GridMinusClick);
 

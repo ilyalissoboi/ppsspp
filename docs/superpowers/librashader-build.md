@@ -12,6 +12,19 @@ PPSSPP can optionally use [librashader](https://github.com/SnowflakePowered/libr
 
 librashader requires Rust stable ≥ 1.88.
 
+The per-platform commands below are what the build scripts run; use the scripts unless you need to
+vary something. They clone the pinned tag, build with the right features, fix up the install
+name/soname, and verify the exports:
+
+| Platform | Script | Output |
+|---|---|---|
+| macOS, Linux | `scripts/build-librashader.sh [OUTDIR]` | `build-librashader/librashader.{dylib,so}` |
+| Windows | `scripts/build-librashader.ps1 [-Platform x64\|ARM64] [-Out DIR]` | `build-librashader\librashader.dll` |
+| Android | `android/build-librashader.sh [ABI ...]` | `android/src/main/jniLibs/<abi>/librashader.so` |
+
+All three take `LIBRASHADER_TAG` / `LIBRASHADER_SRC` from the environment; the pinned tag is
+duplicated in each script, so bump them together.
+
 ### macOS (verified on arm64)
 
 ```bash
@@ -211,6 +224,27 @@ When set, the library will be copied to:
 - **Other platforms:** Same directory as the executable
 
 This step only runs if `USE_LIBRASHADER=ON` (the default on desktop platforms) and the `LIBRASHADER_PREBUILT` variable is non-empty.
+
+### Desktop CI Integration
+
+The release workflows build librashader themselves and ship it inside every desktop artifact - without
+it the binaries load and run but present the unfiltered image, which looks exactly like a broken
+shader rather than a missing library:
+
+| Workflow | Job | How the library gets in |
+|---|---|---|
+| `build.yml` | `build-windows` (x64, ARM64) | `scripts/build-librashader.ps1 -Platform <plat>`, then `librashader.dll` is copied into `ppsspp/` in "Package build", so it lands in both the artifact and the release zip |
+| `build.yml` | `build` / `macos` | `scripts/build-librashader.sh`, then `-DLIBRASHADER_PREBUILT=` is appended to `$CMAKE_ARGS` (which `b.sh` forwards to cmake) so the copy step above puts it in `PPSSPPSDL.app/Contents/MacOS/` before the bundle is zipped |
+| `appimage.yml` | `build` (x86_64, aarch64) | `scripts/build-librashader.sh` plus the same `-DLIBRASHADER_PREBUILT=`; `scripts/makeappimage_64-bit.sh` then copies it into `AppDir/bin` next to the binary, because sharun deploys ldd dependencies only and cannot see a dlopen |
+| `manual_generate_apk.yml` | `apk` | `android/build-librashader.sh`, packaged by Gradle from `jniLibs/` (see [Android](#android) below) |
+
+Each job caches `build-librashader/` on a key that hashes its build script, so the cargo build only
+re-runs when the script - which holds the pinned tag - changes. Windows ARM64 is cross-compiled from
+the x64 runner (`x64_arm64` vcvars, `aarch64-pc-windows-msvc`); the AppImage container installs rustup
+rather than Arch's `rust` package, which would pull the full `llvm-libs` back in and undo the
+`llvm-libs-nano` debloat that keeps the bundled mesa small.
+
+iOS, UWP and the libretro core have `USE_LIBRASHADER` off and get no library, by design.
 
 ## Enabling at Runtime
 

@@ -33,10 +33,12 @@
 
 #include <clocale>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 
 #include "ext/imgui/imgui.h"
@@ -61,6 +63,7 @@
 #include "Common/Render/Text/draw_text.h"
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/GPU/thin3d.h"
+#include "Common/GPU/Vulkan/FixedSPIRVCache.h"
 #include "Common/UI/UI.h"
 #include "Common/UI/Screen.h"
 #include "Common/UI/ScreenManager.h"
@@ -184,9 +187,9 @@ void SaveFrameDump();
 ScreenManager *g_screenManager;
 std::string config_filename;
 
-// Really need to clean this mess of globals up... but instead I add more :P
-bool g_TakeScreenshot;
-static bool resized = false;
+// Set from any thread (on Android, the Java UI thread right after it writes g_display). Atomic, so the frame
+// that consumes it also sees those writes - with a plain bool it could see the flag first and keep stale bounds.
+static std::atomic<bool> resized{false};
 
 static int renderCounter = 0;
 
@@ -214,7 +217,7 @@ static std::vector<QueuedEvent> g_inputEventQueue;
 static std::unique_ptr<ImDebugger> imDebugger_;
 static ImCommand imCmd_{};  // needed to buffer commands in case imgui wasn't created yet.
 static bool imguiInited_ = false;
-static bool lastImguiEnabled_ = false;
+static bool imguiWantTextInput_ = false;
 static ImGuiContext *ctx_ = nullptr;
 
 class GlobalListener : public ControlListener {
@@ -299,20 +302,7 @@ static void RunAchievementsOverrideUpdate(std::function<void()> func) {
 }
 
 void runImDebugger(Draw::DrawContext *draw) {
-	bool lastImguiEnabled_ = false;  // temp
-	if (lastImguiEnabled_ && g_Config.bShowImDebugger) {
-#if !defined(MOBILE_DEVICE)
-		// On mobile devices (specifically iOS) we don't want to pop the keyboard
-		// on activating imgui. Instead, we should do it when a text edit field in imgui gets focus,
-		// although we'll still have ugly overlap problems.
-		System_NotifyUIEvent(UIEventNotification::TEXT_GOTFOCUS);
-#endif
-		VERBOSE_LOG(Log::System, "activating keyboard");
-	} else if (lastImguiEnabled_ && !g_Config.bShowImDebugger) {
-		System_NotifyUIEvent(UIEventNotification::TEXT_LOSTFOCUS);
-		VERBOSE_LOG(Log::System, "deactivating keyboard");
-	}
-	lastImguiEnabled_ = g_Config.bShowImDebugger;
+	bool wantTextInput = false;
 	if (g_Config.bShowImDebugger) {
 		if (!imguiInited_) {
 			// TODO: Do this only on demand.
@@ -385,10 +375,20 @@ void runImDebugger(Draw::DrawContext *draw) {
 
 		// Convert to drawlists.
 		ImGui::Render();
+		wantTextInput = io.WantTextInput;
 	} else {
 		uiContext->SetOverrideScreenFrame(nullptr);
 		SetOverrideScreenFrame(nullptr);
 	}
+
+	// Enable text input (needed for KeyInputFlags::CHAR events) only while an imgui text field is active.
+	// On mobile devices (specifically iOS) this would pop the keyboard, with ugly overlap problems.
+#if !defined(MOBILE_DEVICE)
+	if (wantTextInput != imguiWantTextInput_) {
+		System_SetTextInputWanted(TextInputUser::ImDebugger, wantTextInput);
+		imguiWantTextInput_ = wantTextInput;
+	}
+#endif
 }
 
 void renderImDebugger(Draw::DrawContext *draw) {
@@ -799,6 +799,16 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 
 	g_DownloadManager.SetCacheDir(GetSysDirectory(DIRECTORY_APP_CACHE));
 
+#if !PPSSPP_PLATFORM(UWP)
+	// The SPIR-V of thin3d's shaders and other fixed ones. Only read on first use, so only by Vulkan.
+	if (g_Config.bShaderCache) {
+		File::CreateFullPath(GetSysDirectory(DIRECTORY_APP_CACHE));
+		// About twice what a session compiles (menu and a game: 10, a few more with post-processing
+		// or texture upscaling), so it's flushed once outdated entries have piled up.
+		SetFixedSPIRVCachePath(GetSysDirectory(DIRECTORY_APP_CACHE) / "vulkan_spirv.cache", 32);
+	}
+#endif
+
 	ApplyAchievementsHostOverride();
 
 	g_screenManager = new ScreenManager();
@@ -877,15 +887,12 @@ bool CreateGlobalPipelines();
 
 // TODO: Add faster special case for channels == 2.
 static void NativeMixWrapper(float *dest, int framesToWrite, int sampleRateHz, void *userdata) {
-	static int16_t *buffer;
-	static int bufSize;
-	if (bufSize < framesToWrite * 2) {
-		// This one leaks on exit. Oh well.
-		buffer = new int16_t[framesToWrite * 2];
-		bufSize = framesToWrite * 2;
+	static std::vector<int16_t> buffer;
+	if ((int)buffer.size() < framesToWrite * 2) {
+		buffer.resize(framesToWrite * 2);
 	}
 
-	NativeMix(buffer, framesToWrite, sampleRateHz, userdata);
+	NativeMix(buffer.data(), framesToWrite, sampleRateHz, userdata);
 
 	for (int i = 0; i < framesToWrite * 2; i++) {
 		dest[i] = (float)buffer[i] * (float)(1.0f / 32767.0f);
@@ -943,7 +950,6 @@ bool NativeInitGraphics(GraphicsContext *graphicsContext) {
 #if defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
 	if (IsWin7OrHigher()) {
 		winCamera = new WindowsCaptureDevice(CAPTUREDEVICE_TYPE::VIDEO);
-		winMic = new WindowsCaptureDevice(CAPTUREDEVICE_TYPE::AUDIO);
 	}
 #endif
 
@@ -973,6 +979,10 @@ bool NativeInitGraphics(GraphicsContext *graphicsContext) {
 		ImGui_ImplThin3d_CreateDeviceObjects(g_draw);
 	}
 
+#if !PPSSPP_PLATFORM(UWP)
+	// Now, rather than only at shutdown: on mobile the app can be killed without one.
+	SaveFixedSPIRVCache();
+#endif
 
 	INFO_LOG(Log::System, "NativeInitGraphics completed");
 
@@ -1034,6 +1044,10 @@ bool CreateGlobalPipelines() {
 void NativeShutdownGraphics(GraphicsContext *graphicsContext) {
 	INFO_LOG(Log::System, "NativeShutdownGraphics begin");
 
+#if !PPSSPP_PLATFORM(UWP)
+	SaveFixedSPIRVCache();
+#endif
+
 	graphicsContext->NotifyEmuThreadExit();
 
 	if (g_screenManager) {
@@ -1065,11 +1079,6 @@ void NativeShutdownGraphics(GraphicsContext *graphicsContext) {
 		winCamera->waitShutDown();
 		delete winCamera;
 		winCamera = nullptr;
-	}
-	if (winMic) {
-		winMic->waitShutDown();
-		delete winMic;
-		winMic = nullptr;
 	}
 #endif
 
@@ -1172,6 +1181,28 @@ void NativeFrame(GraphicsContext *graphicsContext) {
 
 	if (g_audioBackend) {
 		g_audioBackend->FrameUpdate(g_Config.bAutoSwitchAudioDevice);
+	}
+
+	// Resize before drawing anything, so the first frame at a new size isn't drawn into the old backbuffer.
+	const bool resizedThisFrame = resized.exchange(false);
+	if (resizedThisFrame) {
+		INFO_LOG(Log::G3D, "Resized flag set - recalculating bounds (%dx%d dp)", g_display.dp_xres, g_display.dp_yres);
+
+		if (uiContext) {
+			uiContext->SetBounds(Bounds(0, 0, g_display.dp_xres, g_display.dp_yres));
+		}
+
+		graphicsContext->Resize();
+		g_screenManager->resized();
+
+		// TODO: Move this to the GraphicsContext objects for each backend.
+		// (Android used to be left out here, since every size change there was a full graphics restart,
+		// and DeviceRestore covers it. Rotation and window resizing are in-place now.)
+#if !PPSSPP_PLATFORM(WINDOWS)
+		PSP_CoreParameter().pixelWidth = g_display.pixel_xres;
+		PSP_CoreParameter().pixelHeight = g_display.pixel_yres;
+		System_PostUIMessage(UIMessage::GPU_DISPLAY_RESIZED);
+#endif
 	}
 
 	// NOTE: We must begin the frame before update, so we can do texture size queries and stuff in Measure etc.
@@ -1332,33 +1363,8 @@ void NativeFrame(GraphicsContext *graphicsContext) {
 
 	g_draw->Present(g_frameTiming.PresentMode());
 
-	if (resized) {
-		INFO_LOG(Log::G3D, "Resized flag set - recalculating bounds");
-		resized = false;
-
-		if (uiContext) {
-			uiContext->SetBounds(Bounds(0, 0, g_display.dp_xres, g_display.dp_yres));
-
-			// OSX 10.6 and SDL 1.2 bug.
-#if defined(__APPLE__)
-			static int dp_xres_old = g_display.dp_xres;
-			if (g_display.dp_xres != dp_xres_old) {
-				dp_xres_old = g_display.dp_xres;
-			}
-#endif
-		}
-
-		graphicsContext->Resize();
-		g_screenManager->resized();
-
-		// TODO: Move this to the GraphicsContext objects for each backend.
-#if !PPSSPP_PLATFORM(WINDOWS) && !defined(ANDROID)
-		PSP_CoreParameter().pixelWidth = g_display.pixel_xres;
-		PSP_CoreParameter().pixelHeight = g_display.pixel_yres;
-		System_PostUIMessage(UIMessage::GPU_DISPLAY_RESIZED);
-#endif
-	} else {
-		// INFO_LOG(Log::G3D, "Polling graphics context");
+	// Not done if we resized at the start of the frame, the swapchain is new.
+	if (!resizedThisFrame) {
 		graphicsContext->Poll();
 	}
 
@@ -1461,19 +1467,13 @@ bool HandleGlobalMessage(UIMessage message, const std::string &value) {
 }
 
 bool NativeIsAtTopLevel() {
-	// This might need some synchronization?
+	// Called from the Android UI thread, while screens may be getting deleted on the render thread,
+	// so this reads a flag cached by ScreenManager::Update() instead of the screen stack.
 	if (!g_screenManager) {
 		ERROR_LOG(Log::System, "No screen manager active");
 		return false;
 	}
-	Screen *currentScreen = g_screenManager->topScreen();
-	if (currentScreen) {
-		bool top = currentScreen->isTopLevel();
-		return currentScreen->isTopLevel();
-	} else {
-		ERROR_LOG(Log::System, "No current screen");
-		return false;
-	}
+	return g_screenManager->IsTopScreenTopLevel();
 }
 
 void NativeTouch(const TouchInput &touch) {
@@ -1586,9 +1586,11 @@ bool NativeKey(const KeyInput &key) {
 	// Filtering, detailed rules needed for good imgui behavior without having to ask the screen about what to do.
 	InputMode inputMode = g_screenManager->PassInputToMapper();
 
+	bool imguiHasKeyboard = false;
 	if (g_Config.bShowImDebugger && imguiInited_) {
 		if (ImGui::GetIO().WantCaptureKeyboard) {
 			inputMode &= ~InputMode::Keyboard;
+			imguiHasKeyboard = true;
 		}
 		if (ImGui::GetIO().WantCaptureMouse) {
 			inputMode &= ~InputMode::Mouse;
@@ -1596,21 +1598,21 @@ bool NativeKey(const KeyInput &key) {
 	}
 
 	bool passKeyThrough = false;
-	if (inputMode != InputMode::None) {
-		if ((inputMode & InputMode::ImDebuggerToggle) && (key.flags & (KeyInputFlags::UP | KeyInputFlags::DOWN))) {
-			InputMapping mapping(key.deviceId, key.keyCode);
-			std::vector<int> pspButtons;
-			bool mappingFound = KeyMap::InputMappingToPspButton(mapping, &pspButtons);
-			if (mappingFound) {
-				for (auto b : pspButtons) {
-					if (b == VIRTKEY_TOGGLE_DEBUGGER || b == VIRTKEY_PAUSE) {
-						// TRUE
-						passKeyThrough = true;
-					}
+	// The debugger toggle also goes through while imgui has the keyboard, so it can always be closed again.
+	if (((inputMode & InputMode::ImDebuggerToggle) || imguiHasKeyboard) && (key.flags & (KeyInputFlags::UP | KeyInputFlags::DOWN))) {
+		InputMapping mapping(key.deviceId, key.keyCode);
+		std::vector<int> pspButtons;
+		bool mappingFound = KeyMap::InputMappingToPspButton(mapping, &pspButtons);
+		if (mappingFound) {
+			for (auto b : pspButtons) {
+				if (b == VIRTKEY_TOGGLE_DEBUGGER || (b == VIRTKEY_PAUSE && (inputMode & InputMode::ImDebuggerToggle))) {
+					passKeyThrough = true;
 				}
 			}
 		}
+	}
 
+	if (inputMode != InputMode::None) {
 		if (key.deviceId == DEVICE_ID_MOUSE) {
 			if (inputMode & InputMode::Mouse) {
 				passKeyThrough = true;
@@ -1860,7 +1862,7 @@ void NativeShutdown() {
 
 	g_controlMapper.RemoveListener(&g_globalListener);
 
-	Achievements::Shutdown();
+	Achievements::Shutdown(false);  // CancelAll below drops the pending requests.
 
 	// Gives queued uploads a few seconds.
 	SaveSync::Shutdown();
@@ -1888,6 +1890,9 @@ void NativeShutdown() {
 	ShutdownWebServer();
 
 	__UPnPShutdown();
+
+	// A request finishing while globals are destroyed at exit touches g_OSD, which may be gone by then.
+	g_DownloadManager.CancelAll();
 
 	net::Shutdown();
 

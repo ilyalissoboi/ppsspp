@@ -12,22 +12,36 @@ for it:
 | Doc | When you need it |
 |---|---|
 | [docs/building.md](docs/building.md) | Build commands for every target (VS/MSBuild, CMake, UWP, legacy Android NDK, libretro), unit tests, pspautotests |
-| [docs/debugging.md](docs/debugging.md) | Driving the WebSocket debugger and PPSSPPHeadless from a script, breakpoint reliability per CPU backend, debugging a game that works on hardware |
+| [docs/android-device-testing.md](docs/android-device-testing.md) | Running a build on a real Android device or a Quest over adb: installing the build you think you are, forcing activity recreates, measuring retained activities, VR |
+| [docs/debugging.md](docs/debugging.md) | Driving the WebSocket debugger and PPSSPPHeadless from a script, measuring a commercial game with headless, comparing binaries' speed (`Tools/headless_bench.py`), finding a game's hot JIT blocks (`--jit-profile`), breakpoint reliability per CPU backend, debugging a game that works on hardware, finding and hashing a game function (like its own `memcpy`) for `ReplaceTables` when hardware backends miss CPU writes to VRAM |
 | [docs/DebuggerThreading.md](docs/DebuggerThreading.md) | `Core_RunOnCPUThread` / `g_frameMutex` / shutdown-lock rules - required reading before touching debugger code |
 | [docs/HLEModules.md](docs/HLEModules.md) | Adding an HLE module or function, and the seven build files a new source file goes in |
 | [docs/translations.md](docs/translations.md) | Translating UI strings with Tools/langtool |
 | [docs/pspautotests.md](docs/pspautotests.md) | Workflow for improving PPSSPP using pspautotests |
 | [docs/pspautotests-hardware.md](docs/pspautotests-hardware.md) | Writing a new pspautotest, and running it on a real PSP over PSPLink to record its `.expected` |
-| [docs/frametest.md](docs/frametest.md) | Framedump rendering tests |
+| [docs/frametest.md](docs/frametest.md) | Framedump rendering tests, and replaying a dump on a real PSP |
+| [docs/sceGe.md](docs/sceGe.md) | How the firmware queues display lists, what SIGNAL and FINISH interrupts do and in which order, and how `ProcessDLQueue()` keeps that order |
 | [docs/sceAudio.md](docs/sceAudio.md) | How the audio output calls block, how deep they buffer, and what each error means |
 | [docs/WebSocketDebugger.md](docs/WebSocketDebugger.md) | WebSocket debugger protocol reference |
 | [docs/reverse-engineering.md](docs/reverse-engineering.md) | Disassembling a firmware PRX with `--re-module`, to find out what the hardware actually does |
+| [docs/command-line.md](docs/command-line.md) | Adding a command-line option - the `g_autoParams` table, per-mode options, `ApplyToConfig()` |
+| [docs/patching-files.md](docs/patching-files.md) | Editing files from a script without wrecking the diff: line endings, and heredoc backslash escaping |
+| [docs/VSHBootInvestigation.md](docs/VSHBootInvestigation.md) | Booting the PSP's Visual Shell with `--vsh` against a real firmware dump |
+| [docs/PsarFileFormat.md](docs/PsarFileFormat.md) | The PSAR archive inside a firmware updater - the format `Core/Util/PSARUnpack.cpp` walks |
+| [docs/pkg_notes.md](docs/pkg_notes.md) | The NPDRM `.pkg` format PSP game updates ship in, and how PPSSPP installs them |
+| [docs/cpu-equivalence.md](docs/cpu-equivalence.md) | Making the CPU cores agree bit for bit on every host: the `CPUEquivalence` fuzzer, what it found, and the differences still open (several waiting on a hardware test) |
+| [docs/dnas-patches.md](docs/dnas-patches.md) | Game patches installed on a real PSP (Killzone: Liberation's DLC): installing one over PSPLink, and the Fuse-ID-keyed PGD and type 3 PRX that `sceKernelLoadModuleDNAS` decrypts |
+| [docs/kernel-hle-review.md](docs/kernel-hle-review.md) | Findings from a review pass over `Core/HLE/sceKernel*.cpp`, and what was verified clean |
+| [docs/metal-backend.md](docs/metal-backend.md) | What a native Metal backend would take, and why programmable blending is the reason to want one |
 
 ## General instructions
 
 1. Keep style changes minimal unless requested. Follow existing code patterns and conventions.
 2. Keep cross-platform parity in mind when changing shared code. See below for more multiplatform tips
-3. Never `git push` (to any remote) without asking the user first. Committing locally is fine when asked; pushing requires explicit approval.
+3. **Commit freely, push only when asked.** Once a change is done and tested, commit it on its
+   branch without waiting to be told. Never `git push` (to any remote) without the user's explicit
+   approval. The exception is a useful new or re-recorded test in `pspautotests`, which goes
+   straight to its `master` without asking (see [docs/pspautotests-hardware.md](docs/pspautotests-hardware.md#committing)).
 4. **Don't write code on `master`.** When asked to make a code change while on `master`, create an
    appropriately named branch first (`git checkout -b some-descriptive-name`) and do the work there.
    If you're already on a topic branch, just keep working on it.
@@ -41,28 +55,31 @@ for it:
    `newline=''` silently converts the whole file, turning a two-line addition into a 5000-line diff.
    Check `git diff --stat` before committing - a whole-file rewrite is obvious there and invisible in
    the editor. Prefer the Edit tool, which does exact string replacement and can't do this.
-6. **Don't feed Python to `bash -c` via a heredoc when the code contains backslashes.** The Git Bash / MinGW
-   layer strips one level of backslash escaping on the way in, *even with a quoted delimiter* (`<<'PY'`), which
-   normally suppresses all substitution. So the script Python receives is not the one you wrote:
 
-   | You write in the heredoc | Python actually sees | Result |
-   |---|---|---|
-   | `"\r\n"` | `"\r\n"` | fine - survives, because you *want* Python to interpret it |
-   | `"\\n"` (intending a literal `\n` in the output) | `"\n"` | **a real newline is written into the file** |
-   | `'foo \\\r\n'` as a match anchor | `'foo \<CR><LF>'` | **anchor silently doesn't match**, reported as "anchor missing" |
+   **Don't verify this with `grep -c $'\r$'`** - Git Bash's grep normalises line endings, so it counts
+   a bare-LF line as having a CR and reports any file as clean. The opposite mistake to a whole-file
+   rewrite is inserting a handful of LF lines into a CRLF file (a Python `"""..."""` block written with
+   `newline=''` does exactly this), and that shows in `--stat` only as the lines you meant to add. Check
+   the bytes instead, e.g. `python -c "d=open(F,'rb').read(); print(d.count(b'\r\n'), d.count(b'\n'))"`,
+   and treat git's "LF will be replaced by CRLF the next time Git touches it" as the warning it is
+   rather than autocrlf noise.
+6. **Don't feed Python to `bash -c` via a heredoc when the code needs a literal backslash in its
+   *output*.** Git Bash strips one level of escaping on the way in even with a quoted delimiter
+   (`<<'PY'`), so `"\\n"` reaches Python as `"\n"` and writes a real newline into the file - no error,
+   just a patch that quietly did nothing. Use the Edit tool, or write the script to a file and run it.
+   Details and the other two failure shapes: [docs/patching-files.md](docs/patching-files.md).
 
-   The tell for the first case is a compiler error like `C2001: newline in string literal`; the second case
-   produces no error at all, just a patch that quietly did nothing. Both are invisible in the heredoc you wrote.
-
-   The rule: **a heredoc is fine as long as every backslash in the script is one you want Python to interpret.
-   The moment you need a literal backslash in the *output*, stop.** Then either:
-   - use the Edit tool instead (exact string replacement, no shell in the path - the best option for the common
-     case of "insert a few lines of C++ that contain `\n`"), or
-   - write the script to a file with the Write tool and run `python thescript.py`, or
-   - build the backslash as `chr(92)` so no literal backslash appears in the heredoc at all.
-
-   Note this is about the *Python source*, not the data: reading and rewriting a CRLF file with `newline=''` and
-   `\r\n` anchors works fine in a heredoc, and is the normal way to patch files here (see rule 5).
+7. **NEVER run more than one PSP hardware operation at a time.** There is one PSP. Every
+   `gentest.py`, `pspsh` or other PSPLink call gets its own message, containing that one tool call
+   and nothing else, and the next one starts only after the previous one has returned. Never put two
+   of them in the same message as parallel tool calls, never background one and start another, and
+   never loop over tests in one shell command. Re-recording a directory means one test, wait,
+   the next test. Concurrent runs collide in PSPLink and `host0:`: they time out, their results are
+   garbage, and the PSP wedges until someone resets it by hand. This has happened repeatedly; there
+   is no case where it is acceptable.
+8. **Update submodules when you start working.** Run `git submodule update --init --recursive`
+   before anything else, and again after switching or rebasing branches, so that builds and tests
+   use the submodule commits the branch records.
 
 ## Core Safety Checks
 
@@ -75,35 +92,58 @@ for it:
    to forget: put it last in the array even when alphabetical or NID order would put it elsewhere,
    and even when the array is otherwise tidily sorted. The same rule governs the order of
    `Register_*()` calls in `Core/HLE/HLETables.cpp` - new modules go at the very end.
+4. **Changing a shader cache key means bumping `CACHE_VERSION`, in both the OpenGL and Vulkan
+   caches** (`GPU/GLES/ShaderManagerGLES.cpp` and `GPU/Vulkan/ShaderManagerVulkan.cpp`). Their
+   on-disk caches store raw key bits with nothing to tell an old layout from a new one. OpenGL
+   stores `VShaderID`/`FShaderID`, and Vulkan stores those plus `VulkanPipelineKey` (the raster
+   state key and the decoded vertex format ID). So adding, removing, moving or reinterpreting any
+   of those bits needs the bump, or an old cache precompiles shaders for keys that now mean
+   something else, including combinations the generators assert on. D3D11 doesn't store shader IDs
+   on disk. Keys that only live in memory, like `SamplerCacheKey`, don't need a bump.
+5. **"As on hardware" needs a hardware test behind it.** A commit message or comment that says the
+   PSP does something names the pspautotests test that shows it, recorded before the change. And the
+   test has to reach the code path the change is about: when the HLE code handles the same call
+   differently by dialog type, mode or size, cover each of those. A dialog fix once claimed
+   hardware behaviour that the test recorded an hour later contradicted, and the test ran a message
+   dialog, which took a different branch from the savedata dialog that then hung Freak Out.
 
 ## Build and validation
 
-- Linux/Mac: `./b.sh --debug` for a full configure+build; after that, just `cd build ; make -j32; cd ..`
-  for a quick rebuild.
-- Windows: the Visual Studio solution `Windows/PPSSPP.sln` - always build through it, even if a stray
-  CMake-generated `build/` directory exists at the repo root. An agent can drive it with `MSBuild.exe`
-  (located via `vswhere.exe`) instead of the GUI:
+- Linux/Mac: `./b.sh --debug` for a full configure+build; after that, `cd build ; make -j32; cd ..`.
+- Windows: always build through `Windows/PPSSPP.sln`, even if a stray CMake-generated `build/` directory
+  exists at the repo root. Drive it with `MSBuild.exe` (found via `vswhere.exe`) rather than the GUI:
 
 ```powershell
 $installPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
 $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
-& $msbuild "Windows\PPSSPP.sln" /t:UnitTest /p:Configuration=Debug /p:Platform=x64 /m
+& $msbuild "Windows\PPSSPP.sln" /t:UnitTest /p:Configuration=Debug /p:Platform=<platform> /m
 ```
 
+- **`<platform>` is whatever the machine is - look it up, don't assume.** It is `ARM64` or `x64`, and
+  the build lands in `Windows\<platform>\<configuration>\` to match, so building one and running the
+  other is easy to do without noticing. On Windows-on-ARM an x64 build runs anyway, under emulation,
+  which is what makes it easy to miss: it works, but it is slower than the native build, it is not
+  the code ARM users get, and any benchmark from it measures the emulator. Get the host from
+  `python -c "import platform; print(platform.machine())"`, not `$PROCESSOR_ARCHITECTURE`, which
+  describes the *shell* and says `AMD64` from an emulated one. The binaries say which they are too -
+  `UnitTest.exe` prints an `ABI:` line at startup.
 - Kill leftover `PPSSPPHeadless.exe`/`PPSSPP*.exe` instances before building - one holding the exe makes
   the link fail with `LNK1168`, which looks like a build problem and isn't.
 - **A stale binary lies consistently.** After a `git stash` cycle that touched a header, do a
   `/t:Rebuild`; when bisecting a behavioural change, confirm the binary actually changed before you
   believe the result.
+- **If a savestate fails to load, first suspect the branch, not the loader.** Either your branch is
+  behind the build that made the state (rebase it on `origin/master` and rebuild), or the state was
+  made on a branch that hasn't been merged yet. Only once you've ruled out both is it a savestate
+  compatibility bug.
 
-UWP, the legacy Android NDK build and the libretro core have their own build systems - see
-[docs/building.md](docs/building.md), which also covers the above in full.
+UWP, the legacy Android NDK build and the libretro core have their own build systems.
 
 ## Testing
 
 After a chunk of work (not after every edit), run both suites:
 
-- C++ unit tests: build the `UnitTest` project and run `Windows/x64/Debug/UnitTest.exe all`
+- C++ unit tests: build the `UnitTest` project and run `Windows/<platform>/Debug/UnitTest.exe all`
   (Linux/Mac: configure with `-DUNITTEST=ON`, run `build/PPSSPPUnitTest all`). Tests are listed in
   `availableTests` in `unittest/UnitTest.cpp`; pass names instead of `all` to run a subset.
 - pspautotests (HLE coverage) - run them **exactly the way CI does**:
@@ -116,11 +156,43 @@ python test.py -g --graphics=software
   around a hundred failures that mean nothing is wrong. The only meaningful result is `0 tests failed`.
   (The debug-CRT "Detected memory leaks!" dump after the summary line is normal, not a failure.)
 
-New unit tests are added to `availableTests`; large ones go in their own file in `unittest/`, listed in
-both CMakeLists.txt and the Visual Studio project. See [docs/building.md](docs/building.md) for the
-details and [docs/pspautotests.md](docs/pspautotests.md) for a workflow for improving PPSSPP with
-pspautotest results. To write a *new* pspautotest and record its `.expected` from a real PSP over
-PSPLink, see [docs/pspautotests-hardware.md](docs/pspautotests-hardware.md).
+When the thing under test is a commercial game rather than a suite, headless needs `--log` before it prints
+anything (to stderr), and defaults its memory stick to `<exe dir>/memstick` rather than the app's - so the
+firmware you installed in the app isn't there. Pass `--memstick=<the app's memstick>` for any run that is
+meant to exercise a real firmware module. Without it, a library whose HLE the config has disabled has
+nothing left to resolve against, and the game does not fall back to our HLE - it gets unresolved imports and
+dies. The tell is a single line early on, `sceMpeg HLE is disabled, but flash0:/kd/mpeg.prx isn't in the
+firmware and the game didn't bring its own`, followed by a run that logs happily for its whole timeout with
+zero `sceDisplaySetFramebuf` calls and a handful of cached textures. Count flips before concluding anything
+about a game's behaviour. A run configured
+differently from what you asked for, or one that never reached the code, produces the same all-zero counts as
+a clean one, so assert the exit code and a positive "we got here" counter before believing any error count.
+The traps in full: [docs/debugging.md](docs/debugging.md).
+
+Unresolved-import errors early in a game run, for `scePsmfPlayer` in particular, are expected and not a
+problem: many games ship libpsmfplayer (and similar libraries) on the disc, and the imports resolve when the
+game loads the module. Don't change the setup (dropping `--memstick`, turning HLE back on) to make them go
+away; a run should be as close to a real one as possible, with firmware modules running as LLE.
+
+Keep game runs short and fast, so nobody has to watch them: always pass `--timeout-wall=30` (alongside any
+`--timeout-emulated`) unless there's a real reason for longer, use `--graphics=vulkan` rather than
+`--graphics=software` (if Vulkan doesn't work in headless, fix that), prefer a Release build, and leave out
+debug-level `--log` unless you need it. Each of those can cost an order of magnitude: Outrun loading a state
+took minutes with a Debug build, software rendering and a 300MB log, and about a second without them. To
+check that a game renders, `--screenshot-save=FILE.png` beats grepping the log. (pspautotests through
+`test.py` are different: they have their own per-test timeouts and use `--graphics=software` like CI.)
+
+Testing on a real Android device has its own traps, the worst of which is silent: `adb install -r`
+of a shorter branch over a longer one fails with `INSTALL_FAILED_VERSION_DOWNGRADE`, because
+`versionCode` is the commit count. The device keeps running the old build and every measurement after
+that describes the wrong binary. Use `adb install -r -d`, don't swallow the install output, and check
+`adb shell dumpsys package org.ppsspp.ppsspp | grep versionName` afterwards. See
+[docs/android-device-testing.md](docs/android-device-testing.md).
+
+New unit tests are added to `availableTests`; large ones go in their own file in `unittest/`, which has
+to be listed in **three** build files, not two: `CMakeLists.txt`, `unittest/UnitTests.vcxproj` (and its
+`.filters`), and `android/jni/Android.mk`, which builds a unit test executable of its own. Miss the last
+one and it builds everywhere you can easily try it, and fails on Android CI.
 
 ## Multiplatform considerations
 
@@ -140,15 +212,11 @@ libretro/libretro.cpp
 
 ## Reverse-engineering the firmware
 
-When a question about hardware behaviour can't be settled from the docs or from JPCSP - what a
-field in a codec context means, what a library actually returns when a buffer runs dry - the
-firmware itself can be read. `PPSSPPHeadless --re-module flash0:/kd/libmp3.prx --re-out DIR`
-loads one PRX standalone and writes an annotated disassembly, the export/import tables with NIDs
-resolved, and a call graph. It needs a firmware dump (`--memstick` pointing at one; PPSSPP can
-unpack an updater itself with `--unpack-updater`).
-
-Full usage, and how to accumulate names in a `.ppsym` file so the disassembly stays readable:
-[docs/reverse-engineering.md](docs/reverse-engineering.md).
+When a question about hardware behaviour can't be settled from the docs or from JPCSP - what a field in
+a codec context means, what a library returns when a buffer runs dry - read the firmware.
+`PPSSPPHeadless --re-module flash0:/kd/libmp3.prx --re-out DIR` loads one PRX standalone and writes an
+annotated disassembly, the export/import tables with NIDs resolved, and a call graph. It needs a
+firmware dump (`--memstick` pointing at one; `--unpack-updater` can produce one).
 
 Two things to know before trusting what you read there:
 
@@ -162,24 +230,10 @@ Two things to know before trusting what you read there:
 ## Command-line parsing
 
 All command-line parsing for both the main app and headless builds belongs in `Core/CmdLine.cpp` /
-`Core/CmdLine.h` (`CommandLineOptions`), not in the platform entry points (`Windows/main.cpp`, `headless/Headless.cpp`,
-`UI/NativeApp.cpp`, etc.). Don't re-parse `argv` manually in those files - add a field to `CommandLineOptions` instead.
-
-- Most options are declared in the `g_autoParams` table in `CmdLine.cpp` as `{offsetof(...), type, longName,
-  shortName, docString, mode}`. `mode` gates the option to `CmdLineMode::Application`, `::Headless`, or `::Both`
-  (the default if the field is omitted from the initializer) - the same long name can be reused for both modes with
-  different types/meanings (e.g. `--log` is a `String` "log to FILE" option in Application mode but a `Bool` "full
-  log output" option in Headless mode; they don't collide because a given `Parse()` call only matches params whose
-  mode is `Both` or equal to the current mode).
-- Options that can be repeated (e.g. `--ignore TESTNAME`, collected into a `std::vector<std::string>`) or that don't
-  fit the generic single-value table need manual handling in the `else if` chain inside `CommandLineOptions::Parse()`,
-  similar to how `--graphics=` and `boot Filenames` are handled.
-- `ApplyToConfig()` is where parsed options get pushed into `g_Config`/`g_logManager`; prefer wiring a new option
-  through there so all platforms get it for free, rather than reading `CommandLineOptions` fields ad-hoc at each
-  call site.
-- `NativeInit()` in `UI/NativeApp.cpp` still takes `argc`/`argv` (several platform entry points pass them in), but
-  it shouldn't read them directly - by the time `NativeInit()` runs, `CommandLineOptions` should already have
-  everything.
+`Core/CmdLine.h` (`CommandLineOptions`), not in the platform entry points (`Windows/main.cpp`,
+`headless/Headless.cpp`, `UI/NativeApp.cpp`, etc.). Don't re-parse `argv` manually in those files - add
+a field to `CommandLineOptions`, and push it into `g_Config` from `ApplyToConfig()` so every platform
+gets it for free. How to declare one: [docs/command-line.md](docs/command-line.md).
 
 ## File formats, codecs, and other format handlers
 
@@ -192,9 +246,8 @@ For string sanitation, we already have SanitizeString in StringUtils.cpp - add n
 
 ## Framedump rendering tests (frametests)
 
-There is a rendering test system that replays GE frame dumps (`.ppdmp`) through PPSSPPHeadless and compares
-the output against reference images, driven by the `frametests.py` script and a JSON config per test set.
-When changing rendering code, consider running these tests. See docs/frametest.md for full documentation.
+`frametests.py` replays GE frame dumps (`.ppdmp`) through PPSSPPHeadless and compares the output against
+reference images, with a JSON config per test set. Consider running these when changing rendering code.
 
 Note: `headless/Compare.cpp` reads back framebuffers top-down; the flip to bottom-up is only applied when
 writing BMPs (and when reading BMP references). `TranslateDebugBufferToCompare` also exists as a copy in
@@ -203,15 +256,9 @@ writing BMPs (and when reading BMP references). `TranslateDebugBufferToCompare` 
 ## Adding HLE modules
 
 HLE module implementations live in `Core/HLE/sce<ModuleName>.cpp` / `.h`, as a `const HLEFunction
-<name>[]` table registered via `RegisterHLEModule()`. Two savestate-compatibility rules that break
-things silently if ignored:
-
-- **New modules are registered at the very end** of the registration function in `Core/HLE/HLETables.cpp`,
-  never inserted alphabetically among the existing `Register_*()` calls.
-- **New entries in an existing module's function table go at the very end of that array too** - a
-  savestate captures the syscall opcode encoding the entry's array index, so shifting later entries
-  makes old savestates call the wrong function. See Core Safety Checks above: this holds for any
-  edit to any `HLEFunction` array, not just when adding a module.
+<name>[]` table registered via `RegisterHLEModule()`. Both the function table and the `Register_*()`
+calls are append-only - see Core Safety Checks above, which is what breaks old savestates silently
+if ignored.
 
 Also: a new `.cpp`/`.c` file has to be added to **seven** build files (CMake, Core.vcxproj + filters,
 the two UWP projects, `android/jni/Android.mk`, `libretro/Makefile.common`); headers to the first five.
@@ -234,22 +281,36 @@ PPSSPP has a JSON/WebSocket debugger and automation API (read/write memory, brea
 state, input injection, log tailing), served at `/debugger` on the Remote ISO port and enabled with
 `--debugger=PORT` on both the application and headless builds. `Tools/wsdbg/` is a CLI client for it.
 
-- Protocol reference and event catalog: [docs/WebSocketDebugger.md](docs/WebSocketDebugger.md) - read it
-  before changing the interface, and update it when adding commands.
-- Driving it from a script, plus the many headless gotchas (`--timeout` is for the whole session, `-r`
-  is ambiguous, exceptions don't reach the log, ...): [docs/debugging.md](docs/debugging.md).
-- Breakpoints are most reliable on the interpreter (`-i`); memory breakpoints only work for constant
-  addresses under the JITs, and register breakpoints never trip there. Table in
-  [docs/debugging.md](docs/debugging.md).
-- **Before touching debugger code that runs off the CPU thread, read
-  [docs/DebuggerThreading.md](docs/DebuggerThreading.md)** - `Core_RunOnCPUThread()` for mutations,
-  `g_frameMutex` for hot reads, and a lock order that has deadlocked for real when gotten backwards.
+Read [docs/WebSocketDebugger.md](docs/WebSocketDebugger.md) before changing the interface, and update
+it when you add a command.
+
+- Breakpoints are most reliable on the interpreter (`-i`): under the JITs, memory breakpoints only work
+  for constant addresses and register breakpoints never trip at all.
+- **Debugger code that runs off the CPU thread has a lock order that has deadlocked for real** -
+  `Core_RunOnCPUThread()` for mutations, `g_frameMutex` for hot reads. Read
+  [docs/DebuggerThreading.md](docs/DebuggerThreading.md) before touching it.
 
 ## Commit message style
 
 Keep commit messages focused, not overly long (although sometimes it's motivated if a single commit
 is super complex). Do not report things like 100/100 tests passed - that's a given, if tests break
 you aren't supposed to make a commit.
+
+When a commit fixes a GitHub issue, the title comes first as usual, then a blank line, then
+`- Fixes #N` as the first line of the body, then a blank line and the rest of the summary:
+
+```
+GE: Nest CALLs only two deep, like the hardware
+
+- Fixes #7395
+
+The GE has two return address registers, ...
+```
+
+The blank line after the title matters: without it, git and GitHub treat both lines as the title.
+GitHub shows a reference that stands alone in a list item with the issue's title, so the PR
+(which takes its description from the commit) shows what is being fixed, and the keyword closes the
+issue on merge. Don't repeat the number in the body.
 
 **Never put a session marker in a commit message.** That means any `Claude-Session:` trailer, or a
 bare `https://claude.ai/code/session_...` line. This holds even when your own attribution
@@ -294,6 +355,19 @@ private:
 ```
 
 But generally follow the surrounding style. Braces are preferred on the same line. Braces are always used even when they could be omitted due the inner part being just a single line.
+
+### Comments
+
+Keep comments tight. Say the thing once; don't restate what the code already shows, and don't
+allude to a previous, now-corrected version ("eight addresses and nothing else" - the "and nothing
+else" only makes sense against the old wrong layout, which is history). Cut filler like "the two
+are the same shape" down to "(the same shape)".
+
+Avoid AI clichés like "not this, but that".
+
+For a parenthetical aside, prefer parentheses over a pair of spaced dashes: write "the audio thread
+that paces playback", or "the audio thread (which paces playback)", not "the audio thread - which
+paces playback -". A single trailing dash to tack on an example is fine.
 
 We've been inconsistent with copyright notices, but for new files, have the year at 2012, and add the "This program is free software..." as in other files.
 

@@ -38,6 +38,11 @@ enum {
 	VERTEX_BUFFER_MAX = 65536,
 	DECODED_VERTEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 2 * 36,  // 36 == sizeof(SimpleVertex)
 	DECODED_INDEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 6 * 6 * 2,   // * 6 for spline tessellation, then * 6 again for converting into points/lines, and * 2 for 2 bytes per index
+	// TestBoundingBox handles up to 1025 vertices: corners (SimpleVertex), then positions, then decoded vertices.
+	BBOX_SCRATCH_CORNERS_OFFSET = 0,
+	BBOX_SCRATCH_VERTS_OFFSET = 64 * 1024,
+	BBOX_SCRATCH_TEMP_OFFSET = 128 * 1024,
+	BBOX_SCRATCH_SIZE = 256 * 1024,
 };
 
 enum {
@@ -45,9 +50,6 @@ enum {
 	TEX_SLOT_SHADERBLEND_SRC = 1,
 	TEX_SLOT_ALPHATEST = 2,
 	TEX_SLOT_CLUT = 3,
-	TEX_SLOT_SPLINE_POINTS = 4,
-	TEX_SLOT_SPLINE_WEIGHTS_U = 5,
-	TEX_SLOT_SPLINE_WEIGHTS_V = 6,
 };
 
 enum FBOTexState {
@@ -68,6 +70,8 @@ struct alignas(16) Plane8 {
 
 class DrawEngineCommon {
 public:
+	DrawEngineCommon(const DrawEngineCommon &) = delete;
+	DrawEngineCommon &operator=(const DrawEngineCommon &) = delete;
 	DrawEngineCommon();
 	virtual ~DrawEngineCommon();
 
@@ -98,9 +102,11 @@ public:
 	bool TestBoundingBox(const void *control_points, const void *inds, int vertexCount, const VertexDecoder *dec, u32 vertType);
 
 	// This is a less accurate version of TestBoundingBox, but faster. Can have more false positives.
-	// Doesn't support indexing.
-	bool TestBoundingBoxFast(const float *cullMatrix, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, ClipInfoFlags *clipInfoFlags);
+	static bool TestBoundingBoxFast(const float *cullMatrix, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, ClipInfoFlags *clipInfoFlags);
 	bool TestBoundingBoxThrough(GEPrimitiveType prim, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, int *bytesRead, ClipInfoFlags *flags);
+	// For a draw too big or complex for TestBoundingBoxFast: the fallbacks it would need on a GPU that lacks
+	// depth clamp or clip distances, assuming the worst, or nothing (not Valid) if none are needed.
+	static ClipInfoFlags UncheckedClipInfoFlags();
 	bool EstimateThroughPrimSafeSize(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, const VertexDecoder *dec, u32 vertType, int *safeWidth, int *safeHeight);
 
 	void FlushPartialDecode() {
@@ -161,6 +167,11 @@ protected:
 	void DecodeVerts(const VertexDecoder *dec, u8 *dest);
 	int DecodeInds();
 
+	// Whether an indexed draw can share the previous draw's vertex decode, by widening its index range.
+	bool CanExtendDecode(const void *verts, const void *inds, const VertexDecoder *dec) const {
+		return inds && numDrawVerts_ > decodeVertsCounter_ && drawVerts_[numDrawVerts_ - 1].verts == verts && !dec->skinInDecode;
+	}
+
 	int ComputeNumVertsToDecode() const;
 
 	void ApplyFramebufferRead(FBOTexState *fboTexState);
@@ -211,6 +222,8 @@ protected:
 		numDrawVerts_ = 0;
 		numDrawInds_ = 0;
 		vertexCountInDrawCalls_ = 0;
+		expandedVertsInDrawCalls_ = 0;
+		numVertsToDecode_ = 0;
 		decodeIndsCounter_ = 0;
 		decodeVertsCounter_ = 0;
 		seenPrims_ = 0;
@@ -265,14 +278,22 @@ protected:
 	bool useHWTransform_ = false;
 	// Used to prevent unnecessary flushing in softgpu.
 	bool flushOnParams_ = true;
+	// Whether SubmitCurve may queue its output as predecoded, rather than through DispatchSubmitPrim.
+	bool curvesPredecoded_ = true;
 
 	// Set once a equal depth test is encountered.
 	bool everUsedEqualDepth_ = false;
 	bool everUsedExactEqualDepth_ = false;
 
+	// The draw context's invalidation callback is installed from BeginFrame, on the emu thread. The draw
+	// engine is created on the loader thread, while the UI thread may already be rendering and calling it.
+	bool invalidationCallbackInstalled_ = false;
+
 	// Vertex collector buffers
 	u8 *decoded_ = nullptr;
 	u16 *decIndex_ = nullptr;
+	// Separate from decoded_, which can hold decoded vertices that haven't been flushed yet.
+	u8 *bboxScratch_ = nullptr;
 
 	// Cached vertex decoders
 	DenseHashMap<u32, VertexDecoder *> decoderMap_;
@@ -289,6 +310,7 @@ protected:
 		u32 vertexCount;
 		u16 indexLowerBound;
 		u16 indexUpperBound;
+		bool predecoded;  // Already in decoded form (a tessellated curve), so DecodeVerts only copies it, if even that.
 	};
 
 	struct DeferredInds {
@@ -305,6 +327,9 @@ protected:
 	enum { MAX_DEFERRED_DRAW_INDS = 512 };  // Monster Hunter spams indexed calls that we end up merging.
 	DeferredVerts drawVerts_[MAX_DEFERRED_DRAW_VERTS];
 	uint32_t drawVertexOffsets_[MAX_DEFERRED_DRAW_VERTS];
+	// A cull mode change flushes, so all draws in a batch share this.
+	bool BatchTrianglesReversed() const { return numDrawInds_ > 0 && !drawInds_[0].clockwise; }
+
 	DeferredInds drawInds_[MAX_DEFERRED_DRAW_INDS];
 
 	const VertexDecoder *dec_ = nullptr;
@@ -312,6 +337,11 @@ protected:
 	int numDrawVerts_ = 0;
 	int numDrawInds_ = 0;
 	int vertexCountInDrawCalls_ = 0;
+	// How many vertices software transform expands the queued points, lines and rectangles to (4 per
+	// point, line or rectangle). Must stay <= VERTEX_BUFFER_MAX, or the expansion drops the whole draw.
+	int expandedVertsInDrawCalls_ = 0;
+	// How many vertices DecodeVerts will produce for the queued draws. Must stay <= VERTEX_BUFFER_MAX.
+	int numVertsToDecode_ = 0;
 
 	int decodeVertsCounter_ = 0;
 	int decodeIndsCounter_ = 0;

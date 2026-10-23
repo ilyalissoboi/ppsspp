@@ -205,6 +205,10 @@ void GEState::FastLoadBoneMatrix(u32 addr) {
 }
 
 void GEState::Restore(const u32_le *ptr) {
+	Restore(ptr, savedContextVersion == 0);
+}
+
+void GEState::Restore(const u32_le *ptr, bool oldLayout) {
 	// Not sure what the first 10 values are, exactly, but these seem right.
 	gstate_c.vertexAddr = ptr[5];
 	gstate_c.indexAddr = ptr[6];
@@ -218,7 +222,7 @@ void GEState::Restore(const u32_le *ptr) {
 		}
 	}
 
-	if (savedContextVersion == 0) {
+	if (oldLayout) {
 		if (Memory::IsValidAddress(getClutAddress()))
 			loadclut = *cmds++;
 		boneMatrixNumber = *cmds++;
@@ -301,7 +305,9 @@ void GPUStateCache::DoState(PointerWrap &p) {
 
 		uint8_t textureChanged = 0;
 		Do(p, textureChanged);  // legacy
-		gstate_c.Dirty(DIRTY_TEXTURE_IMAGE | DIRTY_TEXTURE_PARAMS);
+		if (p.mode == p.MODE_READ) {
+			gstate_c.Dirty(DIRTY_TEXTURE_IMAGE | DIRTY_TEXTURE_PARAMS);
+		}
 		Do(p, textureSolidAlpha);
 		Do(p, vertexFullAlpha);
 		bool framebufChanged = false;  // legacy
@@ -376,7 +382,7 @@ static constexpr const char * g_gpuUseFlagNames[32] = {
 	"GPU_USE_VS_RANGE_CULLING",
 	"GPU_USE_BLEND_MINMAX",
 	"GPU_USE_LOGIC_OP",
-	"N/A",
+	"GPU_USE_SHADER_LOD_BIAS",
 	"N/A",
 	"GPU_USE_ANISOTROPY",
 	"GPU_USE_CLEAR_RAM_HACK",

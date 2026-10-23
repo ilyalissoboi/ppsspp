@@ -55,6 +55,10 @@ struct CoreParameter {
 	CPUCore cpuCore;
 	GPUCore gpuCore;
 
+	// Independent of cpuCore. Standalone turns it on wherever the host can JIT; headless keeps it
+	// off, since the test references were recorded with the C++ vertex decoder.
+	bool bUseVertexDecoderJit = false;
+
 	GraphicsContext *graphicsContext = nullptr;  // TODO: Find a better place.
 	bool enableSound = true;  // there aren't multiple sound cores.
 
@@ -71,6 +75,10 @@ struct CoreParameter {
 	bool startBreak = false;
 	std::string *collectDebugOutput = nullptr;
 	bool headLess = false;   // Try to avoid messageboxes etc
+	// Headless leaves out compat settings when replaying frame dumps, unless this is set.
+	bool dumpCompat = false;
+	// Headless: GPU_USE_ feature bits to turn off, to test the fallbacks for GPUs without them.
+	u32 disabledGPUFeatures = 0;
 
 	// Internal PSP rendering resolution and scale factor.
 	int renderScaleFactor = 1;

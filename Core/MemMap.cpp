@@ -26,6 +26,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/MemArena.h"
+#include "Common/MemoryUtil.h"
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
 
@@ -45,6 +46,9 @@ namespace Memory {
 
 // The base pointer to the auto-mirrored arena.
 u8* base = nullptr;
+
+u8 *blockShadow = nullptr;
+static const size_t BLOCK_SHADOW_SIZE = (size_t)BLOCK_SHADOW_MASK + 1;
 
 // The MemArena class
 MemArena g_arena;
@@ -82,8 +86,21 @@ static u8 *m_pUncachedVRAM[4];
 // Required for HD Remasters to work properly.
 // This replaces RAM_NORMAL_SIZE at runtime.
 u32 g_MemorySize;
+int g_depthTranslationIndex = DepthTranslationIndex(0x400);
+
+bool DepthMirrorsActive() {
+	return PSP_CoreParameter().gpuCore == GPUCORE_SOFTWARE;
+}
+
+u32 DepthMirroredSlow(u32 address) {
+	if (!DepthMirrorsActive())
+		return address;
+	const DepthLayout &layout = DEPTH_LAYOUTS[(address >> 22) & 1][g_depthTranslationIndex];
+	return (address & 0x40000000) | 0x04000000 | layout.Stored(address & 0x001FFFFF);
+}
 // Used to store the PSP model on game startup.
 u32 g_PSPModel;
+u32 g_UserPartitionSize;
 
 static MemMapSetupFlags g_setupFlags;
 
@@ -147,6 +164,24 @@ static bool SkipView(MemMapSetupFlags flags, u32 viewFlags) {
 	return false;
 }
 
+#if defined(__APPLE__)
+// The address range the views need, from the base.
+static size_t ViewSpan(MemMapSetupFlags flags) {
+	size_t span = 0;
+	for (int i = 0; i < ARRAY_SIZE(views); i++) {
+		if (views[i].size == 0 || SkipView(flags, views[i].flags) || CanIgnoreView(views[i]))
+			continue;
+#ifdef MASKED_PSP_MEMORY
+		const u32 address = views[i].virtual_address & MEMVIEW32_MASK;
+#else
+		const u32 address = views[i].virtual_address;
+#endif
+		span = std::max(span, (size_t)address + views[i].size);
+	}
+	return span;
+}
+#endif
+
 static bool Memory_TryBase(MemMapSetupFlags flags) {
 	// OK, we know where to find free space. Now grab it!
 	// We just mimic the popular BAT setup.
@@ -200,9 +235,9 @@ static bool Memory_TryBase(MemMapSetupFlags flags) {
 bail:
 	// Argh! ERROR! Free what we grabbed so far so we can try again.
 	for (int j = 0; j <= i; j++) {
-		if (views[i].size == 0)
+		if (views[j].size == 0)
 			continue;
-		if (SkipView(flags, views[i].flags))
+		if (SkipView(flags, views[j].flags))
 			continue;
 		if (views[j].out_ptr && *views[j].out_ptr) {
 			if (!CanIgnoreView(views[j])) {
@@ -236,6 +271,30 @@ bool MemoryMap_Setup(MemMapSetupFlags flags) {
 	if (!g_arena.GrabMemSpace(total_mem)) {
 		// It'll already have logged.
 		return false;
+	}
+#endif
+
+#if defined(__APPLE__)
+	// Let the kernel find room for the views, instead of guessing at bases.
+	{
+		const size_t span = ViewSpan(flags);
+#ifdef MASKED_PSP_MEMORY
+		base = g_arena.ReserveViewSpace(span, 0);
+#else
+		// A 4GB aligned base lets the ARM64 JIT pointerify guest addresses with a single MOVK.
+		base = g_arena.ReserveViewSpace(span, 0xFFFFFFFF);
+		if (!base) {
+			base = g_arena.ReserveViewSpace(span, 0);
+		}
+#endif
+	}
+	if (base) {
+		if (Memory_TryBase(flags)) {
+			INFO_LOG(Log::MemMap, "Mapped the memory views into reserved space at %p", base);
+			return true;
+		}
+		WARN_LOG(Log::MemMap, "Couldn't map the memory views into reserved space, falling back");
+		g_arena.ReleaseViewSpace();
 	}
 #endif
 
@@ -315,6 +374,27 @@ void MemoryMap_Shutdown() {
 #endif
 }
 
+// Commits the shadow under every view, so exactly the addresses that are valid PSP memory have entries.
+// Mirrors fold onto the same range under the mask, and committing it again is harmless.
+static bool BlockShadow_Setup(MemMapSetupFlags flags) {
+	blockShadow = (u8 *)ReserveMemoryPages(BLOCK_SHADOW_SIZE);
+	if (!blockShadow) {
+		return false;
+	}
+	for (size_t i = 0; i < ARRAY_SIZE(views); i++) {
+		if (views[i].size == 0 || SkipView(flags, views[i].flags))
+			continue;
+		const u32 start = views[i].virtual_address & BLOCK_SHADOW_MASK;
+		_dbg_assert_((size_t)start + views[i].size <= BLOCK_SHADOW_SIZE);
+		if (!CommitMemoryPages(blockShadow + start, views[i].size)) {
+			FreeMemoryPages(blockShadow, BLOCK_SHADOW_SIZE);
+			blockShadow = nullptr;
+			return false;
+		}
+	}
+	return true;
+}
+
 // On some 32 bit platforms (like old Android, old iOS, etc.), there are/were restrictions on memory map sizes.
 // This particular size I can't find any sources for though.
 static const int MAX_MMAP_SIZE = 31 * 1024 * 1024;
@@ -335,7 +415,15 @@ bool Init(MemMapSetupFlags flags) {
 			views[i].size = std::min(std::max((int)g_MemorySize - MAX_MMAP_SIZE * 2, 0), MAX_MMAP_SIZE);
 	}
 
+	// The shadow first, so the base search can't put it in a gap of the PSP's 4GB window, where a bad
+	// guest access would hit it instead of faulting.
+	if (!BlockShadow_Setup(flags)) {
+		return false;
+	}
+
 	if (!MemoryMap_Setup(flags)) {
+		FreeMemoryPages(blockShadow, BLOCK_SHADOW_SIZE);
+		blockShadow = nullptr;
 		return false;
 	}
 
@@ -369,6 +457,10 @@ static void DoMemoryVoid(PointerWrap &p, uint32_t start, uint32_t size) {
 	if ((size & 0x3F) != 0 || ((uintptr_t)d & 0x3F) != 0)
 		return p.DoVoid(d, size);
 
+	if ((p.mode == PointerWrap::MODE_READ || p.mode == PointerWrap::MODE_VERIFY) && !p.CheckRead(size)) {
+		return;
+	}
+
 	switch (p.mode) {
 	case PointerWrap::MODE_READ:
 		ParallelMemcpy(&g_threadManager, d, storage, size);
@@ -383,7 +475,7 @@ static void DoMemoryVoid(PointerWrap &p, uint32_t start, uint32_t size) {
 		ParallelRangeLoop(&g_threadManager, [&](int l, int h) {
 			for (int i = l; i < h; i++)
 				_dbg_assert_msg_(d[i] == storage[i], "Savestate verification failure: %d (0x%X) (at %p) != %d (0x%X) (at %p).\n", d[i], d[i], &d[i], storage[i], storage[i], &storage[i]);
-		}, 0, size, 128);
+		}, 0, size, 128, 8);
 		break;
 	case PointerWrap::MODE_NOOP:
 		break;
@@ -451,6 +543,8 @@ void Shutdown() {
 	u32 flags = 0;
 	MemoryMap_Shutdown();
 	base = nullptr;
+	FreeMemoryPages(blockShadow, BLOCK_SHADOW_SIZE);
+	blockShadow = nullptr;
 	DEBUG_LOG(Log::MemMap, "Memory system shut down.");
 }
 
@@ -458,78 +552,41 @@ bool IsActive() {
 	return base != nullptr;
 }
 
-static Opcode Read_Instruction(u32 address, bool resolveReplacements, Opcode inst) {
-	if (!MIPS_IS_EMUHACK(inst.encoding)) {
-		return inst;
-	}
-
-	// No mutex on jit access here, but we assume the caller has locked, if necessary.
-	if (MIPS_IS_RUNBLOCK(inst.encoding) && MIPSComp::jit) {
-		inst = MIPSComp::jit->GetOriginalOp(inst);
-		if (resolveReplacements && MIPS_IS_REPLACEMENT(inst)) {
-			u32 op;
-			if (GetReplacedOpAt(address, &op)) {
-				if (MIPS_IS_EMUHACK(op)) {
-					ERROR_LOG(Log::MemMap, "WTF 1");
-					return Opcode(op);
-				} else {
-					return Opcode(op);
-				}
-			} else {
-				ERROR_LOG(Log::MemMap, "Replacement, but no replacement op? %08x", inst.encoding);
-			}
-		}
-		return inst;
-	} else if (resolveReplacements && MIPS_IS_REPLACEMENT(inst.encoding)) {
-		u32 op;
-		if (GetReplacedOpAt(address, &op)) {
-			if (MIPS_IS_EMUHACK(op)) {
-				ERROR_LOG(Log::MemMap, "WTF 2");
-				return Opcode(op);
-			} else {
-				return Opcode(op);
-			}
-		} else {
-			return inst;
-		}
-	} else {
-		return inst;
-	}
-}
-
-Opcode Read_Instruction(u32 address, bool resolveReplacements) {
+Opcode Read_Instruction(u32 address) {
 	if (!IsValid4AlignedAddress(address)) {
 		// BAD!
 		_dbg_assert_(false);
 		return Opcode(0);
 	}
-
-	Opcode inst = Opcode(ReadUnchecked_U32(address));
-	return Read_Instruction(address, resolveReplacements, inst);
+	return Opcode(ReadUnchecked_U32(address));
 }
 
-Opcode ReadUnchecked_Instruction(u32 address, bool resolveReplacements) {
+Opcode ReadUnchecked_Instruction(u32 address) {
 	_dbg_assert_((address & 3) == 0);
-	Opcode inst = Opcode(ReadUnchecked_U32(address));
-	return Read_Instruction(address, resolveReplacements, inst);
+	return Opcode(ReadUnchecked_U32(address));
 }
 
-// WARNING! Caller checks that address is valid!
-Opcode Read_Opcode_JIT(u32 address) {
-	_dbg_assert_(Memory::IsValid4AlignedAddress(address));
-	Opcode inst = Opcode(ReadUnchecked_U32(address));
-	// No mutex around jit access here, but we assume caller has if necessary.
-	if (MIPS_IS_RUNBLOCK(inst.encoding) && MIPSComp::jit) {
-		return MIPSComp::jit->GetOriginalOp(inst);
-	} else {
-		return inst;
-	}
+u32 ReadBlockShadow(u32 address) {
+	if (!blockShadow || !IsValid4AlignedAddress(address))
+		return 0;
+	return *GetBlockShadowEntry(address);
 }
 
-// WARNING! No checks!
-void Write_Opcode_JIT(const u32 address, const Opcode& _Value) {
-	_dbg_assert_((address & 3) == 0);
-	Memory::WriteUnchecked_U32(_Value.encoding, address);
+void WriteBlockShadow(u32 address, u32 value) {
+	if (!blockShadow || !IsValid4AlignedAddress(address))
+		return;
+	*GetBlockShadowEntry(address) = value;
+}
+
+bool ClearBlockShadow(u32 address, u32 value) {
+	if (!blockShadow || !IsValid4AlignedAddress(address))
+		return false;
+	u32 *entry = GetBlockShadowEntry(address);
+	if (*entry != value)
+		return false;
+	// A replacement hook keeps the entry nonzero, see ReplaceTables.h.
+	*entry = Replacement_IsHooked(address) ? Replacement_GetBlockShadowHook() : 0;
+	return true;
 }
 
 void Memset(const u32 addr, const u8 value, const u32 size, const char *tag) {

@@ -110,14 +110,12 @@ void GLRenderManager::ThreadEnd() {
 		frameData_[i].deleter_prev.Perform(this, skipGLCalls_);
 	}
 	deleter_.Perform(this, skipGLCalls_);
-	for (int i = 0; i < (int)steps_.size(); i++) {
-		if (steps_[i]->stepType == GLRStepType::NATIVE_CALLBACK && steps_[i]->callback.fn) {
-			delete steps_[i]->callback.fn;
-		}
-		delete steps_[i];
-	}
-	steps_.clear();
+	// Steps that never got submitted. A dry run frees the data they own (texture uploads etc), and the steps.
+	// The skipGLCalls path of RunSteps also deletes NATIVE_CALLBACK functions.
+	queueRunner_.RunInitSteps(initSteps_, true);
 	initSteps_.clear();
+	queueRunner_.RunSteps(steps_, frameData_[0], true, false, false);
+	steps_.clear();
 	INFO_LOG(Log::G3D, "GLRenderManager::ThreadEnd end");
 }
 
@@ -319,20 +317,7 @@ bool GLRenderManager::CopyFramebufferToMemory(GLRFramebuffer *src, int aspectBit
 	curRenderStep_ = nullptr;
 	FlushSync();
 
-	Draw::DataFormat srcFormat;
-	if (aspectBits & GL_COLOR_BUFFER_BIT) {
-		srcFormat = Draw::DataFormat::R8G8B8A8_UNORM;
-	} else if (aspectBits & GL_STENCIL_BUFFER_BIT) {
-		// Copies from stencil are always S8.
-		srcFormat = Draw::DataFormat::S8;
-	} else if (aspectBits & GL_DEPTH_BUFFER_BIT) {
-		// TODO: Do this properly.
-		srcFormat = Draw::DataFormat::D24_S8;
-	} else {
-		return false;
-	}
-	queueRunner_.CopyFromReadbackBuffer(src, w, h, srcFormat, destFormat, pixelStride, pixels);
-	return true;
+	return queueRunner_.CopyFromReadbackBuffer(src, w, h, destFormat, pixelStride, pixels);
 }
 
 void GLRenderManager::CopyImageToMemorySync(GLRTexture *texture, int mipLevel, int x, int y, int w, int h, Draw::DataFormat destFormat, uint8_t *pixels, int pixelStride, const char *tag) {
@@ -348,7 +333,7 @@ void GLRenderManager::CopyImageToMemorySync(GLRTexture *texture, int mipLevel, i
 	curRenderStep_ = nullptr;
 	FlushSync();
 
-	queueRunner_.CopyFromReadbackBuffer(nullptr, w, h, Draw::DataFormat::R8G8B8A8_UNORM, destFormat, pixelStride, pixels);
+	queueRunner_.CopyFromReadbackBuffer(nullptr, w, h, destFormat, pixelStride, pixels);
 }
 
 void GLRenderManager::BeginFrame(bool enableProfiling) {

@@ -182,6 +182,8 @@ public:
 	// Debugger
 	bool bAutoRun;  // start immediately
 	bool bBreakOnFrameTimeout;  // not saved
+	// Sample the JIT and write a report of the hottest blocks to this file. Not saved.
+	std::string sJitProfileFile;
 
 	// General
 	bool bScreenshotsAsPNG;
@@ -232,8 +234,11 @@ public:
 	bool bFastMemory;
 	int iCpuCore;
 	bool bCheckForNewVersion;
+	bool bWow64WarningDismissed;
 	bool bForceLagSync;
 	bool bFuncReplacements;
+	// Compute the VFPU's dot products (vdot, vmmul, vtfm and the rest) bit-exactly like the PSP.
+	bool bAccurateVdot;
 	bool bHideSlowWarnings;
 	bool bHideStateWarnings;
 	uint32_t uJitDisableFlags;
@@ -265,7 +270,7 @@ public:
 	int iAskForExitConfirmationAfterSeconds;
 	int iUIScaleFactor;  // In 8ths of powers of two.
 	int iDisableHLE;
-	int iForceEnableHLE;  // This is the opposite of DisableHLE but can force on HLE even when we've made it permanently off. Only used in tests, not hooked up to the ini file yet.
+	int iForceEnableHLE;  // The opposite of DisableHLE: puts the HLE back for a module that has graduated to always running for real. Saved as ForceEnableHLEFlags, and the way out if one of those turns out to break a game.
 
 	int iScreenRotation;  // Screen rotation lock. Only supported on Android and possibly other mobile platforms.
 
@@ -300,7 +305,6 @@ public:
 	bool bLowLatencyPresent;
 
 	bool bSoftwareRendering;
-	bool bSoftwareRenderingJit;
 	bool bSoftwareDisableDithering;
 	bool bHardwareTransform;
 	bool bVendorBugChecksEnabled;
@@ -479,11 +483,14 @@ public:
 	int iTiltInputType;
 	bool bTiltInputEnabled;
 
-	// The four tabs (including Remote last)
-	bool bGridView1;
-	bool bGridView2;
-	bool bGridView3;
-	bool bGridView4;
+	// The four tabs (including Remote last). Values from GameBrowserViewMode.
+	int iGameBrowserView1;
+	int iGameBrowserView2;
+	int iGameBrowserView3;
+	int iGameBrowserView4;
+	// The old GridView bools, only read, to migrate to iGameBrowserView*. -1 if missing.
+	int iLegacyGridView1;
+	int iLegacyGridView4;
 
 	// Right analog binding
 	int iRightAnalogUp;
@@ -585,6 +592,8 @@ public:
 	// SystemParam
 	std::string sNickName;  // AdHoc and system nickname
 	std::string sMACAddress;
+	// The Fuse ID of the PSP a game patch was installed on (12 hex digits), to decrypt it with.
+	std::string sFuseID;
 
 	int iLanguage;
 	int iTimeFormat;
@@ -779,7 +788,7 @@ public:
 	int NextValidBackend();
 	bool IsBackendEnabled(GPUBackend backend);
 
-	bool LoadAppendedConfig();
+	bool LoadAppendedConfig(bool save = true);
 	void SetAppendedConfigIni(const Path &path) { appendedConfigFileName_ = path; }
 	void UpdateAfterSettingAutoFrameSkip();
 	void NotifyUpdatedCpuCore();

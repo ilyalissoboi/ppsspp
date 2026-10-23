@@ -19,6 +19,7 @@
 #if PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
 
 #include <cstddef>
+#include <map>
 #include "Common/StringUtils.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPSTables.h"
@@ -139,6 +140,8 @@ bool X64JitBackend::CompileBlock(IRBlockCache *irBlockCache, int block_num) {
 		MOV(32, R(SCRATCH1), Imm32(startPC));
 		JMP(outerLoopPCInSCRATCH1_, true);
 	}
+
+	RecordIRAddresses(block_num, addresses);
 
 	if (logBlocks_ > 0) {
 		--logBlocks_;
@@ -306,7 +309,7 @@ bool X64JitBackend::DescribeCodePtr(const u8 *ptr, std::string &name) const {
 		} else if ((const Float4Constant *)ptr >= constants.vec4InitValues && (const Float4Constant *)ptr < constants.vec4InitValues + 8) {
 			name = StringFromFormat("constants.vec4InitValues[%d]", (int)((const Float4Constant *)ptr - constants.vec4InitValues));
 		} else {
-			name = "fixedCode";
+			name = DescribeFixedCode(ptr);
 		}
 	} else {
 		return IRNativeBackend::DescribeCodePtr(ptr, name);

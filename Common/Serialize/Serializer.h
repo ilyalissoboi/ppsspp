@@ -182,7 +182,7 @@ public:
 
 private:
 	const char *firstBadSectionTitle_ = nullptr;
-	const char *curTitle_;
+	const char *curTitle_ = nullptr;
 	u8 *ptrStart_;
 	u8 *end_ = nullptr;
 	std::vector<SerializeCheckpoint> checkpoints_;
@@ -227,7 +227,8 @@ public:
 	}
 
 	// If *saved is null, will allocate storage using malloc.
-	// If it's not null, it will be used, but only hope can save you from overruns at the end. For libretro.
+	// If it's not null, it will be used, and *savedSize is its capacity: a state that doesn't fit fails with
+	// ERROR_BAD_ALLOC. For libretro.
 	template<class T>
 	static Error MeasureAndSavePtr(T &_class, u8 **saved, size_t *savedSize)
 	{
@@ -239,6 +240,8 @@ public:
 		size_t measuredSize = p.Offset();
 		u8 *data;
 		if (*saved) {
+			if (measuredSize > *savedSize)
+				return ERROR_BAD_ALLOC;
 			data = *saved;
 		} else {
 			data = (u8 *)malloc(measuredSize);

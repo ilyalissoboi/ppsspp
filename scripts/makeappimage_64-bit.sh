@@ -22,6 +22,12 @@ chmod +x ./quick-sharun
 # copy assets dir needs to be next to the binary
 cp -vr ./build/assets ./AppDir/bin
 
+# librashader is dlopen'd at runtime, so sharun's ldd-based deploy can't see it - it also has to sit
+# next to the binary, and its soname has to be the bare name (scripts/build-librashader.sh).
+if [ -f ./build/librashader.so ]; then
+	cp -v ./build/librashader.so ./AppDir/bin
+fi
+
 # Make AppImage with uruntime
 ./quick-sharun --make-appimage
 
