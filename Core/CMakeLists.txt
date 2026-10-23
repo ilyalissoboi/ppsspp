@@ -677,6 +677,8 @@ add_library(Core STATIC
 	Replay.h
 	SaveState.cpp
 	SaveState.h
+	SaveSync.cpp
+	SaveSync.h
 	SaveStateRewind.cpp
 	SaveStateRewind.h
 	Screenshot.cpp
@@ -781,6 +783,12 @@ elseif(BUILD_BUNDLED_FFMPEG)
 		swscale
 		${ZLIB_LIBRARY}
 	)
+endif()
+
+# Save sync with emusync (Core/SaveSync.h, cmake/EmuSync.cmake).
+if(EMUSYNC_FOUND)
+	target_link_libraries(Core emusync::emusync)
+	target_compile_definitions(Core PRIVATE USE_EMUSYNC)
 endif()
 
 # Discord integration

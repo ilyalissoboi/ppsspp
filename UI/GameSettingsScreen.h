@@ -58,6 +58,7 @@ private:
 	void CreateToolsSettings(UI::ViewGroup *tools);
 	void CreateSystemSettings(UI::ViewGroup *systemSettings);
 	void CreateVRSettings(UI::ViewGroup *vrSettings);
+	void CreateSaveSyncSettings(UI::ViewGroup *systemSettings);
 
 	std::string gameID_;
 #ifdef _WIN32
@@ -69,6 +70,10 @@ private:
 #endif
 
 	std::string memstickDisplay_;
+
+	// What is typed into the save sync secret fields, handed to SaveSync and cleared.
+	std::string saveSyncSecret_;
+	std::string saveSyncPassphrase_;
 
 	// Global settings handlers
 	void OnChangeBackground(UI::EventParams &e);

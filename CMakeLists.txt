@@ -1148,6 +1148,9 @@ else()
 	include_directories(ext/libchdr/include)
 endif()
 
+# Save sync (Core/SaveSync.h): defines emusync::emusync when it can.
+include(cmake/EmuSync.cmake)
+
 add_subdirectory(GPU)
 add_subdirectory(Core)
 
@@ -1572,6 +1575,11 @@ if(USE_LIBRASHADER AND LIBRASHADER_PREBUILT AND TARGET ${TargetBin})
 	add_custom_command(TARGET ${TargetBin} POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${LIBRASHADER_PREBUILT}" "${LIBRASHADER_DEST}"
 		COMMENT "Copying librashader next to ${TargetBin}")
+endif()
+
+# Save sync: emusync next to the program.
+if(TARGET ${TargetBin})
+	emusync_deploy_runtime(${TargetBin})
 endif()
 
 # installs

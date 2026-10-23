@@ -40,6 +40,7 @@
 #include "Core/Config.h"
 #include "Core/Reporting.h"
 #include "Core/SaveState.h"
+#include "Core/SaveSync.h"
 
 static double g_lastSaveTime = -1.0;
 
@@ -1117,11 +1118,34 @@ int PSPSaveDialog::Update(int animSpeed) {
 	return 0;
 }
 
+// Whether a save mode writes to or deletes from the memory stick.
+static bool WritesSavedata(SceUtilitySavedataType mode) {
+	switch (mode) {
+	case SCE_UTILITY_SAVEDATA_TYPE_SAVE:
+	case SCE_UTILITY_SAVEDATA_TYPE_AUTOSAVE:
+	case SCE_UTILITY_SAVEDATA_TYPE_DELETEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_AUTODELETE:
+	case SCE_UTILITY_SAVEDATA_TYPE_DELETE:
+	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATASECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATASECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_ERASE:
+	case SCE_UTILITY_SAVEDATA_TYPE_ERASESECURE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 // It's kinda ugly how this uses the "global" 'display'...
 void PSPSaveDialog::ExecuteIOAction() {
 	param.ClearSFOCache();
 	auto &result = param.GetPspParam()->common.result;
 	std::lock_guard<std::mutex> guard(paramLock);
+	// For save sync, which uploads a save once the game has written it.
+	const bool writes = display == DS_SAVE_SAVING || display == DS_DELETE_DELETING ||
+		(display == DS_NONE && WritesSavedata((SceUtilitySavedataType)(u32)param.GetPspParam()->mode));
 	switch (display) {
 	case DS_LOAD_LOADING:
 		result = param.Load(param.GetPspParam(), GetSelectedSaveDirName(), currentSelectedSave);
@@ -1161,6 +1185,8 @@ void PSPSaveDialog::ExecuteIOAction() {
 
 	ioThreadStatus = SAVEIO_DONE;
 	param.ClearSFOCache();
+	if (writes)
+		SaveSync::OnSavedataWritten();
 }
 
 void PSPSaveDialog::ExecuteNotVisibleIOAction() {

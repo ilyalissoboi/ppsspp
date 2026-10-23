@@ -268,6 +268,7 @@
     <ClCompile Include="..\..\Core\HLE\Plugins.cpp" />
     <ClCompile Include="..\..\Core\RetroAchievements.cpp" />
     <ClCompile Include="..\..\Core\SaveState.cpp" />
+    <ClCompile Include="..\..\Core\SaveSync.cpp" />
     <ClCompile Include="..\..\Core\Screenshot.cpp" />
     <ClCompile Include="..\..\Core\System.cpp" />
     <ClCompile Include="..\..\Core\TiltEventProcessor.cpp" />
@@ -666,6 +667,7 @@
     <ClInclude Include="..\..\Core\HLE\Plugins.h" />
     <ClInclude Include="..\..\Core\RetroAchievements.h" />
     <ClInclude Include="..\..\Core\SaveState.h" />
+    <ClInclude Include="..\..\Core\SaveSync.h" />
     <ClInclude Include="..\..\Core\Screenshot.h" />
     <ClInclude Include="..\..\Core\System.h" />
     <ClInclude Include="..\..\Core\TiltEventProcessor.h" />

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Save sync (Core/SaveSync.h) with emusync, from a pinned release: emusync-X.Y.Z-windows-x64.zip,
+  checked against its SHA-256 from the release's SHA256SUMS. The Core project downloads and unpacks
+  it into build\ before it compiles; the programs link emusync.lib, delay-load emusync.dll (so a
+  program that never syncs, like the headless runner, never loads it) and get the DLL copied next to
+  them.
+
+  x64 desktop only. Build without it with /p:EmuSync=false (Core/SaveSync.cpp then compiles to
+  no-ops), or use a package built from emusync's source (scripts/build-desktop.sh) with
+  /p:EmuSyncDir=<package>\.
+-->
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <EmuSyncVersion>0.2.0</EmuSyncVersion>
+    <EmuSyncSha256>0000000000000000000000000000000000000000000000000000000000000000</EmuSyncSha256>
+    <EmuSync Condition="'$(EmuSync)' == '' and '$(Platform)' == 'x64' and '$(ApplicationType)' != 'Windows Store'">true</EmuSync>
+    <EmuSyncDir Condition="'$(EmuSyncDir)' == ''">$(MSBuildThisFileDirectory)..\build\emusync-$(EmuSyncVersion)-windows-x64\</EmuSyncDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup Condition="'$(EmuSync)' == 'true'">
+    <ClCompile>
+      <PreprocessorDefinitions>USE_EMUSYNC;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(EmuSyncDir)lib\emusync.lib;delayimp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>emusync.dll;%(DelayLoadDLLs)</DelayLoadDLLs>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <!-- Core builds before every program that links it, so only Core downloads. -->
+  <Target Name="EmuSyncFetch" BeforeTargets="PrepareForBuild"
+          Condition="'$(EmuSync)' == 'true' and '$(MSBuildProjectName)' == 'Core' and !Exists('$(EmuSyncDir)include\emusync.h')">
+    <PropertyGroup>
+      <EmuSyncZipName>emusync-$(EmuSyncVersion)-windows-x64.zip</EmuSyncZipName>
+      <EmuSyncDownloadDir>$(MSBuildThisFileDirectory)..\build\</EmuSyncDownloadDir>
+    </PropertyGroup>
+    <Message Importance="high" Text="emusync: downloading $(EmuSyncZipName) (build without save sync: /p:EmuSync=false)" />
+    <DownloadFile SourceUrl="https://github.com/ilyalissoboi/emusync/releases/download/v$(EmuSyncVersion)/$(EmuSyncZipName)"
+                  DestinationFolder="$(EmuSyncDownloadDir)" />
+    <GetFileHash Files="$(EmuSyncDownloadDir)$(EmuSyncZipName)" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="EmuSyncZipSha256" />
+    </GetFileHash>
+    <!-- MSBuild compares strings case-insensitively, as hex digests should be. -->
+    <Error Condition="'$(EmuSyncZipSha256)' != '$(EmuSyncSha256)'"
+           Text="emusync: $(EmuSyncZipName) has SHA-256 $(EmuSyncZipSha256), expected $(EmuSyncSha256)" />
+    <Unzip SourceFiles="$(EmuSyncDownloadDir)$(EmuSyncZipName)" DestinationFolder="$(EmuSyncDir)" />
+  </Target>
+
+  <!-- Only Core/SaveSync.cpp includes emusync.h. Its include path is added to that file alone, as
+       the projects' own include paths replace inherited ones. -->
+  <Target Name="EmuSyncInclude" BeforeTargets="ClCompile" Condition="'$(EmuSync)' == 'true'">
+    <ItemGroup>
+      <ClCompile Condition="'%(Filename)' == 'SaveSync'">
+        <AdditionalIncludeDirectories>$(EmuSyncDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      </ClCompile>
+    </ItemGroup>
+  </Target>
+
+  <Target Name="EmuSyncCopyRuntime" AfterTargets="Build"
+          Condition="'$(EmuSync)' == 'true' and '$(ConfigurationType)' == 'Application'">
+    <Copy SourceFiles="$(EmuSyncDir)bin\emusync.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

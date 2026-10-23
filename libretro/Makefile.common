@@ -898,6 +898,7 @@ SOURCES_CXX += \
 	       $(COREDIR)/Reporting.cpp \
 	       $(COREDIR)/RetroAchievements.cpp \
 	       $(COREDIR)/SaveState.cpp \
+	       $(COREDIR)/SaveSync.cpp \
 	       $(COREDIR)/SaveStateRewind.cpp \
 	       $(COREDIR)/Screenshot.cpp \
 	       $(COREDIR)/System.cpp \

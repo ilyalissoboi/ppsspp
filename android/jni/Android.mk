@@ -658,6 +658,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/Replay.cpp \
   $(SRC)/Core/RetroAchievements.cpp \
   $(SRC)/Core/SaveState.cpp \
+  $(SRC)/Core/SaveSync.cpp \
   $(SRC)/Core/SaveStateRewind.cpp \
   $(SRC)/Core/Screenshot.cpp \
   $(SRC)/Core/System.cpp \
