@@ -1,3 +1,6 @@
+import java.net.URI
+import java.security.MessageDigest
+
 plugins {
 	id("com.android.application")
 	id("com.google.protobuf")
@@ -57,6 +60,36 @@ val gitVersionCode =
 		patch * 10_000 +
 		commitsSinceTag
 
+// Save sync (Core/SaveSync.h) with emusync, from a pinned release: its AAR, downloaded once and
+// checked against its SHA-256 (from the release's SHA256SUMS). It brings libemusync.so, which
+// SaveSync loads at run time on Android 7.0 and later (the AAR's minSdk; PPSSPP keeps 21: see
+// AndroidManifest.xml), and the Keystore-backed settings class SaveSyncSecrets uses. Keep the
+// version in step with ext/emusync.
+val emusyncVersion = "0.2.0"
+val emusyncAarSha256 = "bd69015c6d46cb1bca108e3b085a8efb1507b3f6ca31c504523dd23c4fa6be59"
+val emusyncAar = layout.buildDirectory.file("emusync/emusync-$emusyncVersion.aar")
+val downloadEmusync = tasks.register("downloadEmusync") {
+	val url = "https://github.com/ilyalissoboi/emusync/releases/download/v$emusyncVersion/emusync-$emusyncVersion.aar"
+	val out = emusyncAar
+	val sha256 = emusyncAarSha256
+	outputs.file(out)
+	doLast {
+		val file = out.get().asFile
+		fun digest(f: File) = MessageDigest.getInstance("SHA-256")
+			.digest(f.readBytes()).joinToString("") { "%02x".format(it) }
+		if (file.isFile && digest(file) == sha256) return@doLast
+		file.parentFile.mkdirs()
+		val tmp = File(file.path + ".part")
+		URI(url).toURL().openStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+		val got = digest(tmp)
+		if (got != sha256) {
+			tmp.delete()
+			throw GradleException("emusync $emusyncVersion: SHA-256 $got of $url, expected $sha256")
+		}
+		tmp.renameTo(file) || throw GradleException("could not move $tmp to $file")
+	}
+}
+
 dependencies {
 	// 1.6.1 is the newest version we can use that won't complain about minSdk version,
 	// and also doesn't collide kotlin versions with com.gladed.androidgitversion.
@@ -64,6 +97,8 @@ dependencies {
 	implementation("androidx.appcompat:appcompat:1.7.1")
 	implementation("androidx.documentfile:documentfile:1.1.0")
 	implementation("com.google.protobuf:protobuf-javalite:4.35.1")
+	// Save sync: emusync's AAR (see downloadEmusync).
+	implementation(files(emusyncAar).builtBy(downloadEmusync))
 }
 
 protobuf {

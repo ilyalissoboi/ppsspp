@@ -41,10 +41,13 @@
 //
 // Settings: [SaveSync] in ppsspp.ini (Enabled, RemoteURI, AccessKeyID, DeviceName), with the secret
 // access key and the optional encryption passphrase in the system's credential store (Credential
-// Manager, Keychain, Secret Service) through emusync, never in the INI.
+// Manager, Keychain, Secret Service) through emusync, or on Android in the Android Keystore through
+// the app (SetSecretStore()); never in the INI.
 //
-// Without USE_EMUSYNC (emusync not found at build time) every function here is a no-op,
-// IsAvailable() is false and starting fails, saying the build has no save sync.
+// The emusync library is loaded at run time (Windows, Linux, macOS, and Android 7.0 and later): a
+// build or a device without it has no save sync, IsAvailable() is false and starting fails, saying
+// why. On other platforms every function here is a no-op. On Android a memory stick in a folder the
+// user picked (a content:// URI) is reached through PPSSPP's own storage functions.
 //
 // Threading: everything is thread-safe. Start() and OnGameStarting() block (local database open,
 // and the network as described); every other hook returns quickly.
@@ -112,6 +115,15 @@ std::optional<std::string> LoadSecret(const char *name, std::string *error);
 
 // Whether a secret is recorded as stored (from ppsspp.ini; does not ask the store).
 bool HasSecret(const char *name);
+
+// Where the secrets are kept instead of emusync's credential store, which is desktop-only: the
+// Android app's Keystore. Set once, before Initialize(). Both functions may be called on any thread
+// attached to the JVM.
+struct SecretStore {
+	bool (*store)(const char *name, const std::string &value, std::string *error);
+	std::optional<std::string> (*load)(const char *name, std::string *error);
+};
+void SetSecretStore(const SecretStore &store);
 
 // Applies the settings on a background thread: optionally stores new secrets first, then starts
 // sync with the settings, or stops it when it is switched off or incomplete. The settings are read

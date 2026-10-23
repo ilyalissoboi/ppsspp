@@ -19,6 +19,7 @@
 #include <utility>
 
 #include "Common/Crypto/sha1.h"
+#include "Common/File/DirListing.h"
 #include "Common/File/FileUtil.h"
 #include "Common/File/Path.h"
 #include "Common/StringUtils.h"
@@ -75,6 +76,12 @@ bool HasSecret(const char *name) {
 	if (n == ENCRYPTION_PASSPHRASE)
 		return g_Config.bSaveSyncPassphraseStored;
 	return false;
+}
+
+static SecretStore s_secretStore{};
+
+void SetSecretStore(const SecretStore &store) {
+	s_secretStore = store;
 }
 
 }  // namespace SaveSync
@@ -199,6 +206,138 @@ static void *EmuSyncSymbol(void *lib, const char *name) {
 	return dlsym(lib, name);
 #endif
 }
+
+#if PPSSPP_PLATFORM(ANDROID)
+
+// ---- The memory stick through PPSSPP's storage functions (Android) -------------------------
+//
+// The memory stick can be a folder the user picked through the Storage Access Framework: content://
+// documents, with no file paths. emusync reaches every container through these callbacks (es_vfs),
+// built on PPSSPP's File API, which handles both those and ordinary paths. They run on emusync's own
+// threads, which PPSSPP's Java calls need attached to the JVM: each is attached once, and detached
+// when it exits (ART aborts if an attached native thread exits). SAF can't set modification times,
+// so set_mtime is NULL; saves written here get the time they are written at.
+
+struct JniThread {
+	bool attached = false;
+	~JniThread() {
+		if (attached)
+			DetachThreadFromJNI();
+	}
+};
+
+static void AttachEmuSyncThread() {
+	thread_local JniThread thread;
+	if (!thread.attached) {
+		AttachThreadToJNI();
+		thread.attached = true;
+	}
+}
+
+static es_vfs_stat ToVfsStat(const File::FileInfo &info) {
+	es_vfs_stat st{};
+	st.size = info.isDirectory ? 0 : info.size;
+	st.mtime_unix_ms = (int64_t)info.mtime * 1000 + info.mtimeUs / 1000;
+	st.is_dir = info.isDirectory ? 1 : 0;
+	return st;
+}
+
+// ES_E_NOT_FOUND when nothing is at `path`, which emusync relies on; ES_E_IO for any other failure.
+static int Failure(const Path &path) {
+	return File::Exists(path) ? ES_E_IO : ES_E_NOT_FOUND;
+}
+
+static int VfsStat(void *, const char *path, es_vfs_stat *out) {
+	AttachEmuSyncThread();
+	File::FileInfo info;
+	if (!File::GetFileInfo(Path(path), &info) || !info.exists)
+		return ES_E_NOT_FOUND;
+	*out = ToVfsStat(info);
+	return ES_OK;
+}
+
+static int VfsList(void *, const char *dir, es_vfs_entry_fn entry, void *ctx) {
+	AttachEmuSyncThread();
+	std::vector<File::FileInfo> files;
+	if (!File::GetFilesInDir(Path(dir), &files, nullptr, File::GETFILES_GETHIDDEN))
+		return Failure(Path(dir));
+	for (const File::FileInfo &f : files) {
+		const es_vfs_stat st = ToVfsStat(f);
+		entry(ctx, f.name.c_str(), &st);
+	}
+	return ES_OK;
+}
+
+static int VfsRead(void *, const char *path, es_vfs_sink_fn sink, void *ctx) {
+	AttachEmuSyncThread();
+	std::string data;
+	if (!File::ReadBinaryFileToString(Path(path), &data))
+		return Failure(Path(path));
+	sink(ctx, data.data(), data.size());
+	return ES_OK;
+}
+
+static int VfsWrite(void *, const char *path, const void *data, size_t len) {
+	AttachEmuSyncThread();
+	return File::WriteDataToFile(false, data, len, Path(path)) ? ES_OK : ES_E_IO;
+}
+
+static int VfsMkdir(void *, const char *path) {
+	AttachEmuSyncThread();
+	return File::CreateDir(Path(path)) ? ES_OK : ES_E_IO;
+}
+
+static int VfsRename(void *, const char *path, const char *newName) {
+	AttachEmuSyncThread();
+	const Path from(path);
+	return File::Rename(from, from.NavigateUp() / newName) ? ES_OK : Failure(from);
+}
+
+static int VfsRemove(void *, const char *path) {
+	AttachEmuSyncThread();
+	const Path p(path);
+	const bool removed = File::IsDirectory(p) ? File::DeleteDirRecursively(p) : File::Delete(p);
+	return removed ? ES_OK : Failure(p);
+}
+
+static size_t CopyOut(const std::string &s, char *out, size_t cap) {
+	if (s.size() < cap) {
+		memcpy(out, s.data(), s.size());
+		out[s.size()] = '\0';
+	}
+	return s.size();
+}
+
+static size_t VfsJoin(void *, const char *dir, const char *name, char *out, size_t cap) {
+	return CopyOut((Path(dir) / name).ToString(), out, cap);
+}
+
+static size_t VfsParent(void *, const char *path, char *out, size_t cap) {
+	const Path p(path);
+	return p.CanNavigateUp() ? CopyOut(p.NavigateUp().ToString(), out, cap) : 0;
+}
+
+static size_t VfsName(void *, const char *path, char *out, size_t cap) {
+	return CopyOut(Path(path).GetFilename(), out, cap);
+}
+
+static es_vfs MemStickVfs() {
+	es_vfs v{};
+	v.struct_size = sizeof(es_vfs);
+	v.stat = &VfsStat;
+	v.list = &VfsList;
+	v.read = &VfsRead;
+	v.write = &VfsWrite;
+	v.mkdir = &VfsMkdir;
+	v.rename = &VfsRename;
+	v.remove = &VfsRemove;
+	v.join = &VfsJoin;
+	v.parent = &VfsParent;
+	v.name = &VfsName;
+	return v;
+}
+
+#endif  // PPSSPP_PLATFORM(ANDROID)
 
 // Loads the library once; never unloaded.
 static bool LoadEmuSync() {
@@ -586,6 +725,11 @@ bool Start(const Config &config, std::string *error) {
 	cfg.conflict_policy = ES_POLICY_NEWEST;
 	cfg.log = &LogMessage;
 	cfg.log_level = ES_LOG_INFO;
+#if PPSSPP_PLATFORM(ANDROID)
+	// Copied by es_client_create.
+	const es_vfs vfs = MemStickVfs();
+	cfg.vfs = &vfs;
+#endif
 	es_status st = g_es.es_client_create(&cfg, &s_client);
 	if (st != ES_OK) {
 		if (error)
@@ -699,14 +843,19 @@ bool StoreSecret(const char *name, const std::string &value, std::string *error)
 			*error = NO_LIBRARY;
 		return false;
 	}
-	// Without a Secret Service (Linux), the secret goes to a file only this user can read here.
-	const std::string fallback = DataRoot().ToString();
-	const es_status st = value.empty() ? g_es.es_secret_delete(SECRET_SERVICE, name, fallback.c_str()) :
-	                                     g_es.es_secret_set(SECRET_SERVICE, name, value.c_str(), fallback.c_str());
-	if (st != ES_OK) {
-		if (error)
-			*error = StringFromFormat("Could not store the secret in the system's credential store: %s", g_es.es_status_str(st));
-		return false;
+	if (s_secretStore.store) {
+		if (!s_secretStore.store(name, value, error))
+			return false;
+	} else {
+		// Without a Secret Service (Linux), the secret goes to a file only this user can read here.
+		const std::string fallback = DataRoot().ToString();
+		const es_status st = value.empty() ? g_es.es_secret_delete(SECRET_SERVICE, name, fallback.c_str()) :
+		                                     g_es.es_secret_set(SECRET_SERVICE, name, value.c_str(), fallback.c_str());
+		if (st != ES_OK) {
+			if (error)
+				*error = StringFromFormat("Could not store the secret in the system's credential store: %s", g_es.es_status_str(st));
+			return false;
+		}
 	}
 	const std::string_view n = name;
 	if (n == SECRET_ACCESS_KEY)
@@ -722,6 +871,8 @@ std::optional<std::string> LoadSecret(const char *name, std::string *error) {
 			*error = NO_LIBRARY;
 		return std::nullopt;
 	}
+	if (s_secretStore.load)
+		return s_secretStore.load(name, error);
 	std::string buf(SECRET_BUFFER, '\0');
 	size_t len = 0;
 	const std::string fallback = DataRoot().ToString();
@@ -790,6 +941,8 @@ static std::string StartFromSettings(const Settings &s) {
 
 static void ApplyLoop() {
 	SetCurrentThreadName("SaveSyncApply");
+	// Reads the secrets, through the Java side on Android.
+	AndroidJNIThreadContext jniContext;
 	for (;;) {
 		std::vector<SecretUpdate> secrets;
 		std::vector<std::function<void(const std::string &)>> done;

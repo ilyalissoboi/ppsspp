@@ -96,6 +96,7 @@ struct JNIEnv {};
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
 #include "Core/Loaders.h"
+#include "Core/SaveSync.h"
 #include "Core/KeyMap.h"
 #include "Core/System.h"
 #include "Core/EmuThread.h"
@@ -516,6 +517,59 @@ std::string GetJavaString(JNIEnv *env, jstring jstr) {
 	return cpp_string;
 }
 
+// ---- Save sync (Core/SaveSync.h): its secrets in the Android Keystore -------------------------
+// Through org.ppsspp.ppsspp.SaveSyncSecrets, which uses emusync's SyncSettings. The application
+// context, unlike the activity, lives as long as the process, so a secret being read on SaveSync's
+// thread never meets a released activity.
+
+static jobject g_appContext;
+static jclass g_saveSyncSecrets;
+static jmethodID g_saveSyncStore;
+static jmethodID g_saveSyncLoad;
+
+static bool StoreSaveSyncSecret(const char *name, const std::string &value, std::string *error) {
+	JNIEnv *env = getEnv();
+	jstring jname = env->NewStringUTF(name);
+	jstring jvalue = env->NewStringUTF(value.c_str());
+	const bool stored = env->CallStaticBooleanMethod(g_saveSyncSecrets, g_saveSyncStore, g_appContext, jname, jvalue);
+	env->DeleteLocalRef(jvalue);
+	env->DeleteLocalRef(jname);
+	if (!stored && error)
+		*error = "Could not store the secret in the Android Keystore.";
+	return stored;
+}
+
+static std::optional<std::string> LoadSaveSyncSecret(const char *name, std::string *error) {
+	JNIEnv *env = getEnv();
+	jstring jname = env->NewStringUTF(name);
+	jstring jvalue = (jstring)env->CallStaticObjectMethod(g_saveSyncSecrets, g_saveSyncLoad, g_appContext, jname);
+	env->DeleteLocalRef(jname);
+	if (!jvalue)
+		return std::nullopt;
+	std::string value = GetJavaString(env, jvalue);
+	env->DeleteLocalRef(jvalue);
+	return value;
+}
+
+static void RegisterSaveSyncSecrets(JNIEnv *env, jobject activity) {
+	if (g_saveSyncSecrets)
+		return;
+	jclass cls = env->FindClass("org/ppsspp/ppsspp/SaveSyncSecrets");
+	jclass contextClass = env->GetObjectClass(activity);
+	jmethodID getAppContext = env->GetMethodID(contextClass, "getApplicationContext", "()Landroid/content/Context;");
+	if (!cls || !getAppContext) {
+		env->ExceptionClear();
+		WARN_LOG(Log::System, "SaveSync: no SaveSyncSecrets class; save sync can't keep its keys");
+		return;
+	}
+	g_appContext = env->NewGlobalRef(env->CallObjectMethod(activity, getAppContext));
+	g_saveSyncSecrets = (jclass)env->NewGlobalRef(cls);
+	g_saveSyncStore = env->GetStaticMethodID(cls, "store", "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Z");
+	g_saveSyncLoad = env->GetStaticMethodID(cls, "load", "(Landroid/content/Context;Ljava/lang/String;)Ljava/lang/String;");
+	_dbg_assert_(g_saveSyncStore && g_saveSyncLoad);
+	SaveSync::SetSecretStore({&StoreSaveSyncSecret, &LoadSaveSyncSecret});
+}
+
 extern "C" void Java_org_ppsspp_ppsspp_PpssppActivity_registerCallbacks(JNIEnv *env, jobject obj) {
 	ppssppActivity = env->NewGlobalRef(obj);
 	TextDrawerAndroid::SetActivity(ppssppActivity);
@@ -529,6 +583,7 @@ extern "C" void Java_org_ppsspp_ppsspp_PpssppActivity_registerCallbacks(JNIEnv *
 
 	Android_RegisterStorageCallbacks(env, obj);
 	Android_StorageSetActivity(ppssppActivity);
+	RegisterSaveSyncSecrets(env, obj);
 }
 
 extern "C" void Java_org_ppsspp_ppsspp_PpssppActivity_unregisterCallbacks(JNIEnv *env, jobject obj) {
@@ -881,6 +936,7 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeApp_resume(JNIEnv *, jclass) {
 	AndroidAudio_Resume(g_audioState);
 
 	System_PostUIMessage(UIMessage::APP_RESUMED, bFirstResume ? "first" : "");
+	SaveSync::SetAppBackgrounded(false);
 
 	bFirstResume = false;
 	INFO_LOG(Log::System, "NativeApp.resume() - end");
@@ -889,6 +945,8 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeApp_resume(JNIEnv *, jclass) {
 extern "C" void Java_org_ppsspp_ppsspp_NativeApp_pause(JNIEnv *, jclass) {
 	INFO_LOG(Log::System, "NativeApp.pause() - begin");
 	AndroidAudio_Pause(g_audioState);
+	// Uploads the saves made so far, before the system may stop the app.
+	SaveSync::SetAppBackgrounded(true);
 	INFO_LOG(Log::System, "NativeApp.pause() - end");
 }
 
