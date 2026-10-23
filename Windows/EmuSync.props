@@ -13,7 +13,7 @@
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <PropertyGroup>
     <EmuSyncVersion>0.2.0</EmuSyncVersion>
-    <EmuSyncSha256>0000000000000000000000000000000000000000000000000000000000000000</EmuSyncSha256>
+    <EmuSyncSha256>f7ceb90e6b2d143c258d1184b02c91b0e7253be7110f55aa0ab023879f2a69b2</EmuSyncSha256>
     <EmuSync Condition="'$(EmuSync)' == '' and '$(Platform)' == 'x64' and '$(ApplicationType)' != 'Windows Store'">true</EmuSync>
     <EmuSyncDir Condition="'$(EmuSyncDir)' == ''">$(MSBuildThisFileDirectory)..\build\emusync-$(EmuSyncVersion)-windows-x64\</EmuSyncDir>
   </PropertyGroup>
