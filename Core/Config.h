@@ -729,6 +729,16 @@ public:
 	std::string sAchievementsToken;  // Not saved, to be used if you want to manually make your RA login persistent. See Native_SaveSecret for the normal case.
 	std::string sAchievementsHost;  // Optional custom host for debugging against alternate RA servers.
 
+	// Save sync with emusync (Core/SaveSync.h). The secret access key and the encryption
+	// passphrase are kept in the system's credential store, not here: these only say whether one
+	// is stored.
+	bool bSaveSyncEnabled;
+	std::string sSaveSyncRemoteURI;
+	std::string sSaveSyncAccessKeyID;
+	std::string sSaveSyncDeviceName;
+	bool bSaveSyncSecretStored;
+	bool bSaveSyncPassphraseStored;
+
 	// Various directories. Autoconfigured, not read from ini.
 	Path currentDirectory;  // The directory selected in the game browsing window.
 	Path defaultCurrentDirectory;  // Platform dependent, initialized at startup.

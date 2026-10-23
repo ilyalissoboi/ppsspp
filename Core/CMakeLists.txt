@@ -654,6 +654,8 @@ add_library(Core STATIC
 	Replay.h
 	SaveState.cpp
 	SaveState.h
+	SaveSync.cpp
+	SaveSync.h
 	SaveStateRewind.cpp
 	SaveStateRewind.h
 	Screenshot.cpp

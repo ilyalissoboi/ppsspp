@@ -40,6 +40,7 @@
 #include "Core/Config.h"
 #include "Core/Reporting.h"
 #include "Core/SaveState.h"
+#include "Core/SaveSync.h"
 
 static double g_lastSaveTime = -1.0;
 
@@ -1079,10 +1080,33 @@ int PSPSaveDialog::Update(int animSpeed) {
 	return 0;
 }
 
+// Whether a save mode writes to or deletes from the memory stick.
+static bool WritesSavedata(SceUtilitySavedataType mode) {
+	switch (mode) {
+	case SCE_UTILITY_SAVEDATA_TYPE_SAVE:
+	case SCE_UTILITY_SAVEDATA_TYPE_AUTOSAVE:
+	case SCE_UTILITY_SAVEDATA_TYPE_DELETEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_AUTODELETE:
+	case SCE_UTILITY_SAVEDATA_TYPE_DELETE:
+	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATASECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATASECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_ERASE:
+	case SCE_UTILITY_SAVEDATA_TYPE_ERASESECURE:
+		return true;
+	default:
+		return false;
+	}
+}
+
 // Runs on the IO thread. Of the dialog, it only touches the io* members (see StartIOThread and FinishIO).
 void PSPSaveDialog::ExecuteIOAction() {
 	ioParam_.ClearSFOCache();
 	auto &result = ioRequest_.common.result;
+	// For save sync, which uploads a save once the game has written it.
+	const bool writes = ioAction_ == DS_SAVE_SAVING || ioAction_ == DS_DELETE_DELETING ||
+		(ioAction_ == DS_NONE && WritesSavedata((SceUtilitySavedataType)(u32)ioRequest_.mode));
 	ioDisplay_ = ioAction_;
 	switch (ioAction_) {
 	case DS_LOAD_LOADING:
@@ -1112,6 +1136,8 @@ void PSPSaveDialog::ExecuteIOAction() {
 
 	ioParam_.ClearSFOCache();
 	ioThreadStatus = SAVEIO_READY;
+	if (writes)
+		SaveSync::OnSavedataWritten();
 }
 
 // What a mode that shows no dialog returns without a memory stick, or 0 for one not tested on

@@ -113,6 +113,7 @@
 #include "Core/Reporting.h"
 #include "Core/RetroAchievements.h"
 #include "Core/SaveState.h"
+#include "Core/SaveSync.h"
 #include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/HLE/__sceAudio.h"
@@ -859,6 +860,9 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 
 	// Initialize retro achievements runtime.
 	Achievements::Initialize();
+
+	// Save sync starts in the background, from its settings.
+	SaveSync::Initialize();
 
 	// Must be done restarting by now.
 	g_nativeMainThreadReady = true;
@@ -1859,6 +1863,9 @@ void NativeShutdown() {
 	g_controlMapper.RemoveListener(&g_globalListener);
 
 	Achievements::Shutdown(false);  // CancelAll below drops the pending requests.
+
+	// Gives queued uploads a few seconds.
+	SaveSync::Shutdown();
 
 	if (g_Config.bAchievementsEnable) {
 		FILE *iconCacheFile = File::OpenCFile(GetSysDirectory(DIRECTORY_CACHE) / "icon.cache", "wb");

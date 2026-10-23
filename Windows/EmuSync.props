@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Save sync (Core/SaveSync.h) with emusync. PPSSPP loads emusync.dll at run time and builds against
+  the vendored header (ext/emusync), so this only puts the DLL next to PPSSPPWindows64.exe: from a
+  pinned release, emusync-X.Y.Z-windows-x64.zip, checked against its SHA-256 from the release's
+  SHA256SUMS and unpacked into build\. Without it (offline, /p:EmuSync=false, or not x64 desktop)
+  PPSSPP runs without save sync.
+
+  Use a package built from emusync's source (scripts/build-desktop.sh) with /p:EmuSyncDir=<package>\.
+  Keep EmuSyncVersion in step with ext/emusync and cmake/EmuSync.cmake.
+-->
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <EmuSyncVersion>0.2.0</EmuSyncVersion>
+    <EmuSyncSha256>f7ceb90e6b2d143c258d1184b02c91b0e7253be7110f55aa0ab023879f2a69b2</EmuSyncSha256>
+    <EmuSync Condition="'$(EmuSync)' == '' and '$(Platform)' == 'x64' and '$(ApplicationType)' != 'Windows Store'">true</EmuSync>
+    <EmuSyncDir Condition="'$(EmuSyncDir)' == ''">$(MSBuildThisFileDirectory)..\build\emusync-$(EmuSyncVersion)-windows-x64\</EmuSyncDir>
+  </PropertyGroup>
+
+  <Target Name="EmuSyncFetch" BeforeTargets="PrepareForBuild"
+          Condition="'$(EmuSync)' == 'true' and !Exists('$(EmuSyncDir)bin\emusync.dll')">
+    <PropertyGroup>
+      <EmuSyncZipName>emusync-$(EmuSyncVersion)-windows-x64.zip</EmuSyncZipName>
+      <EmuSyncDownloadDir>$(MSBuildThisFileDirectory)..\build\</EmuSyncDownloadDir>
+      <EmuSyncZip>$(EmuSyncDownloadDir)$(EmuSyncZipName)</EmuSyncZip>
+    </PropertyGroup>
+    <Message Importance="high" Text="emusync: downloading $(EmuSyncZipName) for save sync" />
+    <DownloadFile SourceUrl="https://github.com/ilyalissoboi/emusync/releases/download/v$(EmuSyncVersion)/$(EmuSyncZipName)"
+                  DestinationFolder="$(EmuSyncDownloadDir)" ContinueOnError="WarnAndContinue" />
+    <GetFileHash Condition="Exists('$(EmuSyncZip)')" Files="$(EmuSyncZip)" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="EmuSyncZipSha256" />
+    </GetFileHash>
+    <!-- MSBuild compares strings case-insensitively, as hex digests should be. A download that isn't
+         the pinned release is an error, not a reason to build without sync. -->
+    <Error Condition="Exists('$(EmuSyncZip)') and '$(EmuSyncZipSha256)' != '$(EmuSyncSha256)'"
+           Text="emusync: $(EmuSyncZipName) has SHA-256 $(EmuSyncZipSha256), expected $(EmuSyncSha256)" />
+    <Unzip Condition="Exists('$(EmuSyncZip)')" SourceFiles="$(EmuSyncZip)" DestinationFolder="$(EmuSyncDir)" />
+  </Target>
+
+  <Target Name="EmuSyncCopyRuntime" AfterTargets="Build"
+          Condition="'$(EmuSync)' == 'true' and Exists('$(EmuSyncDir)bin\emusync.dll')">
+    <Copy SourceFiles="$(EmuSyncDir)bin\emusync.dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

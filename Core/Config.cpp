@@ -431,6 +431,16 @@ static const ConfigSetting achievementSettings[] = {
 	ConfigSetting("AchievementsUnlockedPos", SETTING(g_Config, iAchievementsUnlockedPos), (int)ScreenEdgePosition::TOP_CENTER, CfgFlag::PER_GAME | CfgFlag::DEFAULT),
 };
 
+// Save sync (Core/SaveSync.h). The secrets themselves are in the system's credential store.
+static const ConfigSetting saveSyncSettings[] = {
+	ConfigSetting("Enabled", SETTING(g_Config, bSaveSyncEnabled), false, CfgFlag::DEFAULT),
+	ConfigSetting("RemoteURI", SETTING(g_Config, sSaveSyncRemoteURI), "", CfgFlag::DEFAULT),
+	ConfigSetting("AccessKeyID", SETTING(g_Config, sSaveSyncAccessKeyID), "", CfgFlag::DEFAULT),
+	ConfigSetting("DeviceName", SETTING(g_Config, sSaveSyncDeviceName), "", CfgFlag::DEFAULT),
+	ConfigSetting("SecretAccessKeyStored", SETTING(g_Config, bSaveSyncSecretStored), false, CfgFlag::DEFAULT),
+	ConfigSetting("EncryptionPassphraseStored", SETTING(g_Config, bSaveSyncPassphraseStored), false, CfgFlag::DEFAULT),
+};
+
 static const ConfigSetting cpuSettings[] = {
 	ConfigSetting("CPUCore", SETTING(g_Config, iCpuCore), &DefaultCpuCore, CfgFlag::PER_GAME | CfgFlag::REPORT),
 	ConfigSetting("SeparateSASThread", SETTING(g_Config, bSeparateSASThread), &DefaultSasThread, CfgFlag::PER_GAME | CfgFlag::REPORT),
@@ -1195,6 +1205,7 @@ static const ConfigSectionMeta g_sectionMeta[] = {
 	{ &g_Config, themeSettings, ARRAY_SIZE(themeSettings), "Theme" },
 	{ &g_Config, vrSettings, ARRAY_SIZE(vrSettings), "VR" },
 	{ &g_Config, achievementSettings, ARRAY_SIZE(achievementSettings), "Achievements" },
+	{ &g_Config, saveSyncSettings, ARRAY_SIZE(saveSyncSettings), "SaveSync" },
 	{ &g_Config, upgradeSettings, ARRAY_SIZE(upgradeSettings), "Upgrade" },
 	{ &g_Config.displayLayoutLandscape, displayLayoutSettings, ARRAY_SIZE(displayLayoutSettings), "DisplayLayout.Landscape", "Graphics" },  // We read the old settings from [Graphics], since most people played in landscape before.
 	{ &g_Config.displayLayoutPortrait, displayLayoutSettings, ARRAY_SIZE(displayLayoutSettings), "DisplayLayout.Portrait"},  // These we don't want to read from the old settings, since for most people, those settings will be bad.

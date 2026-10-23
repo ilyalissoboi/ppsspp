@@ -1163,6 +1163,9 @@ else()
 	include_directories(ext/libchdr/include)
 endif()
 
+# Save sync (Core/SaveSync.h): the emusync library to put next to the program.
+include(cmake/EmuSync.cmake)
+
 add_subdirectory(GPU)
 add_subdirectory(Core)
 
@@ -1598,6 +1601,11 @@ if(USE_LIBRASHADER AND LIBRASHADER_PREBUILT AND TARGET ${TargetBin})
 		COMMENT "Copying librashader next to ${TargetBin}")
 endif()
 
+# Save sync: emusync next to the program.
+if(TARGET ${TargetBin})
+	emusync_deploy_runtime(${TargetBin})
+endif()
+
 # installs
 if(NOT ANDROID)
 	file(INSTALL ${BigFontAssets} DESTINATION assets)
@@ -1763,6 +1771,11 @@ if(UNIX AND NOT ANDROID AND NOT APPLE)
 		TARGETS ${TargetBin}
 		DESTINATION "${CMAKE_INSTALL_BINDIR}"
 	)
+	# Save sync: the emusync library goes where PPSSPP looks for it, next to the program
+	# (cmake/EmuSync.cmake).
+	if(EMUSYNC_RUNTIME)
+		install(FILES "${EMUSYNC_RUNTIME}" DESTINATION "${CMAKE_INSTALL_BINDIR}")
+	endif()
 	install(
 		DIRECTORY "${CMAKE_BINARY_DIR}/assets"
 		DESTINATION "${CMAKE_INSTALL_DATADIR}/ppsspp"

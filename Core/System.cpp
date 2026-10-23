@@ -75,6 +75,7 @@
 #include "Core/PSPLoaders.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/SaveState.h"
+#include "Core/SaveSync.h"
 #include "Core/Util/RecentFiles.h"
 #include "Common/ExceptionHandlerSetup.h"
 #include "GPU/GPUCommon.h"
@@ -824,6 +825,9 @@ bool PSP_InitStart(const CoreParameter &coreParam) {
 			return;
 		}
 #endif
+		// The game is loaded and hasn't run yet: newer saves from other devices go onto the
+		// memory stick now, before it can read them (waits up to 3 s for the network).
+		SaveSync::OnGameStarting();
 		g_bootState = BootState::Complete;
 	});
 
@@ -922,6 +926,8 @@ void PSP_Shutdown(bool success) {
 
 	CPU_Shutdown(success);
 	GPU_Shutdown();
+	// The game can't write saves any more: upload them, and apply what arrived meanwhile.
+	SaveSync::OnGameStopped();
 	g_paramSFO.Clear();
 	g_paramSFORaw.Clear();
 	System_SetWindowTitle("");

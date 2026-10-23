@@ -720,6 +720,7 @@
     <ClCompile Include="Reporting.cpp" />
     <ClCompile Include="RetroAchievements.cpp" />
     <ClCompile Include="SaveState.cpp" />
+    <ClCompile Include="SaveSync.cpp" />
     <ClCompile Include="MIPS\MIPSStackWalk.cpp" />
     <ClCompile Include="SaveStateRewind.cpp" />
     <ClCompile Include="Screenshot.cpp" />
@@ -1045,6 +1046,7 @@
     <ClInclude Include="Reporting.h" />
     <ClInclude Include="RetroAchievements.h" />
     <ClInclude Include="SaveState.h" />
+    <ClInclude Include="SaveSync.h" />
     <ClInclude Include="MIPS\MIPSStackWalk.h" />
     <ClInclude Include="SaveStateRewind.h" />
     <ClInclude Include="Screenshot.h" />

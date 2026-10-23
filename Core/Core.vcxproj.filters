@@ -414,6 +414,9 @@
     <ClCompile Include="SaveState.cpp">
       <Filter>Core</Filter>
     </ClCompile>
+    <ClCompile Include="SaveSync.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
     <ClCompile Include="..\ext\snappy\snappy-c.cpp">
       <Filter>Ext\Snappy</Filter>
     </ClCompile>
@@ -1708,6 +1711,9 @@
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
     <ClInclude Include="SaveState.h">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="SaveSync.h">
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="..\ext\snappy\snappy.h">

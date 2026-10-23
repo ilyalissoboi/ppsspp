@@ -82,6 +82,7 @@
 #include "Core/HLE/sceUsbMic.h"
 #include "Core/HLE/sceUtility.h"
 #include "Core/Util/PortManager.h"
+#include "Core/SaveSync.h"
 #include "GPU/Common/PostShader.h"
 #include "GPU/GPU.h"
 
@@ -1392,6 +1393,8 @@ void GameSettingsScreen::CreateSystemSettings(UI::ViewGroup *systemSettings) {
 	UI::PopupSliderChoice *sizeChoice = systemSettings->Add(new PopupSliderChoice(&g_Config.iMemStickSizeGB, 1, 32, 16, sy->T("Memory Stick size", "Memory Stick size"), screenManager(), "GB"));
 	sizeChoice->SetFormat("%d GB");
 
+	CreateSaveSyncSettings(systemSettings);
+
 	systemSettings->Add(new ItemHeader(sy->T("Help the PPSSPP team")));
 	if (!enableReportsSet_)
 		enableReports_ = Reporting::IsEnabled();
@@ -1526,6 +1529,163 @@ void GameSettingsScreen::CreateSystemSettings(UI::ViewGroup *systemSettings) {
 	systemSettings->Add(new CheckBox(&g_Config.bDumpAudio, sy->T("Record Audio")));
 	systemSettings->Add(new CheckBox(&g_Config.bSaveLoadResetsAVdumping, sy->T("Reset Recording on Save/Load State")));
 #endif
+}
+
+namespace {
+
+// The storage address, shown on one row: a long address has no spaces to wrap at, so it would run
+// into the label. Shown without its options (?region=...) and cropped in the middle, keeping the
+// start (the bucket) and the end (the folder); the full address is in the text field.
+class StorageAddressChoice : public UI::PopupTextInputChoice {
+public:
+	using UI::PopupTextInputChoice::PopupTextInputChoice;
+
+protected:
+	std::string ValueText(bool *shadow) const override {
+		std::string text = UI::PopupTextInputChoice::ValueText(shadow);
+		if (*shadow)
+			return text;
+		text = text.substr(0, text.find('?'));
+		constexpr size_t MAX_LENGTH = 32;
+		const bool ascii = std::all_of(text.begin(), text.end(), [](char c) { return (unsigned char)c < 0x80; });
+		if (text.size() <= MAX_LENGTH || !ascii)
+			return text;
+		return text.substr(0, 16) + "..." + text.substr(text.size() - (MAX_LENGTH - 19));
+	}
+};
+
+// The save sync status line, drawn as a hint of the "Sync saves" row like the other settings' tips,
+// so it sits inside the section. It refreshes itself as the screen draws (syncing happens in the
+// background), and keeps the secret fields' "Saved"/"Not set" in step with the store.
+class SaveSyncStatusView : public SettingHint {
+public:
+	SaveSyncStatusView(UI::View *setting, UI::PopupTextInputChoice *secret, UI::PopupTextInputChoice *passphrase)
+		: SettingHint("", setting), secret_(secret), passphrase_(passphrase) {}
+
+	void Update() override {
+		auto sy = GetI18NCategory(I18NCat::SYSTEM);
+		std::string text;
+		if (!SaveSync::IsAvailable()) {
+			text = sy->T("This build of PPSSPP has no save sync.");
+		} else if (SaveSync::IsApplying()) {
+			text = sy->T("Connecting to the storage...");
+		} else if (std::string error = SaveSync::GetLastStartError(); !error.empty()) {
+			text = error;
+		} else if (!g_Config.bSaveSyncEnabled) {
+			text = sy->T("Off.");
+		} else if (!SaveSync::IsRunning()) {
+			text = sy->T("Not syncing: fill in the storage, access key ID and secret access key.");
+		} else if (std::string status = SaveSync::GetStatus(); !status.empty()) {
+			text = status;
+		} else {
+			text = sy->T("Syncing. Nothing has changed yet.");
+		}
+		SetText(text);
+		secret_->SetShadowText(SaveSync::HasSecret(SaveSync::SECRET_ACCESS_KEY) ? sy->T("Saved") : sy->T("Not set"));
+		passphrase_->SetShadowText(SaveSync::HasSecret(SaveSync::ENCRYPTION_PASSPHRASE) ? sy->T("Saved") : sy->T("None"));
+		SettingHint::Update();
+	}
+
+private:
+	UI::PopupTextInputChoice *secret_;
+	UI::PopupTextInputChoice *passphrase_;
+};
+
+}  // namespace
+
+// Save sync with emusync (Core/SaveSync.h): the storage and its keys, an optional encryption
+// passphrase, and a status line. Each change applies at once, in the background.
+void GameSettingsScreen::CreateSaveSyncSettings(UI::ViewGroup *systemSettings) {
+	using namespace UI;
+	auto sy = GetI18NCategory(I18NCat::SYSTEM);
+	auto di = GetI18NCategory(I18NCat::DIALOG);
+
+	systemSettings->Add(new ItemHeader(sy->T("Save sync")));
+	const auto apply = [](EventParams &) { SaveSync::ApplySettingsAsync(); };
+	const auto available = []() { return SaveSync::IsAvailable(); };
+
+	CheckBox *enabled = systemSettings->Add(new CheckBox(&g_Config.bSaveSyncEnabled, sy->T("Sync saves")));
+	enabled->OnClick.Add(apply);
+	enabled->SetEnabledFunc(available);
+	systemSettings->Add(new SettingHint(sy->T("Save sync Tip", "Saves made on your other devices are put on the memory stick before a game starts, and yours upload as the game saves them. Uses storage you own: Amazon S3 or an S3-compatible service."), enabled));
+
+	PopupTextInputChoice *storage = systemSettings->Add(new StorageAddressChoice(GetRequesterToken(), &g_Config.sSaveSyncRemoteURI, sy->T("Storage"), "s3://bucket/folder?region=eu-west-1", 512, screenManager()));
+	storage->OnChange.Add(apply);
+	storage->SetEnabledFunc(available);
+	systemSettings->Add(new SettingHint(sy->T("Save sync storage Tip", "Bucket and folder, e.g. s3://my-saves/emusync/v1?region=eu-west-1. Use the same on every device. S3-compatible services take an endpoint: s3://bucket/folder?endpoint=https://...&region=auto"), storage));
+
+	PopupTextInputChoice *keyId = systemSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sSaveSyncAccessKeyID, sy->T("Access key ID"), "", 128, screenManager()));
+	keyId->OnChange.Add(apply);
+	keyId->SetEnabledFunc(available);
+
+	// The field never holds the stored secret: what is typed is handed over, then cleared.
+	PopupTextInputChoice *secret = systemSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &saveSyncSecret_, sy->T("Secret access key"), "", 128, screenManager()));
+	secret->SetPasswordDisplay();
+	secret->SetEnabledFunc(available);
+	secret->OnChange.Add([this](EventParams &) {
+		std::string value(StripSpaces(saveSyncSecret_));
+		SaveSync::WipeSecret(saveSyncSecret_);
+		if (!value.empty())
+			SaveSync::ApplySettingsAsync({{SaveSync::SECRET_ACCESS_KEY, std::move(value)}});
+	});
+
+	PopupTextInputChoice *passphrase = systemSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &saveSyncPassphrase_, sy->T("Encryption passphrase"), "", 256, screenManager()));
+	passphrase->SetPasswordDisplay();
+	// Spaces at either end are part of a passphrase: it has to match on every device.
+	passphrase->SetKeepSpaces(true);
+	passphrase->SetEnabledFunc(available);
+	passphrase->OnChange.Add([this](EventParams &) {
+		// Not trimmed: spaces can be part of a passphrase, and it has to match on every device.
+		std::string value = saveSyncPassphrase_;
+		SaveSync::WipeSecret(saveSyncPassphrase_);
+		if (!value.empty())
+			SaveSync::ApplySettingsAsync({{SaveSync::ENCRYPTION_PASSPHRASE, std::move(value)}});
+	});
+	systemSettings->Add(new SettingHint(sy->T("Save sync passphrase Tip", "Optional. Encrypts your saves on this device before they upload, so the storage provider can't read them. Use the same passphrase on every device. It can't be recovered."), passphrase));
+
+	// Show displays a saved secret, e.g. to set up another device with it.
+	const auto show = [this](const char *name, std::string_view title) {
+		auto sy = GetI18NCategory(I18NCat::SYSTEM);
+		auto di = GetI18NCategory(I18NCat::DIALOG);
+		std::string error;
+		std::optional<std::string> value = SaveSync::LoadSecret(name, &error);
+		std::string message = value.has_value() ? *value : (error.empty() ? std::string(sy->T("Not set")) : error);
+		if (value.has_value())
+			SaveSync::WipeSecret(*value);
+		screenManager()->push(new MessagePopupScreen(title, message, di->T("OK"), ""));
+		SaveSync::WipeSecret(message);
+	};
+	Choice *showSecret = systemSettings->Add(new Choice(sy->T("Show secret access key")));
+	showSecret->OnClick.Add([show](EventParams &) {
+		auto sy = GetI18NCategory(I18NCat::SYSTEM);
+		show(SaveSync::SECRET_ACCESS_KEY, sy->T("Secret access key"));
+	});
+	// While a new one is being saved, the store may still hold the old one.
+	showSecret->SetEnabledFunc([]() { return SaveSync::HasSecret(SaveSync::SECRET_ACCESS_KEY) && !SaveSync::IsApplying(); });
+	Choice *showPassphrase = systemSettings->Add(new Choice(sy->T("Show encryption passphrase")));
+	showPassphrase->OnClick.Add([show](EventParams &) {
+		auto sy = GetI18NCategory(I18NCat::SYSTEM);
+		show(SaveSync::ENCRYPTION_PASSPHRASE, sy->T("Encryption passphrase"));
+	});
+	showPassphrase->SetEnabledFunc([]() { return SaveSync::HasSecret(SaveSync::ENCRYPTION_PASSPHRASE) && !SaveSync::IsApplying(); });
+	Choice *removePassphrase = systemSettings->Add(new Choice(sy->T("Remove encryption passphrase")));
+	removePassphrase->OnClick.Add([](EventParams &) {
+		SaveSync::ApplySettingsAsync({{SaveSync::ENCRYPTION_PASSPHRASE, std::string()}});
+	});
+	removePassphrase->SetEnabledFunc([]() { return SaveSync::HasSecret(SaveSync::ENCRYPTION_PASSPHRASE) && !SaveSync::IsApplying(); });
+
+	PopupTextInputChoice *deviceName = systemSettings->Add(new PopupTextInputChoice(GetRequesterToken(), &g_Config.sSaveSyncDeviceName, sy->T("Device name"), "", 64, screenManager()));
+	deviceName->SetShadowText(sy->T("This device's name"));
+	deviceName->OnChange.Add(apply);
+	deviceName->SetEnabledFunc(available);
+
+	Choice *syncNow = systemSettings->Add(new Choice(sy->T("Sync now")));
+	syncNow->OnClick.Add([](EventParams &) { SaveSync::SyncNow(); });
+	syncNow->SetEnabledFunc([]() { return SaveSync::IsRunning() && !SaveSync::IsApplying(); });
+
+	// Under Sync now, with the enabled state (and so the color) of the switch, which is on whenever
+	// the build has save sync.
+	systemSettings->Add(new SaveSyncStatusView(enabled, secret, passphrase));
 }
 
 void GameSettingsScreen::CreateVRSettings(UI::ViewGroup *vrSettings) {
