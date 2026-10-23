@@ -28,6 +28,12 @@ if [ -f ./build/librashader.so ]; then
 	cp -v ./build/librashader.so ./AppDir/bin
 fi
 
+# The same goes for emusync (save sync, Core/SaveSync.cpp), which cmake/EmuSync.cmake puts next to
+# PPSSPPSDL on x86_64.
+if [ -f ./build/libemusync.so ]; then
+	cp -v ./build/libemusync.so ./AppDir/bin
+fi
+
 # Make AppImage with uruntime
 ./quick-sharun --make-appimage
 
