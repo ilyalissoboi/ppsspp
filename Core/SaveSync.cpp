@@ -904,6 +904,15 @@ static std::string StartFromSettings(const Settings &s) {
 	c.remote_uri = std::string(StripSpaces(s.remoteUri));
 	c.access_key_id = std::string(StripSpaces(s.accessKeyId));
 	c.device_name = std::string(StripSpaces(s.deviceName));
+#if PPSSPP_PLATFORM(ANDROID)
+	// emusync names a device after its host name when none is set, and Android has none: use the
+	// model ("AYN Thor"), from the "manufacturer:model" PPSSPP keeps.
+	if (c.device_name.empty()) {
+		const std::string name = System_GetProperty(SYSPROP_NAME);
+		const size_t colon = name.find(':');
+		c.device_name = colon == std::string::npos ? name : name.substr(colon + 1);
+	}
+#endif
 	if (!s.enabled || c.remote_uri.empty() || c.access_key_id.empty()) {
 		Stop(2000);
 		return {};
