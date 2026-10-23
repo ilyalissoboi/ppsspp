@@ -107,6 +107,8 @@ jobs:
         cp Windows/*.bat ppsspp/
         cp -r assets ppsspp/assets
         cp build-librashader/librashader.dll ppsspp/
+        # Save sync (Windows/EmuSync.props puts emusync.dll next to the exe; x64 only).
+        if (Test-Path emusync.dll) { cp emusync.dll ppsspp/ }
 
     - name: Package headless (non-Win32)
       if: matrix.platform != 'Win32'
