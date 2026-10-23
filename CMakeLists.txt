@@ -1148,7 +1148,7 @@ else()
 	include_directories(ext/libchdr/include)
 endif()
 
-# Save sync (Core/SaveSync.h): defines emusync::emusync when it can.
+# Save sync (Core/SaveSync.h): the emusync library to put next to the program.
 include(cmake/EmuSync.cmake)
 
 add_subdirectory(GPU)

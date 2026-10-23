@@ -785,12 +785,6 @@ elseif(BUILD_BUNDLED_FFMPEG)
 	)
 endif()
 
-# Save sync with emusync (Core/SaveSync.h, cmake/EmuSync.cmake).
-if(EMUSYNC_FOUND)
-	target_link_libraries(Core emusync::emusync)
-	target_compile_definitions(Core PRIVATE USE_EMUSYNC)
-endif()
-
 # Discord integration
 if(USE_DISCORD AND NOT IOS AND NOT LIBRETRO)
 	target_link_libraries(Core discord-rpc)

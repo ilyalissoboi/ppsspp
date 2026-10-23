@@ -26,6 +26,13 @@
 #include "Core/SaveSync.h"
 #include "Core/System.h"
 
+// Save sync is built where emusync has a library: Windows (desktop), Linux, macOS and Android. The
+// library is loaded at run time (see LoadEmuSync()), so building needs only its header.
+#if !defined(__LIBRETRO__) && !PPSSPP_PLATFORM(UWP) && !PPSSPP_PLATFORM(IOS) && \
+	(PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(LINUX) || PPSSPP_PLATFORM(MAC))
+#define USE_EMUSYNC 1
+#endif
+
 namespace SaveSync {
 
 // ---- Common to both builds ----------------------------------------------------------------
@@ -124,17 +131,98 @@ void OnGameStopped() {}
 #include <shared_mutex>
 #include <thread>
 
-#include <emusync.h>
+#include "ext/emusync/include/emusync.h"
 
 #include "Common/Log.h"
 #include "Common/System/OSD.h"
-#ifdef _WIN32
+#include "Common/System/System.h"
+#if PPSSPP_PLATFORM(WINDOWS)
 #include "Common/CommonWindows.h"
+#else
+#include <dlfcn.h>
 #endif
 #include "Common/Thread/ThreadUtil.h"
 #include "Core/ELF/ParamSFO.h"
 
 namespace SaveSync {
+
+// ---- The library, loaded at run time -------------------------------------------------------
+//
+// From the emusync release PPSSPP pins (ext/emusync/README.md): emusync.dll next to PPSSPP on
+// Windows, libemusync.so next to it on Linux, libemusync.dylib in the app's Frameworks (or next to
+// the program) on macOS, and the APK's libemusync.so on Android 7.0 and later (the AAR's minimum).
+// A build or a device without it runs without save sync: IsAvailable() is false. Nothing links
+// against it, so on older Android it never stops PPSSPP from loading.
+
+#define ES_FUNCTIONS(X) \
+	X(es_abi_version) X(es_status_str) X(es_client_create) X(es_client_destroy) \
+	X(es_repo_create_encrypted) X(es_remote_add) X(es_event_set_notifier) X(es_event_poll) \
+	X(es_event_release) X(es_container_add) X(es_container_flushed) X(es_session_begin) \
+	X(es_session_end) X(es_app_suspend) X(es_app_resume) X(es_sync_now) X(es_secret_set) \
+	X(es_secret_get) X(es_secret_delete)
+
+struct EmuSyncApi {
+#define ES_POINTER(name) decltype(&::name) name = nullptr;
+	ES_FUNCTIONS(ES_POINTER)
+#undef ES_POINTER
+};
+static EmuSyncApi g_es;
+
+static void *OpenEmuSync() {
+#if PPSSPP_PLATFORM(WINDOWS)
+	HMODULE lib = LoadLibraryW((File::GetExeDirectory() / "emusync.dll").ToWString().c_str());
+	return lib ? lib : LoadLibraryW(L"emusync.dll");
+#elif PPSSPP_PLATFORM(ANDROID)
+	if (System_GetPropertyInt(SYSPROP_SYSTEMVERSION) < 24)
+		return nullptr;
+	return dlopen("libemusync.so", RTLD_NOW | RTLD_LOCAL);
+#else
+#if PPSSPP_PLATFORM(MAC)
+	const char *name = "libemusync.dylib";
+	const Path candidates[] = {File::GetExeDirectory() / ".." / "Frameworks" / name, File::GetExeDirectory() / name};
+#else
+	const char *name = "libemusync.so";
+	const Path candidates[] = {File::GetExeDirectory() / name};
+#endif
+	for (const Path &p : candidates) {
+		if (void *lib = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL))
+			return lib;
+	}
+	return dlopen(name, RTLD_NOW | RTLD_LOCAL);
+#endif
+}
+
+static void *EmuSyncSymbol(void *lib, const char *name) {
+#if PPSSPP_PLATFORM(WINDOWS)
+	return (void *)GetProcAddress((HMODULE)lib, name);
+#else
+	return dlsym(lib, name);
+#endif
+}
+
+// Loads the library once; never unloaded.
+static bool LoadEmuSync() {
+	static std::once_flag once;
+	static bool loaded = false;
+	std::call_once(once, [] {
+		void *lib = OpenEmuSync();
+		if (!lib) {
+			INFO_LOG(Log::System, "SaveSync: the emusync library isn't there; no save sync");
+			return;
+		}
+		bool all = true;
+#define ES_RESOLVE(name) g_es.name = reinterpret_cast<decltype(g_es.name)>(EmuSyncSymbol(lib, #name)); all = all && g_es.name;
+		ES_FUNCTIONS(ES_RESOLVE)
+#undef ES_RESOLVE
+		if (!all || g_es.es_abi_version() != ES_ABI_VERSION) {
+			WARN_LOG(Log::System, "SaveSync: the emusync library isn't the version PPSSPP was built for; no save sync");
+			g_es = {};
+			return;
+		}
+		loaded = true;
+	});
+	return loaded;
+}
 
 // How long boot waits for the network before the game starts with the saves as they are.
 static constexpr uint32_t BOOT_SYNC_TIMEOUT_MS = 3000;
@@ -278,9 +366,9 @@ static es_container_id RegisterSavedata() {
 	desc.card = "SAVEDATA";
 	desc.flags = ES_CF_REPLACE;
 	es_container_id id = 0;
-	const es_status st = es_container_add(s_client, &desc, &id);
+	const es_status st = g_es.es_container_add(s_client, &desc, &id);
 	if (st != ES_OK) {
-		WARN_LOG(Log::System, "SaveSync: not syncing %s: %s", location.c_str(), es_status_str(st));
+		WARN_LOG(Log::System, "SaveSync: not syncing %s: %s", location.c_str(), g_es.es_status_str(st));
 		return 0;
 	}
 	return id;
@@ -305,9 +393,9 @@ static es_session_id BeginSession(es_container_id container, const std::string &
 	args.mounted_count = 1;
 	args.timeout_ms = timeoutMs;
 	*info = ES_SESSION_INFO_INIT;
-	const es_status st = es_session_begin(s_client, &args, info);
+	const es_status st = g_es.es_session_begin(s_client, &args, info);
 	if (st < 0) {
-		WARN_LOG(Log::System, "SaveSync: could not start syncing the memory stick in use: %s", es_status_str(st));
+		WARN_LOG(Log::System, "SaveSync: could not start syncing the memory stick in use: %s", g_es.es_status_str(st));
 		return 0;
 	}
 	return info->id;
@@ -324,7 +412,7 @@ static void EndSession() {
 		playedMs = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - s_sessionStarted).count();
 	}
 	if (id != 0)
-		es_session_end(s_client, id, playedMs);
+		g_es.es_session_end(s_client, id, playedMs);
 }
 
 // Starts following the memory stick of a running game, when sync starts mid-game. Never waits for
@@ -353,7 +441,7 @@ static std::string DescribeEvent(const es_event &ev) {
 			return StringFromFormat("Synced at %s.", TimeOfDay().c_str());
 		if (ev.status == ES_OFFLINE)
 			return StringFromFormat("Offline at %s: changes upload once the storage can be reached.", TimeOfDay().c_str());
-		return StringFromFormat("Sync failed at %s: %s", TimeOfDay().c_str(), ev.message ? ev.message : es_status_str(ev.status));
+		return StringFromFormat("Sync failed at %s: %s", TimeOfDay().c_str(), ev.message ? ev.message : g_es.es_status_str(ev.status));
 	case ES_EV_UNIT_APPLIED:
 		return StringFromFormat("Updated %s%s at %s.", save,
 			ev.device_name ? StringFromFormat(" from %s", ev.device_name).c_str() : "", TimeOfDay().c_str());
@@ -362,11 +450,11 @@ static std::string DescribeEvent(const es_event &ev) {
 			return StringFromFormat("%s does not fit on the memory stick.", save);
 		if (ev.status == ES_E_BUSY)
 			return {};  // the memory stick is in use; it is applied when the game ends
-		return StringFromFormat("Could not update %s: %s", save, ev.message ? ev.message : es_status_str(ev.status));
+		return StringFromFormat("Could not update %s: %s", save, ev.message ? ev.message : g_es.es_status_str(ev.status));
 	case ES_EV_AUTH_REQUIRED:
 		return "The storage rejected the access key. Check it in the save sync settings.";
 	case ES_EV_ERROR:
-		return StringFromFormat("Sync error: %s", ev.message ? ev.message : es_status_str(ev.status));
+		return StringFromFormat("Sync error: %s", ev.message ? ev.message : g_es.es_status_str(ev.status));
 	default:
 		return {};
 	}
@@ -375,7 +463,7 @@ static std::string DescribeEvent(const es_event &ev) {
 // Drains emusync's events into the log and the status line. Needs the client lock (shared).
 static void DrainEvents() {
 	es_event ev = ES_EVENT_INIT;
-	while (es_event_poll(s_client, &ev) == 1) {
+	while (g_es.es_event_poll(s_client, &ev) == 1) {
 		std::string text = DescribeEvent(ev);
 		if (ev.type == ES_EV_UNIT_APPLIED || ev.type == ES_EV_UNIT_UPLOADED) {
 			INFO_LOG(Log::System, "SaveSync: %s %s", ev.type == ES_EV_UNIT_APPLIED ? "applied" : "uploaded", ev.unit_id ? ev.unit_id : "?");
@@ -384,7 +472,7 @@ static void DrainEvents() {
 		}
 		if (!text.empty())
 			SetStatus(std::move(text));
-		es_event_release(s_client, &ev);
+		g_es.es_event_release(s_client, &ev);
 		ev = ES_EVENT_INIT;
 	}
 }
@@ -415,16 +503,16 @@ static void WorkerLoop() {
 				container = s_container;
 			}
 			if (container != 0)
-				es_container_flushed(s_client, container);
+				g_es.es_container_flushed(s_client, container);
 		}
 		if (background.has_value()) {
 			if (*background)
-				es_app_suspend(s_client, SUSPEND_UPLOAD_MS);
+				g_es.es_app_suspend(s_client, SUSPEND_UPLOAD_MS);
 			else
-				es_app_resume(s_client);
+				g_es.es_app_resume(s_client);
 		}
 		if (std::chrono::steady_clock::now() >= nextSync) {
-			es_sync_now(s_client);
+			g_es.es_sync_now(s_client);
 			nextSync = std::chrono::steady_clock::now() + PERIODIC_SYNC;
 		}
 		DrainEvents();
@@ -448,8 +536,8 @@ static void StopLocked(std::unique_lock<std::shared_mutex> &client, uint32_t tim
 		s_worker.join();
 	client.lock();
 
-	es_event_set_notifier(s_client, nullptr, nullptr);
-	es_client_destroy(s_client, timeoutMs);
+	g_es.es_event_set_notifier(s_client, nullptr, nullptr);
+	g_es.es_client_destroy(s_client, timeoutMs);
 	s_client = nullptr;
 
 	{
@@ -466,17 +554,11 @@ static void StopLocked(std::unique_lock<std::shared_mutex> &client, uint32_t tim
 }
 
 bool IsAvailable() {
-#ifdef _WIN32
-	// emusync.dll is delay-loaded (Windows/EmuSync.props): a call into it without the DLL would
-	// crash, so every path into emusync checks this first.
-	static const bool loaded = LoadLibraryW(L"emusync.dll") != nullptr;
-	return loaded;
-#else
-	return true;
-#endif
+	// Every path into emusync checks this first: the table is empty without the library.
+	return LoadEmuSync();
 }
 
-static constexpr const char *NO_LIBRARY = "Save sync needs emusync.dll next to PPSSPP.";
+static constexpr const char *NO_LIBRARY = "This build of PPSSPP has no emusync library, or this device is too old for it (save sync needs Android 7.0).";
 
 bool Start(const Config &config, std::string *error) {
 	if (!IsAvailable()) {
@@ -504,10 +586,10 @@ bool Start(const Config &config, std::string *error) {
 	cfg.conflict_policy = ES_POLICY_NEWEST;
 	cfg.log = &LogMessage;
 	cfg.log_level = ES_LOG_INFO;
-	es_status st = es_client_create(&cfg, &s_client);
+	es_status st = g_es.es_client_create(&cfg, &s_client);
 	if (st != ES_OK) {
 		if (error)
-			*error = StringFromFormat("Could not open the sync data in %s: %s", config.data_dir.c_str(), es_status_str(st));
+			*error = StringFromFormat("Could not open the sync data in %s: %s", config.data_dir.c_str(), g_es.es_status_str(st));
 		s_client = nullptr;
 		// StopLocked() returns early without a client, so this is the only place the copied keys can
 		// go.
@@ -520,10 +602,10 @@ bool Start(const Config &config, std::string *error) {
 	const bool encrypted = !config.passphrase.empty();
 	// Applies to the es_remote_add below: create the storage encrypted, or unlock it.
 	if (encrypted)
-		st = es_repo_create_encrypted(s_client, config.passphrase.c_str());
+		st = g_es.es_repo_create_encrypted(s_client, config.passphrase.c_str());
 	const es_credential_provider creds = {nullptr, &GetCredentials};
 	if (st == ES_OK)
-		st = es_remote_add(s_client, config.remote_uri.c_str(), &creds);
+		st = g_es.es_remote_add(s_client, config.remote_uri.c_str(), &creds);
 	// Locked: encrypted storage this device has no key for, and no passphrase was given. The remote
 	// is added; sync runs and snapshots the saves, and uploads once it is unlocked.
 	if (st != ES_OK && st != ES_OFFLINE && st != ES_E_LOCKED) {
@@ -540,9 +622,9 @@ bool Start(const Config &config, std::string *error) {
 			else if (st == ES_E_INVALID_ARG)
 				*error = "The storage address is not valid.";
 			else
-				*error = StringFromFormat("Could not use the storage: %s", es_status_str(st));
+				*error = StringFromFormat("Could not use the storage: %s", g_es.es_status_str(st));
 		}
-		es_client_destroy(s_client, 0);
+		g_es.es_client_destroy(s_client, 0);
 		s_client = nullptr;
 		std::lock_guard<std::mutex> lock(s_stateLock);
 		WipeSecret(s_config.secret_access_key);
@@ -557,7 +639,7 @@ bool Start(const Config &config, std::string *error) {
 		s_workerStop = false;
 		s_workerWake = false;
 	}
-	es_event_set_notifier(s_client, &OnEventsWaiting, nullptr);
+	g_es.es_event_set_notifier(s_client, &OnEventsWaiting, nullptr);
 	s_worker = std::thread(&WorkerLoop);
 
 	// A game already running keeps its saves: follow them without touching them. One starting counts
@@ -574,7 +656,7 @@ bool Start(const Config &config, std::string *error) {
 		std::lock_guard<std::mutex> lock(s_stateLock);
 		s_container = container;
 	}
-	es_sync_now(s_client);
+	g_es.es_sync_now(s_client);
 	NOTICE_LOG(Log::System, "SaveSync: syncing saves with %s", config.remote_uri.c_str());
 	return true;
 }
@@ -598,7 +680,7 @@ std::string GetStatus() {
 void SyncNow() {
 	std::shared_lock<std::shared_mutex> client(s_clientLock);
 	if (s_client)
-		es_sync_now(s_client);
+		g_es.es_sync_now(s_client);
 }
 
 void SetAppBackgrounded(bool backgrounded) {
@@ -619,11 +701,11 @@ bool StoreSecret(const char *name, const std::string &value, std::string *error)
 	}
 	// Without a Secret Service (Linux), the secret goes to a file only this user can read here.
 	const std::string fallback = DataRoot().ToString();
-	const es_status st = value.empty() ? es_secret_delete(SECRET_SERVICE, name, fallback.c_str()) :
-	                                     es_secret_set(SECRET_SERVICE, name, value.c_str(), fallback.c_str());
+	const es_status st = value.empty() ? g_es.es_secret_delete(SECRET_SERVICE, name, fallback.c_str()) :
+	                                     g_es.es_secret_set(SECRET_SERVICE, name, value.c_str(), fallback.c_str());
 	if (st != ES_OK) {
 		if (error)
-			*error = StringFromFormat("Could not store the secret in the system's credential store: %s", es_status_str(st));
+			*error = StringFromFormat("Could not store the secret in the system's credential store: %s", g_es.es_status_str(st));
 		return false;
 	}
 	const std::string_view n = name;
@@ -643,7 +725,7 @@ std::optional<std::string> LoadSecret(const char *name, std::string *error) {
 	std::string buf(SECRET_BUFFER, '\0');
 	size_t len = 0;
 	const std::string fallback = DataRoot().ToString();
-	const es_status st = es_secret_get(SECRET_SERVICE, name, fallback.c_str(), buf.data(), buf.size(), &len);
+	const es_status st = g_es.es_secret_get(SECRET_SERVICE, name, fallback.c_str(), buf.data(), buf.size(), &len);
 	if (st == ES_E_NOT_FOUND) {
 		WipeSecret(buf);
 		return std::nullopt;
@@ -651,7 +733,7 @@ std::optional<std::string> LoadSecret(const char *name, std::string *error) {
 	if (st != ES_OK) {
 		WipeSecret(buf);
 		if (error)
-			*error = StringFromFormat("Could not read the secret from the system's credential store: %s", es_status_str(st));
+			*error = StringFromFormat("Could not read the secret from the system's credential store: %s", g_es.es_status_str(st));
 		return std::nullopt;
 	}
 	std::string value(buf.c_str());
