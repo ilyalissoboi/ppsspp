@@ -61,6 +61,7 @@ TopBar::TopBar(const UIContext &ctx, TopBarFlags flags, std::string_view title, 
 		backButton_->OnClick.Add([](UI::EventParams &e) {
 			e.bubbleResult = DR_BACK;
 		});
+		backButton_->SetRoundCorners();
 	} else {
 		Add(new Spacer(4.0f));
 	}
@@ -78,6 +79,7 @@ TopBar::TopBar(const UIContext &ctx, TopBarFlags flags, std::string_view title, 
 		contextMenuButton_->OnClick.Add([this](UI::EventParams &e) {
 			this->OnContextMenuClick.Trigger(e);
 		});
+		contextMenuButton_->SetRoundCorners();
 	}
 }
 
@@ -131,6 +133,10 @@ private:
 	int textureHeight_ = 0;
 };
 
+UI::View *CreateGameIconView(const Path &gamePath, UI::LayoutParams *layoutParams) {
+	return new SimpleGameIconView(gamePath, layoutParams);
+}
+
 PaneTitleBar::PaneTitleBar(const Path &gamePath, std::string_view title, const std::string_view settingsCategory, UI::LayoutParams *layoutParams) 
 	: UI::LinearLayout(ORIENT_HORIZONTAL, layoutParams), gamePath_(gamePath) {
 	using namespace UI;
@@ -143,7 +149,7 @@ PaneTitleBar::PaneTitleBar(const Path &gamePath, std::string_view title, const s
 	auto dlg = GetI18NCategory(I18NCat::DIALOG);
 
 	if (!title.empty()) {
-		SimpleTextView *titleView = Add(new SimpleTextView(title, new LinearLayoutParams(0.0f, Gravity::G_VCENTER, Margins(8, 0, 20, 0))));
+		SimpleTextView *titleView = Add(new SimpleTextView(title, new LinearLayoutParams(0.0f, Gravity::G_VCENTER, Margins(12, 0, 20, 0))));
 		titleView->SetBig(true);
 		// If using HCENTER, to balance the centering, add a spacer on the right.
 	}
@@ -299,7 +305,7 @@ void GameInfoBGView::Draw(UIContext &dc) {
 SettingHint::SettingHint(std::string_view text, UI::View *setting)
 	: UI::TextView(text, new UI::LinearLayoutParams(UI::FILL_PARENT, UI::WRAP_CONTENT)), setting_(setting) {
 	SetTextSize(UI::TextSize::Tiny);
-	SetPadding(UI::Margins(14, 0, 12, 8));
+	SetPadding(UI::Margins(12, 0, 12, 8));
 	SetAlign(FLAG_WRAP_TEXT);
 }
 
@@ -307,7 +313,9 @@ void SettingHint::Draw(UIContext &dc) {
 	const bool enabled = setting_ ? setting_->IsEnabled() : true;
 	const UI::Style &style = enabled ? dc.GetTheme().itemStyle : dc.GetTheme().itemDisabledStyle;
 	SetTextColor(style.fgColor);  // bit hacky but works
-	dc.FillRect(style.background, bounds_);
+	if (setting_) {
+		dc.FillRoundRect(style.background, bounds_, dc.GetTheme().choiceRoundRadius, roundCorners_);
+	}
 	UI::TextView::Draw(dc);
 }
 
@@ -482,8 +490,13 @@ bool ViewSearch::Key(UI::ViewGroup *viewGroup, const KeyInput &input) {
 	} else if (input.flags & KeyInputFlags::DOWN) {
 		if (input.keyCode == NKCODE_DEL) {
 			if (!searchFilter.empty()) {
-				if (input.flags & KeyInputFlags::ModCtrl) {
-					// Ctrl+Backspace deletes the last word. Delete until the last space.
+#if PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)
+				const KeyInputFlags wordMod = KeyInputFlags::ModAlt;
+#else
+				const KeyInputFlags wordMod = KeyInputFlags::ModCtrl;
+#endif
+				if (input.flags & wordMod) {
+					// Ctrl+Backspace (Option+Backspace on Apple) deletes the last word. Delete until the last space.
 					size_t pos = searchFilter.find_last_of(' ');
 					if (pos != searchFilter.npos) {
 						searchFilter.erase(pos);
@@ -502,9 +515,8 @@ bool ViewSearch::Key(UI::ViewGroup *viewGroup, const KeyInput &input) {
 					// TODO: Restore focus state here.
 					UI::EnableFocusMovement(false);
 				}
-			} else {
-				// Empty search filter. Navigate upwards on backspace?
 			}
+			// With an empty filter, it's up to the owner (the game browser goes up a directory).
 		} else if (!searchFilter.empty() && input.keyCode == NKCODE_ESCAPE) {
 			searchFilter.clear();
 			ApplySearchFilter(viewGroup, false);

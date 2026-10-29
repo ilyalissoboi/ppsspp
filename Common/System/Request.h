@@ -183,6 +183,19 @@ inline void System_ShareFile(const Path &path, std::string_view mimeType = "") {
 	g_requestManager.MakeSystemRequest(SystemRequestType::SHARE_FILE, NO_REQUESTER_TOKEN, nullptr, nullptr, path.ToString(), mimeType, 0);
 }
 
+// Talking to other devices on the local network (in either direction) needs a runtime permission on
+// Android 17+. Asks for it unless it's granted or already being asked for. Returns true if granted.
+inline bool System_RequestLocalNetworkPermission() {
+	PermissionStatus status = System_GetPermissionStatus(SYSTEM_PERMISSION_LOCAL_NETWORK);
+	if (status == PERMISSION_STATUS_GRANTED) {
+		return true;
+	}
+	if (status != PERMISSION_STATUS_PENDING) {
+		System_AskForPermission(SYSTEM_PERMISSION_LOCAL_NETWORK);
+	}
+	return false;
+}
+
 // TEXT_GOTFOCUS/TEXT_LOSTFOCUS (and POPUP_CLOSED) sent through here count as the regular UI's use of text input.
 void System_NotifyUIEvent(UIEventNotification notification);
 
@@ -194,6 +207,14 @@ enum class TextInputUser {
 	COUNT,
 };
 void System_SetTextInputWanted(TextInputUser user, bool wanted);
+
+// Keeps the soft keyboard up (typing as key and char events) until called with false. With keepAfterAppSwitch,
+// it comes back after switching to another app and back, otherwise the platform drops it then. When the platform
+// closes it, it posts UIMessage::SOFT_KEYBOARD_HIDDEN. Only Android implements this so far, though other platforms
+// with SYSPROP_KEYBOARD_IS_SOFT should.
+inline void System_SetSoftKeyboardForced(bool forced, bool keepAfterAppSwitch) {
+	g_requestManager.MakeSystemRequest(SystemRequestType::SET_SOFT_KEYBOARD_FORCED, NO_REQUESTER_TOKEN, nullptr, nullptr, "", "", (int64_t)forced, (int64_t)keepAfterAppSwitch);
+}
 
 inline void System_SetKeepScreenBright(bool keepScreenBright) {
 	g_requestManager.MakeSystemRequest(SystemRequestType::SET_KEEP_SCREEN_BRIGHT, NO_REQUESTER_TOKEN, nullptr, nullptr, "", "", (int64_t)keepScreenBright);

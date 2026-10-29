@@ -459,6 +459,10 @@ public:
 	bool CopyFramebufferToMemory(Framebuffer *src, Aspect aspects, int x, int y, int w, int h, Draw::DataFormat format, void *pixels, int pixelStride, ReadbackMode mode, const char *tag) override;
 	DataFormat PreferredFramebufferReadbackFormat(Framebuffer *src) override;
 
+	Swapchain *CreateSwapchain(const SwapchainDesc &desc, std::string *error) override;
+	void DestroySwapchain(Swapchain *swapchain) override;
+	void ResizeSwapchain(Swapchain *swapchain, int width, int height) override;
+
 	// These functions should be self explanatory.
 	void BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) override;
 	void BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect channelBit, int layer) override;
@@ -747,7 +751,7 @@ VulkanTexture *VKContext::GetNullTexture() {
 		TextureCopyBatch batch;
 		nullTexture_->CopyBufferToMipLevel(cmdInit, &batch, 0, w, h, 0, bindBuf, bindOffset, w);
 		nullTexture_->FinishCopyBatch(cmdInit, &batch);
-		nullTexture_->EndCreate(cmdInit, false, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		nullTexture_->EndCreate(cmdInit, VK_PIPELINE_STAGE_TRANSFER_BIT);
 	}
 	return nullTexture_;
 }
@@ -853,7 +857,7 @@ bool VKTexture::Create(VkCommandBuffer cmd, VulkanBarrierBatch *postBarriers, Vu
 			layout = VK_IMAGE_LAYOUT_GENERAL;
 		}
 	}
-	vkTex_->EndCreate(cmd, false, VK_PIPELINE_STAGE_TRANSFER_BIT, layout);
+	vkTex_->EndCreate(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, layout);
 	return true;
 }
 
@@ -959,7 +963,6 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	caps_.coordConvention = CoordConvention::Vulkan;
 	caps_.setMaxFrameLatencySupported = true;
 	caps_.anisoSupported = vulkan->GetDeviceFeatures().enabled.standard.samplerAnisotropy != 0;
-	caps_.tesselationShaderSupported = vulkan->GetDeviceFeatures().enabled.standard.tessellationShader != 0;
 	caps_.dualSourceBlend = vulkan->GetDeviceFeatures().enabled.standard.dualSrcBlend != 0;
 	caps_.depthClampSupported = vulkan->GetDeviceFeatures().enabled.standard.depthClamp != 0;
 
@@ -1003,6 +1006,8 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	caps_.presentMaxInterval = 1;
 	caps_.presentInstantModeChange = false;  // TODO: Fix this with some work in VulkanContext
 	caps_.presentModesSupported = (PresentMode)0;
+	// Additional swapchains go with a real main one.
+	caps_.multipleSwapchains = vulkan->GetPresentation() == nullptr;
 
 	if (vulkan->GetPresentation()) {
 		// No real present modes exist in this model (the host, e.g. libretro, owns real presentation
@@ -1833,6 +1838,24 @@ uint32_t VKContext::GetDataFormatSupport(DataFormat fmt) const {
 // It also has a reference to the command buffer that it was last rendered to with.
 // If it needs to be transitioned, and the frame number matches, use it, otherwise
 // use this frame's init command buffer.
+class VKSwapchain : public Swapchain {
+public:
+	VKSwapchain(VKRSwapchain *swapchain, const char *tag) : swapchain(swapchain), tag_(tag ? tag : "") {
+		UpdateSize();
+	}
+	// The render manager recreates it when it's out of date, possibly at another size.
+	void UpdateSize() {
+		width_ = swapchain->extent.width;
+		height_ = swapchain->extent.height;
+	}
+	const char *Tag() const override { return tag_.c_str(); }
+
+	VKRSwapchain *swapchain;
+
+private:
+	std::string tag_;
+};
+
 class VKFramebuffer : public Framebuffer {
 public:
 	VKFramebuffer(VKRFramebuffer *fb, int multiSampleLevel) : buf_(fb) {
@@ -1841,6 +1864,7 @@ public:
 		height_ = fb->height;
 		layers_ = fb->numLayers;
 		multiSampleLevel_ = multiSampleLevel;
+		hasDepthStencil_ = fb->HasDepth();
 	}
 	~VKFramebuffer() {
 		_assert_msg_(buf_, "Null buf_ in VKFramebuffer - double delete?");
@@ -1920,6 +1944,11 @@ bool VKContext::RunNativeCallback(Framebuffer *srcfb, Framebuffer *dstfb, Native
 }
 
 bool VKContext::CopyFramebufferToMemory(Framebuffer *srcfb, Aspect aspects, int x, int y, int w, int h, Draw::DataFormat format, void *pixels, int pixelStride, ReadbackMode mode, const char *tag) {
+	srcfb = PrimaryToNull(srcfb);
+	if (srcfb && srcfb->IsSwapchain()) {
+		// Not supported for additional swapchains.
+		return false;
+	}
 	VKFramebuffer *src = (VKFramebuffer *)srcfb;
 	if (!src && vulkan_->GetSwapchain() == VK_NULL_HANDLE) {
 		// No backbuffer to read, as in headless.
@@ -1935,6 +1964,7 @@ bool VKContext::CopyFramebufferToMemory(Framebuffer *srcfb, Aspect aspects, int 
 }
 
 DataFormat VKContext::PreferredFramebufferReadbackFormat(Framebuffer *src) {
+	src = PrimaryToNull(src);
 	if (src) {
 		return DrawContext::PreferredFramebufferReadbackFormat(src);
 	}
@@ -1946,18 +1976,29 @@ DataFormat VKContext::PreferredFramebufferReadbackFormat(Framebuffer *src) {
 }
 
 void VKContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) {
+	fbo = PrimaryToNull(fbo);
 	_dbg_assert_(fbo != nullptr || equals(tag, "BackBuffer"))
 
-	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	VKRRenderPassLoadAction color = (VKRRenderPassLoadAction)rp.color;
 	VKRRenderPassLoadAction depth = (VKRRenderPassLoadAction)rp.depth;
 	VKRRenderPassLoadAction stencil = (VKRRenderPassLoadAction)rp.stencil;
+
+	if (fbo && fbo->IsSwapchain()) {
+		VKSwapchain *swapchain = (VKSwapchain *)fbo;
+		swapchain->UpdateSize();
+		renderManager_.BindFramebufferAsRenderTarget(nullptr, color, depth, stencil, rp.clearColor, rp.clearDepth, rp.clearStencil, tag, swapchain->swapchain);
+		curFramebuffer_ = nullptr;
+		return;
+	}
+
+	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 
 	renderManager_.BindFramebufferAsRenderTarget(fb ? fb->GetFB() : nullptr, color, depth, stencil, rp.clearColor, rp.clearDepth, rp.clearStencil, tag);
 	curFramebuffer_ = fb;
 }
 
 void VKContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect channelBit, int layer) {
+	_dbg_assert_(fbo && !fbo->IsSwapchain());
 	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	_assert_(binding >= 0 && binding < MAX_BOUND_TEXTURES);
 
@@ -1984,6 +2025,7 @@ void VKContext::BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect c
 }
 
 void VKContext::BindFramebufferSamplesAsTexture(Framebuffer *fbo, int binding, int layer) {
+	_dbg_assert_(fbo && !fbo->IsSwapchain());
 	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	_assert_(binding >= 0 && binding < MAX_BOUND_TEXTURES);
 	_assert_(fb != curFramebuffer_);
@@ -1992,6 +2034,13 @@ void VKContext::BindFramebufferSamplesAsTexture(Framebuffer *fbo, int binding, i
 }
 
 void VKContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
+	fbo = PrimaryToNull(fbo);
+	if (fbo && fbo->IsSwapchain()) {
+		const VKRSwapchain *swapchain = ((VKSwapchain *)fbo)->swapchain;
+		*w = swapchain->extent.width;
+		*h = swapchain->extent.height;
+		return;
+	}
 	VKFramebuffer *fb = (VKFramebuffer *)fbo;
 	if (fb) {
 		*w = fb->GetFB()->width;
@@ -2002,6 +2051,30 @@ void VKContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
 	}
 }
 
+Swapchain *VKContext::CreateSwapchain(const SwapchainDesc &desc, std::string *error) {
+	VKRSwapchain *swapchain = renderManager_.CreateExtraSwapchain(desc.winsys, desc.data1, desc.data2, desc.width, desc.height, error);
+	return swapchain ? new VKSwapchain(swapchain, desc.tag) : nullptr;
+}
+
+void VKContext::DestroySwapchain(Swapchain *swapchain) {
+	_dbg_assert_(swapchain && swapchain != primarySwapchain_);
+	VKSwapchain *vkSwapchain = (VKSwapchain *)swapchain;
+	renderManager_.DestroyExtraSwapchain(vkSwapchain->swapchain);
+	vkSwapchain->swapchain = nullptr;
+	// Nothing else may hold it, it no longer has a swapchain to be.
+	vkSwapchain->ReleaseAssertLast();
+}
+
+void VKContext::ResizeSwapchain(Swapchain *swapchain, int width, int height) {
+	if (swapchain == primarySwapchain_) {
+		// Goes through GraphicsContext::Resize.
+		return;
+	}
+	VKSwapchain *vkSwapchain = (VKSwapchain *)swapchain;
+	renderManager_.ResizeExtraSwapchain(vkSwapchain->swapchain, width, height);
+	vkSwapchain->UpdateSize();
+}
+
 void VKContext::HandleEvent(Event ev, int width, int height, void *param1, void *param2) {
 	switch (ev) {
 	case Event::LOST_BACKBUFFER:
@@ -2009,6 +2082,7 @@ void VKContext::HandleEvent(Event ev, int width, int height, void *param1, void 
 		break;
 	case Event::GOT_BACKBUFFER:
 		renderManager_.CreateBackbuffers();
+		primarySwapchain_->SetSize(vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
 		break;
 	default:
 		_assert_(false);

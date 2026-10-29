@@ -28,6 +28,7 @@ SDLJoystick *joystick = NULL;
 #include "Common/System/System.h"
 #include "Common/System/Request.h"
 #include "Common/System/NativeApp.h"
+#include "Common/GPU/thin3d.h"
 #include "Common/Audio/AudioBackend.h"
 #include "Core/CmdLine.h"
 #include "Core/EmuThread.h"
@@ -75,6 +76,8 @@ SDLJoystick *joystick = NULL;
 #if PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)
 #include "Core/Util/DarwinFileSystemServices.h"
 #include "SDL/SDLCocoaMetalLayer.h"
+#include "Common/GPU/Metal/MetalGraphicsContext.h"
+#include <SDL3/SDL_metal.h>
 #endif
 
 #if PPSSPP_PLATFORM(MAC)
@@ -126,7 +129,8 @@ struct WindowState {
 static WindowState g_windowState;
 
 #if !PPSSPP_PLATFORM(MAC)
-static int g_batteryPercent = 0;
+// -1 until polled, or without a battery.
+static int g_batteryPercent = -1;
 #endif
 
 #if PPSSPP_PLATFORM(MAC)
@@ -740,8 +744,8 @@ AudioBackend *System_CreateAudioBackend() {
 static void InitializeFilters(std::vector<std::string> &filters, BrowseFileType type) {
 	switch (type) {
 	case BrowseFileType::BOOTABLE:
-		filters.push_back("All supported file types (*.iso *.cso *.chd *.pbp *.elf *.prx *.zip *.ppdmp)");
-		filters.push_back("*.pbp *.elf *.iso *.cso *.chd *.prx *.zip *.ppdmp");
+		filters.push_back("All supported file types (*.iso *.cso *.chd *.pbp *.elf *.prx *.zip *.ppdmp *.cue *.ccd *.mds *.mdf *.bin *.img)");
+		filters.push_back("*.pbp *.elf *.iso *.cso *.chd *.prx *.zip *.ppdmp *.cue *.ccd *.mds *.mdf *.bin *.img");
 		break;
 	case BrowseFileType::SAVE_STATE:
 		filters.push_back("Save state files (*.ppst)");
@@ -1114,6 +1118,10 @@ void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {
 
 std::string System_GetProperty(SystemProperty prop) {
 	switch (prop) {
+#if PPSSPP_PLATFORM(MAC)
+	case SYSPROP_DEVICE_MODEL:
+		return "Mac";
+#endif
 	case SYSPROP_NAME:
 #ifdef _WIN32
 		return "SDL:Windows";
@@ -1435,7 +1443,78 @@ void UpdateCursor() {
 	SDL_SetCursor(g_builtinCursors[(int)curCursor]);
 }
 
+// --game-window: a second window showing just the game. For now it's only a way to test multiple outputs on
+// the desktop, standing in for a TV over AirPlay. Later, real multi-window support (like ImGui's multi-viewports)
+// will take this over.
+static SDL_Window *g_gameWindow = nullptr;
+static int g_gameOutputId = 0;
+
+static void CreateGameWindow() {
+	Draw::SwapchainDesc desc{};
+	desc.tag = "GameWindow";
+	const GPUBackend backend = (GPUBackend)g_Config.iGPUBackend;
+	if (backend == GPUBackend::VULKAN) {
+		g_gameWindow = SDL_CreateWindow("PPSSPP game", 960, 544, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+		WindowDesc windowDesc{};
+		std::string error;
+		if (g_gameWindow && !DetermineVulkanWindowSystem(g_gameWindow, &windowDesc, &error)) {
+			fprintf(stderr, "Can't use the game window: %s\n", error.c_str());
+			SDL_DestroyWindow(g_gameWindow);
+			g_gameWindow = nullptr;
+			return;
+		}
+		desc.winsys = windowDesc.winsys;
+		desc.data1 = windowDesc.data1;
+		desc.data2 = windowDesc.data2;
+#if PPSSPP_PLATFORM(MAC)
+	} else if (backend == GPUBackend::METAL) {
+		g_gameWindow = SDL_CreateWindow("PPSSPP game", 960, 544, SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+		if (g_gameWindow) {
+			desc.winsys = WINDOWSYSTEM_METAL_EXT;
+			desc.data1 = SDL_Metal_GetLayer(SDL_Metal_CreateView(g_gameWindow));
+		}
+#endif
+	} else {
+		// TODO: Windows (D3D11) and OpenGL.
+		fprintf(stderr, "--game-window needs Vulkan, or Metal on Mac\n");
+		return;
+	}
+	if (!g_gameWindow) {
+		fprintf(stderr, "Error creating the game window: %s\n", SDL_GetError());
+		return;
+	}
+	SDL_GetWindowSizeInPixels(g_gameWindow, &desc.width, &desc.height);
+	g_gameOutputId = Native_AddOutput(OutputRole::Game, desc);
+}
+
+// Returns true if the event was for the game window, and has been handled. Keys still go to the emulator.
+static bool ProcessGameWindowEvent(const SDL_Event &event) {
+	if (!g_gameWindow || SDL_GetWindowFromEvent(&event) != g_gameWindow) {
+		return false;
+	}
+	switch (event.type) {
+	case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+		Native_ResizeOutput(g_gameOutputId, event.window.data1, event.window.data2);
+		return true;
+	case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+		// The layer has to outlive the swapchain, so the window stays until we quit.
+		Native_RemoveOutput(g_gameOutputId);
+		SDL_HideWindow(g_gameWindow);
+		return true;
+	case SDL_EVENT_KEY_DOWN:
+	case SDL_EVENT_KEY_UP:
+	case SDL_EVENT_TEXT_INPUT:
+		return false;
+	default:
+		// Window events, and the mouse, which the UI in the main window would get the coordinates wrong for.
+		return true;
+	}
+}
+
 static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputStateTracker *inputTracker) {
+	if (ProcessGameWindowEvent(event)) {
+		return;
+	}
 	// SDL input uses window coordinates; convert to pixels before applying the UI scale.
 	float inputPixelDensity = SDL_GetWindowPixelDensity(window);
 	if (inputPixelDensity <= 0.0f) {
@@ -1444,6 +1523,13 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 	switch (event.type) {
 	case SDL_EVENT_QUIT:
 		g_QuitRequested = 1;
+		break;
+
+	case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+		// SDL only sends a quit when the last window closes, and --game-window's may still be open.
+		if (SDL_GetWindowFromEvent(&event) == window) {
+			g_QuitRequested = 1;
+		}
 		break;
 
 	#if !defined(MOBILE_DEVICE)
@@ -2158,6 +2244,11 @@ int main(int argc, char *argv[]) {
 	case GPUBackend::OPENGL:
 		fallbackGPUBackend = (int)GPUBackend::VULKAN;
 		break;
+#if PPSSPP_PLATFORM(MAC)
+	case GPUBackend::METAL:
+		fallbackGPUBackend = vulkanMayBeAvailable ? (int)GPUBackend::VULKAN : (int)GPUBackend::OPENGL;
+		break;
+#endif
 	default:
 		fprintf(stderr, "Unknown GPU backend %d, switching to Vulkan.\n", g_Config.iGPUBackend);
 		g_Config.iGPUBackend = (int)GPUBackend::VULKAN;
@@ -2178,6 +2269,26 @@ int main(int argc, char *argv[]) {
 			windowDesc.data2 = (void *)glContext;
 
 			ctx = new SDLGLGraphicsContext();
+#if PPSSPP_PLATFORM(MAC)
+		} else if (backend == GPUBackend::METAL) {
+			window = SDL_CreateWindow("Initializing graphics...", w, h, (SDL_WindowFlags)(mode | SDL_WINDOW_METAL | SDL_WINDOW_HIDDEN));
+			if (!window) {
+				*errorMessage = StringFromFormat("Error creating SDL window: %s", SDL_GetError());
+				return false;
+			}
+			if (x != SDL_WINDOWPOS_UNDEFINED && y != SDL_WINDOWPOS_UNDEFINED) {
+				SDL_SetWindowPosition(window, x, y);
+			}
+			SDL_MetalView metalView = SDL_Metal_CreateView(window);
+			if (!metalView) {
+				*errorMessage = StringFromFormat("Error creating Metal view: %s", SDL_GetError());
+				return false;
+			}
+			windowDesc.winsys = WINDOWSYSTEM_METAL_EXT;
+			windowDesc.data1 = SDL_Metal_GetLayer(metalView);
+			windowDesc.data2 = (void *)window;
+			ctx = new MetalGraphicsContext();
+#endif
 		} else {
 			// Use a local copy of mode: this flag combination is Vulkan-specific, and if we fall back to
 			// OpenGL below, we don't want SDL_WINDOW_VULKAN to stick around and get OR'd in there too.
@@ -2231,7 +2342,7 @@ int main(int argc, char *argv[]) {
 	if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
 		fprintf(stderr, "Failed to initialize graphics backend: %s\n", error_message.c_str());
 		if (fallbackGPUBackend != -1) {
-			fprintf(stderr, "Attempting to fall back to %s...\n", fallbackGPUBackend == (int)GPUBackend::OPENGL ? "OpenGL" : "Vulkan");
+			fprintf(stderr, "Attempting to fall back to %s...\n", GPUBackendToString((GPUBackend)fallbackGPUBackend).c_str());
 			g_Config.iGPUBackend = fallbackGPUBackend;
 			error_message.clear();
 			if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
@@ -2261,6 +2372,10 @@ int main(int argc, char *argv[]) {
 	Native_UpdateScreenScale(initialPixelWidth, initialPixelHeight, UIScaleFactorToMultiplier(g_Config.iUIScaleFactor));
 
 	SDL_SetWindowTitle(window, (app_name_nice + " " + PPSSPP_GIT_VERSION).c_str());
+
+	if (cmdLineOptions.gameWindow.value_or(false)) {
+		CreateGameWindow();
+	}
 
 	char iconPath[PATH_MAX];
 #if defined(ASSETS_DIR)
@@ -2342,10 +2457,8 @@ int main(int argc, char *argv[]) {
 		}
 	});
 
+	// Always polled: the status overlay shows it, and so does the HOME screen.
 	auto kick_battery_poll_thread = [&last_battery_poll, &battery_poll_thread_sema] {
-		if (!(g_Config.iShowStatusFlags & (int)ShowStatusFlags::BATTERY_PERCENT)) {
-			return;
-		}
 		double now = time_now_d();
 		if (now - last_battery_poll >= 5.0) {
 			last_battery_poll = now;

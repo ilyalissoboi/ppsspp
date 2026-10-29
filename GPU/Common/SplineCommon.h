@@ -34,7 +34,8 @@ class SimpleBufferManager;
 
 namespace Spline {
 
-void BuildIndex(u16 *indices, int &count, int num_u, int num_v, GEPatchPrimType prim_type, int total = 0);
+// patch_u is the number of quads per patch along u.
+void BuildIndex(u16 *indices, int &count, int num_u, int num_v, int patch_u, GEPatchPrimType prim_type, int total = 0);
 
 class Bezier3DWeight;
 class Spline3DWeight;
@@ -54,20 +55,6 @@ struct SurfaceInfo {
 		// If specified as 0, uses 1.
 		if (tess_u < 1) tess_u = 1;
 		if (tess_v < 1) tess_v = 1;
-
-		switch ((SplineQuality)g_Config.iSplineBezierQuality) {
-		case SplineQuality::LOW_QUALITY:
-			tess_u = 2;
-			tess_v = 2;
-			break;
-		case SplineQuality::MEDIUM_QUALITY:
-			// Don't cut below 2, though.
-			if (tess_u > 2) tess_u = half_ceil(tess_u);
-			if (tess_v > 2) tess_v = half_ceil(tess_v);
-			break;
-		default:
-			break;
-		}
 	}
 
 	// Only the larger factor, so a lopsided patch keeps at least one step along its short axis.
@@ -113,7 +100,7 @@ struct BezierSurface : public SurfaceInfo {
 			for (int patch_v = 0; patch_v < num_patches_v; ++patch_v) {
 				int patch_index = patch_v * num_patches_u + patch_u;
 				int total = patch_index * num_verts_per_patch;
-				Spline::BuildIndex(indices + count, count, tess_u, tess_v, primType, total);
+				Spline::BuildIndex(indices + count, count, tess_u, tess_v, tess_u, primType, total);
 			}
 		}
 	}
@@ -147,7 +134,7 @@ struct SplineSurface : public SurfaceInfo {
 	}
 
 	void BuildIndex(u16 *indices, int &count) const {
-		Spline::BuildIndex(indices, count, num_patches_u * tess_u, num_patches_v * tess_v, primType);
+		Spline::BuildIndex(indices, count, num_patches_u * tess_u, num_patches_v * tess_v, tess_u, primType);
 	}
 };
 

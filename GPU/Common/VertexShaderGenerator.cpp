@@ -537,6 +537,11 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		if (gstate_c.Use(GPU_USE_VIRTUAL_REALITY)) {
 			WRITE(p, "  vec4 outPos = mul(u_proj_lens, viewPos);\n");
 			WRITE(p, "  vec4 orgPos = mul(u_proj, viewPos);\n");
+#ifdef __LIBRETRO__
+			// Preserve game depth before clipping and viewport conversion. The VR lens
+			// changes XY, but depth must still agree with through-mode draws and clears.
+			WRITE(p, "  outPos.z = orgPos.z * (outPos.w / orgPos.w);\n");
+#endif
 		} else {
 			WRITE(p, "  vec4 outPos = mul(u_proj, viewPos);\n");
 		}
@@ -951,6 +956,17 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		WRITE(p, "  %sgl_ClipDistance%s = u_minZmaxZ.y < 65535.0 ? (u_minZmaxZ.y - clipZFar) * outPos.w : 1.0;\n", compat.vsOutPrefix, maxZClipPlaneSuffix);
 	}
 
+	// Snap screen Z to 1/8 and W to 16 significant bits. Hardware and software transform (which
+	// does the matrices on the CPU) differ by a few ulps here, which is enough to fail an
+	// equal-depth GEQUAL test when a frame mixes the two, as with draws that cross the near plane
+	// on GPUs without cull distances (DBZ Tenkaichi Tag Team's outlines, Naruto's grass). This is
+	// for the two to agree, not PSP behavior. Z steps of a whole unit break decals (Star Wars Lethal
+	// Alliance).
+	WRITE(p, "  outPos.z = floor(outPos.z * 8.0 + 0.5) * 0.125;\n");
+	if (compat.bitwiseOps) {
+		WRITE(p, "  outPos.w = uintBitsToFloat((floatBitsToUint(outPos.w) + 128u) & 4294967040u);\n");
+	}
+
 	// Convert to NDC space, using the framebuffer offset and (inverse size * 2) stored in u_xywh.
 	WRITE(p, "  outPos.xy = (((outPos.xy + u_xywh.xy) * u_xywh.zw) - vec2(1.0, 1.0)) * outPos.w;\n");
 
@@ -993,10 +1009,12 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 	WRITE(p, "  %sgl_Position = outPos;\n", compat.vsOutPrefix);
 
 	if (gstate_c.Use(GPU_USE_VIRTUAL_REALITY)) {
+#ifndef __LIBRETRO__
 		// Z correction for the depth buffer
 		if (useHWTransform) {
 			WRITE(p, "  %sgl_Position.z = orgPos.z / abs(orgPos.w) * abs(outPos.w);\n", compat.vsOutPrefix);
 		}
+#endif
 
 		// HUD scaling
 		WRITE(p, "  %sgl_Position.x *= u_scaleX;\n", compat.vsOutPrefix);

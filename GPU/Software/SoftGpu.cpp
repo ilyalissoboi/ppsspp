@@ -494,6 +494,7 @@ void SoftGPU::SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat for
 }
 
 DSStretch g_DarkStalkerStretch;
+bool g_DarkStalkersNativeOutput = false;
 
 // With the DarkStalkers hack, the game's stretch blit is skipped and we present its 384x224 source image directly.
 static const u32 DS_SOURCE_ADDR = 0x04088000;
@@ -506,7 +507,7 @@ bool SoftGPU::DarkStalkersStretchActive() const {
 void SoftGPU::GetDarkStalkersDisplay(GPUDebugBuffer &buffer) {
 	const u16 *src = (const u16 *)Memory::GetPointerOrException(DS_SOURCE_ADDR);
 	const int srcStride = displayStride_ == 0 ? 512 : displayStride_;
-	const int srcX = 64, srcY = 16, srcW = 384, srcH = 224;
+	const int srcX = 64, srcY = 16, srcW = DS_SOURCE_WIDTH, srcH = DS_SOURCE_HEIGHT;
 	// Same rectangles as the game's own blits (see RectangleFastPath).
 	const int dstX = g_DarkStalkerStretch == DSStretch::Normal ? 48 : 0;
 	const int dstW = g_DarkStalkerStretch == DSStretch::Normal ? 384 : 480;
@@ -569,7 +570,7 @@ void SoftGPU::ConvertTextureDescFrom16(Draw::TextureDesc &desc, int srcwidth, in
 			break;
 
 		default:
-			ERROR_LOG_REPORT(Log::G3D, "Software: Unexpected framebuffer format: %d", displayFormat_);
+			ERROR_LOG(Log::G3D, "Software: Unexpected framebuffer format: %d", displayFormat_);
 			break;
 		}
 	}
@@ -612,6 +613,7 @@ void SoftGPU::CopyToCurrentFboFromDisplayRam(const DisplayLayoutConfig &config, 
 	OutputFlags outputFlags = config.iDisplayFilter == SCALE_NEAREST ? OutputFlags::NEAREST : OutputFlags::LINEAR;
 	bool hasPostShader = presentation_ && presentation_->HasPostShader();
 
+	presentedDSNative_ = DSStretch::Off;
 	if (DarkStalkersStretchActive()) {
 		const u8 *data = Memory::GetPointerWriteOrException(DS_SOURCE_ADDR);
 		bool fillDesc = true;
@@ -631,14 +633,23 @@ void SoftGPU::CopyToCurrentFboFromDisplayRam(const DisplayLayoutConfig &config, 
 			desc.height = srcheight;
 			desc.initData.push_back(data);
 		}
-		u0 = 64.5f / (float)desc.width;
-		u1 = 447.5f / (float)desc.width;
 		v0 = 16.0f / (float)desc.height;
 		v1 = 240.0f / (float)desc.height;
-		if (g_DarkStalkerStretch == DSStretch::Normal) {
-			outputFlags |= OutputFlags::PILLARBOX;
+		if (g_DarkStalkersNativeOutput) {
+			u0 = 64.0f / (float)desc.width;
+			u1 = 448.0f / (float)desc.width;
+			outputFlags |= OutputFlags::NEAREST | OutputFlags::NATIVE_SIZE;
+			presentedDSNative_ = g_DarkStalkerStretch;
+		} else {
+			u0 = 64.5f / (float)desc.width;
+			u1 = 447.5f / (float)desc.width;
+			if (g_DarkStalkerStretch == DSStretch::Normal) {
+				outputFlags |= OutputFlags::PILLARBOX;
+			}
 		}
-	} else if (!Memory::IsValidAddress(displayFramebuf_) || srcwidth == 0 || srcheight == 0) {
+	} else if (srcwidth == 0 || srcheight == 0 || displayStride_ < 0 || !Memory::IsValidRange(displayFramebuf_, (displayStride_ == 0 ? srcwidth : displayStride_) * srcheight * (displayFormat_ == GE_FORMAT_8888 ? 4 : 2))) {
+		// Nothing, or not all of it in memory: the PSP takes strides that run past the end of VRAM, or
+		// negative ones (rows going up.)
 		hasImage = false;
 		u1 = 1.0f;
 	} else if (displayFormat_ == GE_FORMAT_8888) {
@@ -707,6 +718,16 @@ void SoftGPU::BeginHostFrame(const DisplayLayoutConfig &config) {
 
 bool SoftGPU::PresentedThisFrame() const {
 	return presentation_ ? presentation_->PresentedThisFrame() : false;
+}
+
+void SoftGPU::SetPresentationOutput(const OutputParams *output) {
+	if (presentation_) {
+		presentation_->SetOutputOverride(output);
+	}
+}
+
+bool SoftGPU::PresentsToOtherOutput() const {
+	return presentation_ && presentation_->HasOutputOverride();
 }
 
 void SoftGPU::MarkDirty(uint32_t addr, uint32_t stride, uint32_t height, GEBufferFormat fmt, SoftGPUVRAMDirty value) {
@@ -940,7 +961,7 @@ void SoftGPU::Execute_Prim(u32 op, u32 diff) {
 	FlushImm();
 
 	if (!Memory::IsValidAddress(gstate_c.vertexAddr)) {
-		ERROR_LOG_REPORT(Log::G3D, "Software: Bad vertex address %08x!", gstate_c.vertexAddr);
+		ERROR_LOG(Log::G3D, "Software: Bad vertex address %08x!", gstate_c.vertexAddr);
 		return;
 	}
 
@@ -950,7 +971,7 @@ void SoftGPU::Execute_Prim(u32 op, u32 diff) {
 	const u32 vertType = gstate.vertType;
 	if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
 		if (!Memory::IsValidAddress(gstate_c.indexAddr)) {
-			ERROR_LOG_REPORT(Log::G3D, "Software: Bad index address %08x!", gstate_c.indexAddr);
+			ERROR_LOG(Log::G3D, "Software: Bad index address %08x!", gstate_c.indexAddr);
 			return;
 		}
 		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
@@ -1020,7 +1041,7 @@ void SoftGPU::Execute_Bezier(u32 op, u32 diff) {
 	}
 
 	if (!Memory::IsValidAddress(gstate_c.vertexAddr)) {
-		ERROR_LOG_REPORT(Log::G3D, "Bad vertex address %08x!", gstate_c.vertexAddr);
+		ERROR_LOG(Log::G3D, "Bad vertex address %08x!", gstate_c.vertexAddr);
 		return;
 	}
 
@@ -1029,14 +1050,14 @@ void SoftGPU::Execute_Bezier(u32 op, u32 diff) {
 	const u32 vertType = gstate.vertType;
 	if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
 		if (!Memory::IsValidAddress(gstate_c.indexAddr)) {
-			ERROR_LOG_REPORT(Log::G3D, "Bad index address %08x!", gstate_c.indexAddr);
+			ERROR_LOG(Log::G3D, "Bad index address %08x!", gstate_c.indexAddr);
 			return;
 		}
 		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
 	}
 
 	if ((vertType & GE_VTYPE_MORPHCOUNT_MASK) || vertTypeIsSkinningEnabled(vertType)) {
-		DEBUG_LOG_REPORT(Log::G3D, "Unusual bezier/spline vtype: %08x, morph: %d, bones: %d", vertType, (vertType & GE_VTYPE_MORPHCOUNT_MASK) >> GE_VTYPE_MORPHCOUNT_SHIFT, vertTypeGetNumBoneWeights(vertType));
+		DEBUG_LOG(Log::G3D, "Unusual bezier/spline vtype: %08x, morph: %d, bones: %d", vertType, (vertType & GE_VTYPE_MORPHCOUNT_MASK) >> GE_VTYPE_MORPHCOUNT_SHIFT, vertTypeGetNumBoneWeights(vertType));
 	}
 
 	Spline::BezierSurface surface;
@@ -1073,7 +1094,7 @@ void SoftGPU::Execute_Spline(u32 op, u32 diff) {
 	}
 
 	if (!Memory::IsValidAddress(gstate_c.vertexAddr)) {
-		ERROR_LOG_REPORT(Log::G3D, "Bad vertex address %08x!", gstate_c.vertexAddr);
+		ERROR_LOG(Log::G3D, "Bad vertex address %08x!", gstate_c.vertexAddr);
 		return;
 	}
 
@@ -1082,14 +1103,14 @@ void SoftGPU::Execute_Spline(u32 op, u32 diff) {
 	const u32 vertType = gstate.vertType;
 	if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
 		if (!Memory::IsValidAddress(gstate_c.indexAddr)) {
-			ERROR_LOG_REPORT(Log::G3D, "Bad index address %08x!", gstate_c.indexAddr);
+			ERROR_LOG(Log::G3D, "Bad index address %08x!", gstate_c.indexAddr);
 			return;
 		}
 		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
 	}
 
 	if ((vertType & GE_VTYPE_MORPHCOUNT_MASK) || vertTypeIsSkinningEnabled(vertType)) {
-		DEBUG_LOG_REPORT(Log::G3D, "Unusual bezier/spline vtype: %08x, morph: %d, bones: %d", vertType, (vertType & GE_VTYPE_MORPHCOUNT_MASK) >> GE_VTYPE_MORPHCOUNT_SHIFT, vertTypeGetNumBoneWeights(vertType));
+		DEBUG_LOG(Log::G3D, "Unusual bezier/spline vtype: %08x, morph: %d, bones: %d", vertType, (vertType & GE_VTYPE_MORPHCOUNT_MASK) >> GE_VTYPE_MORPHCOUNT_SHIFT, vertTypeGetNumBoneWeights(vertType));
 	}
 
 	Spline::SplineSurface surface;
@@ -1579,6 +1600,19 @@ bool SoftGPU::GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferT
 }
 
 bool SoftGPU::GetOutputFramebuffer(GPUDebugBuffer &buffer) {
+	if (g_DarkStalkersNativeOutput && DarkStalkersStretchActive()) {
+		// The source image as is, for the host to scale.
+		const u16 *src = (const u16 *)Memory::GetPointerOrException(DS_SOURCE_ADDR);
+		const int srcStride = displayStride_ == 0 ? 512 : displayStride_;
+		buffer.Allocate(DS_SOURCE_WIDTH, DS_SOURCE_HEIGHT, GE_FORMAT_5551);
+		u16 *dst = (u16 *)buffer.GetData();
+		for (int y = 0; y < DS_SOURCE_HEIGHT; ++y) {
+			memcpy(dst + y * DS_SOURCE_WIDTH, src + (16 + y) * srcStride + 64, DS_SOURCE_WIDTH * sizeof(u16));
+		}
+		presentedDSNative_ = g_DarkStalkerStretch;
+		return true;
+	}
+	presentedDSNative_ = DSStretch::Off;
 	return GetCurrentFramebuffer(buffer, GPU_DBG_FRAMEBUF_DISPLAY, 1);
 }
 

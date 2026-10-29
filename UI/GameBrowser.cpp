@@ -38,9 +38,12 @@
 #include "Core/Util/RecentFiles.h"
 #include "Core/HLE/sceCtrl.h"
 #include "Core/ELF/PBPReader.h"
+#include "Core/FileLoaders/PS1EbootFileLoader.h"
+#include "Core/MemMap.h"
 #include "Core/Util/VideoPlayer.h"
 
 #include "UI/GameBrowser.h"
+#include "UI/GamePacker.h"
 #include "UI/RemoteISOScreen.h"
 #include "UI/SavedataScreen.h"
 #include "UI/Store.h"
@@ -75,7 +78,8 @@ static float ListTextRightMargin(GameBrowserViewMode viewMode) {
 	return 0.0f;
 }
 
-static void DrawIconWithText(UIContext &dc, ImageID image, std::string_view text, const Bounds &bounds, GameBrowserViewMode viewMode, const UI::Style &style) {
+// In the list views, rightText (like a game ID) goes at the right edge, as for a game with a picture.
+static void DrawIconWithText(UIContext &dc, ImageID image, std::string_view text, const Bounds &bounds, GameBrowserViewMode viewMode, const UI::Style &style, std::string_view rightText = {}) {
 	const bool gridStyle = viewMode == GameBrowserViewMode::GRID;
 	float tw, th;
 	dc.MeasureText(dc.GetFontStyle(), gridStyle ? g_Config.fGameGridScale : 1.0, gridStyle ? g_Config.fGameGridScale : 1.0, text, &tw, &th, 0);
@@ -119,6 +123,14 @@ static void DrawIconWithText(UIContext &dc, ImageID image, std::string_view text
 
 		float tx = textX;
 		int availableWidth = bounds.w - textX - ListTextRightMargin(viewMode);
+		if (!rightText.empty()) {
+			float vw, vh;
+			dc.MeasureText(dc.GetFontStyle(), 0.7f, 0.7f, rightText, &vw, &vh, 0);
+			availableWidth -= vw + 20;
+			dc.SetFontScale(0.7f, 0.7f);
+			dc.DrawText(rightText, bounds.x + availableWidth + textX + 10, bounds.centerY(), style.fgColor, ALIGN_VCENTER);
+			dc.SetFontScale(1.0f, 1.0f);
+		}
 		float sineWidth = std::max(0.0f, (tw - availableWidth)) / 2.0f;
 		if (availableWidth < tw) {
 			tx -= (1.0f + sin(time_now_d() * 1.5f)) * sineWidth;
@@ -137,7 +149,7 @@ static void DrawIconWithText(UIContext &dc, ImageID image, std::string_view text
 class GameButton : public UI::Clickable {
 public:
 	GameButton(const Path &gamePath, GameBrowserViewMode viewMode, UI::LayoutParams *layoutParams = nullptr)
-		: UI::Clickable(layoutParams), viewMode_(viewMode), gridStyle_(viewMode == GameBrowserViewMode::GRID), gamePath_(gamePath) {}
+		: UI::Clickable(layoutParams), viewMode_(viewMode), gamePath_(gamePath) {}
 
 	void Draw(UIContext &dc) override;
 	std::string DescribeText() const override;
@@ -152,18 +164,21 @@ public:
 		return filename;
 	}
 	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override {
-		if (gridStyle_) {
+		switch (viewMode_) {
+		case GameBrowserViewMode::GRID:
 			w = 144 * g_Config.fGameGridScale;
 			h = 80 * g_Config.fGameGridScale;
-		} else if (viewMode_ == GameBrowserViewMode::LARGE_LIST) {
+			break;
+		case GameBrowserViewMode::LARGE_LIST:
 			w = 500;
 			h = LARGE_LIST_ICON_H * g_Config.fGameGridScale + LARGE_LIST_PAD * 2;
-		} else {
+			break;
+		default:  // List
 			w = 500;
 			h = 50;
+			break;
 		}
 	}
-
 	const Path &GamePath() const { return gamePath_; }
 
 	void SetHoldEnabled(bool hold) {
@@ -330,9 +345,8 @@ private:
 		return true;
 	}
 
-	GameBrowserViewMode viewMode_;
-	bool gridStyle_;
-	Path gamePath_;
+	const GameBrowserViewMode viewMode_;
+	const Path gamePath_;
 	std::string title_;
 
 	// The ICON1.PMF video, played in place of the icon in the large list, like the XMB does.
@@ -369,9 +383,9 @@ void GameButton::UpdateVideo(const std::shared_ptr<GameInfo> &ginfo, bool wantVi
 }
 
 void GameButton::Draw(UIContext &dc) {
-	const bool largeList = viewMode_ == GameBrowserViewMode::LARGE_LIST;
-	// Like the XMB, only the selected game plays its video. The mouse can select one too, by hovering.
-	const bool wantVideo = largeList && (HasFocus() || hovering_) && pmf_player_available();
+	// Like the XMB, only the selected game plays its video. Only keyboard/gamepad focus selects, since with
+	// touch or the mouse, getting a video to play without launching the game was too fiddly.
+	const bool wantVideo = viewMode_ == GameBrowserViewMode::LARGE_LIST && HasFocus() && pmf_player_available();
 
 	GameInfoFlags infoFlags = GameInfoFlags::PARAM_SFO | GameInfoFlags::ICON;
 	if (wantVideo) {
@@ -392,7 +406,11 @@ void GameButton::Draw(UIContext &dc) {
 	ImageID imageIcon = ImageID::invalid();
 	bool drawBackground = true;
 	switch (ginfo->fileType) {
-	case IdentifiedFileType::PSP_ELF: imageIcon = ImageID("I_APP"); drawBackground = false; break;
+	case IdentifiedFileType::PSP_ELF:
+		imageIcon = ImageID("I_APP");
+		// The XMB is an ELF too, but has an icon.
+		drawBackground = ginfo->region == GameRegion::VSH;
+		break;
 	case IdentifiedFileType::UNKNOWN_ELF: imageIcon = ImageID("I_APP"); drawBackground = false; break;
 	case IdentifiedFileType::PPSSPP_GE_DUMP: imageIcon = ImageID("I_DISPLAY"); break;
 	case IdentifiedFileType::PSX_ISO:
@@ -414,10 +432,14 @@ void GameButton::Draw(UIContext &dc) {
 	if (ginfo->Ready(GameInfoFlags::ICON)) {
 		if (ginfo->icon.texture && drawBackground) {
 			texture = ginfo->icon.texture;
+			// The type icon is only for when there's no picture, and would be drawn on top of it.
+			imageIcon = ImageID::invalid();
 		} else if (drawBackground) {
 			// No icon, but drawBackground is set. Let's show a plain icon depending on type.
 			if (ginfo->fileType == IdentifiedFileType::PSP_ISO || ginfo->fileType == IdentifiedFileType::PSP_ISO_NP) {
 				imageIcon = ImageID("I_UMD");
+			} else if (ginfo->fileType == IdentifiedFileType::PSX_ISO || ginfo->fileType == IdentifiedFileType::PSP_PS1_PBP) {
+				imageIcon = ImageID("I_PSX_ISO");
 			} else if (gamePath_.Type() == PathType::HTTP) {
 				imageIcon = ginfo->fileType == IdentifiedFileType::UNKNOWN ? ImageID("I_LINK_OUT_QUESTION") : ImageID("I_LINK_OUT");
 			} else {
@@ -449,9 +471,9 @@ void GameButton::Draw(UIContext &dc) {
 
 	int x = bounds_.x;
 	int y = bounds_.y;
-	int w = gridStyle_ ? bounds_.w : 144;
+	int w = viewMode_ == GameBrowserViewMode::GRID ? bounds_.w : 144;
 	int h = bounds_.h;
-	if (largeList) {
+	if (viewMode_ == GameBrowserViewMode::LARGE_LIST) {
 		x += LARGE_LIST_LEFT_PAD;
 		y += LARGE_LIST_PAD;
 		w = LARGE_LIST_ICON_W * g_Config.fGameGridScale;
@@ -460,7 +482,7 @@ void GameButton::Draw(UIContext &dc) {
 	const float textX = ListTextX(viewMode_);
 
 	const bool rowFocused = HasFocus() && !infoSelected_;
-	if (!gridStyle_ || !texture) {
+	if (viewMode_ != GameBrowserViewMode::GRID || !texture) {
 		if (rowFocused)
 			style = down_ ? dc.GetTheme().itemDownStyle : dc.GetTheme().itemFocusedStyle;
 
@@ -493,12 +515,12 @@ void GameButton::Draw(UIContext &dc) {
 	}
 
 	int txOffset = down_ ? 4 : 0;
-	if (!gridStyle_) txOffset = 0;
+	if (viewMode_ != GameBrowserViewMode::GRID) txOffset = 0;
 
 	// Render button
 	int dropsize = 10;
 	if (texture) {
-		if (!gridStyle_ && !largeList) {
+		if (viewMode_ == GameBrowserViewMode::LIST) {
 			x += 4;
 		}
 		if (txOffset) {
@@ -525,7 +547,7 @@ void GameButton::Draw(UIContext &dc) {
 		dc.Draw()->Flush();
 	}
 
-	if (gridStyle_ && g_Config.bShowIDOnGameIcon && ginfo->fileType != IdentifiedFileType::PSP_ELF && !ginfo->id_version.empty()) {
+	if (viewMode_ == GameBrowserViewMode::GRID && g_Config.bShowIDOnGameIcon && ginfo->fileType != IdentifiedFileType::PSP_ELF && !ginfo->id_version.empty()) {
 		std::string_view idStr = ginfo->id_version;
 		if (ginfo->fileType == IdentifiedFileType::PSP_SAVEDATA_DIRECTORY) {
 			auto ga = GetI18NCategory(I18NCat::GAME);
@@ -544,7 +566,7 @@ void GameButton::Draw(UIContext &dc) {
 		if (down_) style = dc.GetTheme().itemDownStyle;
 		if (!IsEnabled()) style = dc.GetTheme().itemDisabledStyle;
 
-		DrawIconWithText(dc, imageIcon, ginfo->GetTitle(), bounds_, viewMode_, style);
+		DrawIconWithText(dc, imageIcon, ginfo->GetTitle(), bounds_, viewMode_, style, g_Config.bShowIDOnGameIcon ? std::string_view(ginfo->id_version) : std::string_view());
 
 		if (overlayColor) {
 			dc.FillRect(Drawable(overlayColor), overlayBounds);
@@ -559,7 +581,7 @@ void GameButton::Draw(UIContext &dc) {
 		dc.Draw()->Flush();
 		dc.RebindTexture();
 		dc.SetFontStyle(dc.GetTheme().uiFont);
-		if (!gridStyle_) {
+		if (viewMode_ != GameBrowserViewMode::GRID) {
 			float tw, th;
 			dc.Draw()->Flush();
 			dc.PushScissor(bounds_);
@@ -609,9 +631,9 @@ void GameButton::Draw(UIContext &dc) {
 	if (ginfo->hasConfig && !ginfo->id.empty()) {
 		const AtlasImage *gearImage = dc.Draw()->GetAtlas()->getImage(ImageID("I_GEAR_SMALL"));
 		if (gearImage) {
-			if (gridStyle_) {
+			if (viewMode_ == GameBrowserViewMode::GRID) {
 				dc.Draw()->DrawImage(ImageID("I_GEAR_SMALL"), bounds_.x, y + h - gearImage->h * g_Config.fGameGridScale, g_Config.fGameGridScale);
-			} else if (largeList) {
+			} else if (viewMode_ == GameBrowserViewMode::LARGE_LIST) {
 				dc.Draw()->DrawImage(ImageID("I_GEAR_SMALL"), bounds_.x + LARGE_LIST_LEFT_PAD, y + h - gearImage->h * g_Config.fGameGridScale, g_Config.fGameGridScale);
 			} else {
 				dc.Draw()->DrawImage(ImageID("I_GEAR_SMALL"), bounds_.x + 4, y, 1.0f);
@@ -631,10 +653,10 @@ void GameButton::Draw(UIContext &dc) {
 		};
 		const AtlasImage *image = dc.Draw()->GetAtlas()->getImage(regionIcons[regionIndex]);
 		if (image) {
-			if (gridStyle_) {
+			if (viewMode_ == GameBrowserViewMode::GRID) {
 				dc.Draw()->DrawImage(regionIcons[regionIndex], bounds_.x + bounds_.w - (image->w + 5) * g_Config.fGameGridScale,
 					y + h - (image->h + 5) * g_Config.fGameGridScale, g_Config.fGameGridScale);
-			} else if (largeList) {
+			} else if (viewMode_ == GameBrowserViewMode::LARGE_LIST) {
 				dc.Draw()->DrawImage(regionIcons[regionIndex], bounds_.x + LARGE_LIST_LEFT_PAD + (LARGE_LIST_ICON_W - image->w - 5) * g_Config.fGameGridScale,
 					y + h - (image->h + 5) * g_Config.fGameGridScale, g_Config.fGameGridScale);
 			} else {
@@ -648,15 +670,29 @@ void GameButton::Draw(UIContext &dc) {
 		Style infoStyle = HasFocus() ? dc.GetTheme().itemFocusedStyle : dc.GetTheme().itemStyle;
 		if (infoButtonDown_) {
 			infoStyle = dc.GetTheme().itemDownStyle;
-			dc.FillRect(infoStyle.background, infoBounds);
+			dc.FillRoundRect(infoStyle.background, infoBounds, dc.GetTheme().choiceRoundRadius);
 		} else if (HasFocus() && infoSelected_) {
-			dc.FillRect(infoStyle.background, infoBounds);
+			dc.FillRoundRect(infoStyle.background, infoBounds, dc.GetTheme().choiceRoundRadius);
 		}
 		dc.Draw()->DrawImage(ImageID("I_INFO"), infoBounds.centerX(), infoBounds.centerY(), 1.0f, infoStyle.fgColor, ALIGN_CENTER);
 	}
 
 	if (overlayColor) {
 		dc.FillRect(Drawable(overlayColor), overlayBounds);
+	}
+
+	// Covers the icon while the game is being compressed. Clicking opens the game screen instead of playing.
+	GamePacker::Status packStatus;
+	if (GamePacker::IsPacking(gamePath_) && GamePacker::GetStatus(&packStatus)) {
+		auto ga = GetI18NCategory(I18NCat::GAME);
+		const Bounds iconBounds(x, y, w, h);
+		dc.FillRect(Drawable(0xD0505050), iconBounds);
+		const float scale = viewMode_ == GameBrowserViewMode::GRID || viewMode_ == GameBrowserViewMode::LARGE_LIST ? 0.8f * g_Config.fGameGridScale : 0.6f;
+		dc.SetFontStyle(dc.GetTheme().uiFont);
+		dc.SetFontScale(scale, scale);
+		const std::string text = std::string(ga->T("Compressing...")) + StringFromFormat("\n%d%%", (int)(packStatus.progress * 100.0f));
+		dc.DrawTextRectSqueeze(text, iconBounds, 0xFFFFFFFF, ALIGN_CENTER);
+		dc.SetFontScale(1.0f, 1.0f);
 	}
 
 	dc.RebindTexture();
@@ -714,7 +750,9 @@ void DirButton::Draw(UIContext &dc) {
 
 	std::string_view text(GetText());
 	ImageID image = ImageID(pinned_ ? "I_FOLDER_PINNED" : "I_FOLDER");
-	if (text == "..") {
+	if (path_.IsNetworkRoot()) {
+		image = ImageID("I_NETWORK");
+	} else if (text == "..") {
 		image = ImageID("I_UP_DIRECTORY");
 		text = "";
 	}
@@ -761,7 +799,7 @@ void GameBrowser::FocusGame(const Path &gamePath) {
 		}
 	}
 	// Otherwise, Refresh focuses it when it recreates the buttons.
-	focusGamePath_ = gamePath;
+	focusPath_ = gamePath;
 	refreshPending_ = true;
 }
 
@@ -772,6 +810,30 @@ void GameBrowser::SetPath(const Path &path) {
 }
 
 bool GameBrowser::Key(const KeyInput &input) {
+	// Alt+Up goes to the parent directory, as in file managers.
+	if ((input.flags & KeyInputFlags::DOWN) && (input.flags & KeyInputFlags::ModAlt) && input.keyCode == NKCODE_DPAD_UP && input.deviceId == DEVICE_ID_KEYBOARD) {
+		if ((browseFlags_ & BrowseFlags::NAVIGATE) && path_.CanNavigateUp()) {
+			NavigateUp();
+			return true;
+		}
+	}
+
+	// Backspace with no search going also goes to the parent directory, as in file managers. Never on
+	// a repeat, or holding it would climb to the root (or carry on up after clearing a search). Not
+	// every platform flags repeats, so this also tracks whether it's held.
+	if (input.keyCode == NKCODE_DEL && input.deviceId == DEVICE_ID_KEYBOARD) {
+		if (input.flags & KeyInputFlags::UP) {
+			backspaceHeld_ = false;
+		} else if (input.flags & KeyInputFlags::DOWN) {
+			const bool repeat = backspaceHeld_ || (input.flags & KeyInputFlags::IS_REPEAT);
+			backspaceHeld_ = true;
+			if (!repeat && search_.searchFilter.empty() && (browseFlags_ & BrowseFlags::NAVIGATE) && path_.CanNavigateUp()) {
+				NavigateUp();
+				return true;
+			}
+		}
+	}
+
 	bool retval = LinearLayout::Key(input);
 	if (retval) {
 		return true;
@@ -864,10 +926,6 @@ void GameBrowser::PinToggleClick(UI::EventParams &e) {
 	refreshPending_ = true;
 }
 
-bool GameBrowser::DisplayTopBar() {
-	return path_.GetPath().ToString() != "!RECENT";
-}
-
 bool GameBrowser::HasSpecialFiles(std::vector<Path> &filenames) {
 	if (path_.GetPath().ToString() == "!RECENT") {
 		filenames.clear();
@@ -941,6 +999,12 @@ static bool IsValidPBP(const Path &path, bool allowHomebrew) {
 	std::unique_ptr<FileLoader> loader(ConstructFileLoader(path));
 
 	PBPReader pbp(loader.get());
+	// Some old homebrew (like Ozone and Trig Wars) ships a plain ELF named EBOOT.PBP. It has no
+	// PARAM.SFO, but Identify_File accepts it and it boots.
+	if (pbp.IsELF()) {
+		return true;
+	}
+
 	std::vector<u8> sfoData;
 	if (!pbp.GetSubFile(PBP_PARAM_SFO, &sfoData))
 		return false;
@@ -950,7 +1014,8 @@ static bool IsValidPBP(const Path &path, bool allowHomebrew) {
 	if (!allowHomebrew && sfo.GetValueString("DISC_ID").empty())
 		return false;
 
-	if (sfo.GetValueString("CATEGORY") == "ME")
+	// PS1 games, which need the Media Engine.
+	if (sfo.GetValueString("CATEGORY") == "ME" && !Memory::CanCreateMESpace())
 		return false;
 
 	return true;
@@ -967,110 +1032,109 @@ void GameBrowser::Refresh() {
 	Clear();
 	search_.searchStates.clear();
 
-	Add(new Spacer(1.0f));
 	auto mm = GetI18NCategory(I18NCat::MAINMENU);
 
-	// No topbar on recent screen
 	gameList_ = nullptr;
 
-	if (DisplayTopBar()) {
-		LinearLayout *topBar = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(8, 0, 8, 0)));
-		Add(topBar);
+	LinearLayout *topBar = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(0, 12, 8, 0)));
+	Add(topBar);
 
-		const bool pathOnSeparateLine = g_display.dp_xres < 1050 || portrait_;
+	// Recent isn't a real folder, so it gets no path or refresh.
+	const bool isRecent = path_.GetPath().ToString() == "!RECENT";
 
-		std::string pathStr = GetFriendlyPath(path_.GetPath(), aliasMatch_, aliasDisplay_);
+	std::string pathStr = path_.GetPath().IsNetworkRoot() ? std::string(mm->T("Network")) : GetFriendlyPath(path_.GetPath(), aliasMatch_, aliasDisplay_);
 
-		if (pathOnSeparateLine) {
-			Add(new TextView(pathStr, ALIGN_VCENTER | FLAG_WRAP_TEXT, true, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(8, 0, 8, 0))));
+	if (browseFlags_ & BrowseFlags::NAVIGATE) {
+		Choice *homeChoice = topBar->Add(new Choice(ImageID("I_HOME_ICON"), new LayoutParams(WRAP_CONTENT, 64.0f)));
+		homeChoice->SetRoundCorners(RoundCorners::All);
+		homeChoice->OnClick.Handle(this, &GameBrowser::OnHomeClick);
+		if (System_GetPropertyBool(SYSPROP_HAS_ADDITIONAL_STORAGE)) {
+			Choice *sdCardChoice = topBar->Add(new Choice(ImageID("I_SDCARD"), new LayoutParams(WRAP_CONTENT, 64.0f)));
+			sdCardChoice->SetRoundCorners(RoundCorners::All);
+			sdCardChoice->OnClick.Handle(this, &GameBrowser::StorageClick);
 		}
-		if (browseFlags_ & BrowseFlags::NAVIGATE) {
-			if (!pathOnSeparateLine) {
-				topBar->Add(new Spacer(2.0f));
-				topBar->Add(new TextView(pathStr, ALIGN_VCENTER | FLAG_WRAP_TEXT, true, new LinearLayoutParams(FILL_PARENT, 64.0f, 1.0f)));
-			}
-			topBar->Add(new Choice(ImageID("I_HOME"), new LayoutParams(WRAP_CONTENT, 64.0f)))->OnClick.Handle(this, &GameBrowser::OnHomeClick);
-			if (System_GetPropertyBool(SYSPROP_HAS_ADDITIONAL_STORAGE)) {
-				topBar->Add(new Choice(ImageID("I_SDCARD"), new LayoutParams(WRAP_CONTENT, 64.0f)))->OnClick.Handle(this, &GameBrowser::StorageClick);
-			}
 #if PPSSPP_PLATFORM(IOS_APP_STORE)
-			// Don't show a browse button, not meaningful to browse outside the documents folder it seems,
-			// as we can't list things like document folders of another app, as far as I can tell.
-			// However, we do show a Load.. button for picking individual files, that seems to work.
+		// Don't show a browse button, not meaningful to browse outside the documents folder it seems,
+		// as we can't list things like document folders of another app, as far as I can tell.
+		// However, we do show a Load.. button for picking individual files, that seems to work.
 #elif PPSSPP_PLATFORM(IOS) || PPSSPP_PLATFORM(MAC)
-			// on Darwin, we don't show the 'Browse' text alongside the image
-			// we show just the image, because we don't need to emphasize the button on Darwin
-			// (tvOS has no folder browser.)
-			if (System_GetPropertyBool(SYSPROP_HAS_FOLDER_BROWSER)) {
-				topBar->Add(new Choice(ImageID("I_FOLDER_OPEN"), new LayoutParams(WRAP_CONTENT, 64.0f)))->OnClick.Handle(this, &GameBrowser::BrowseClick);
-			}
+		// on Darwin, we don't show the 'Browse' text alongside the image
+		// we show just the image, because we don't need to emphasize the button on Darwin
+		// (tvOS has no folder browser.)
+		if (System_GetPropertyBool(SYSPROP_HAS_FOLDER_BROWSER)) {
+			Choice *browseChoice = topBar->Add(new Choice(ImageID("I_FOLDER_OPEN"), new LayoutParams(WRAP_CONTENT, 64.0f)));
+			browseChoice->SetRoundCorners(RoundCorners::All);
+			browseChoice->OnClick.Handle(this, &GameBrowser::BrowseClick);
+		}
 #else
-			if ((browseFlags_ & BrowseFlags::BROWSE) && System_GetPropertyBool(SYSPROP_HAS_FOLDER_BROWSER)) {
-				// Collapse the button title on very small screens (Retroid Pocket) or portrait mode.
-				std::string_view browseTitle = (g_display.dp_xres <= 550 || portrait_) ? "" : mm->T("Browse");
-				topBar->Add(new Choice(browseTitle, ImageID("I_FOLDER_OPEN"), new LayoutParams(WRAP_CONTENT, 64.0f)))->OnClick.Handle(this, &GameBrowser::BrowseClick);
-			}
-			if (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_TV) {
-				topBar->Add(new Choice(mm->T("Enter Path"), new LayoutParams(WRAP_CONTENT, 64.0f)))->OnClick.Add([=](UI::EventParams &) {
-					auto mm = GetI18NCategory(I18NCat::MAINMENU);
-					System_InputBoxGetString(token_, mm->T("Enter Path"), path_.GetPath().ToString(), false, [=](std::string_view responseString, int responseValue) {
-						this->SetPath(Path(responseString));
-						});
+		if ((browseFlags_ & BrowseFlags::BROWSE) && System_GetPropertyBool(SYSPROP_HAS_FOLDER_BROWSER)) {
+			// Collapse the button title on very small screens (Retroid Pocket) or portrait mode.
+			std::string_view browseTitle = (g_display.dp_xres <= 550 || portrait_) ? "" : mm->T("Browse");
+			Choice *browseChoice = topBar->Add(new Choice(browseTitle, ImageID("I_FOLDER_OPEN"), new LayoutParams(WRAP_CONTENT, 64.0f)));
+			browseChoice->SetRoundCorners(RoundCorners::All);
+			browseChoice->OnClick.Handle(this, &GameBrowser::BrowseClick);
+		}
+		if (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_TV) {
+			Choice *enterPathChoice = topBar->Add(new Choice(mm->T("Enter Path"), new LayoutParams(WRAP_CONTENT, 64.0f)));
+			enterPathChoice->SetRoundCorners(RoundCorners::All);
+			enterPathChoice->OnClick.Add([=](UI::EventParams &) {
+				auto mm = GetI18NCategory(I18NCat::MAINMENU);
+				System_InputBoxGetString(token_, mm->T("Enter Path"), path_.GetPath().ToString(), false, [=](std::string_view responseString, int responseValue) {
+					this->SetPath(Path(responseString));
 					});
-			}
+				});
+		}
 #endif
-		} else if (!pathOnSeparateLine) {
-			topBar->Add(new Spacer(new LinearLayoutParams(FILL_PARENT, 64.0f, 1.0f)));
-		}
+	}
 
-		if (browseFlags_ & BrowseFlags::HOMEBREW_STORE) {
-			topBar->Add(new Choice(mm->T("Homebrew store"), ImageID("I_HOMEBREW_STORE"), new UI::LinearLayoutParams(WRAP_CONTENT, 64.0f)))->OnClick.Handle(this, &GameBrowser::OnHomebrewStore);
-		}
+	if (!isRecent) {
+		Add(new TextView(pathStr, ALIGN_VCENTER | FLAG_WRAP_TEXT, true, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(8, 0, 8, 0))));
+	}
 
-		if (browseFlags_ & BrowseFlags::UPLOAD_BUTTON) {
-			topBar->Add(new Choice(ImageID("I_FOLDER_UPLOAD"), new UI::LinearLayoutParams(WRAP_CONTENT, 64.0f)))->OnClick.Add([this](UI::EventParams &e) {
-				screenManager_->push(new UploadScreen(path_.GetPath()));
-			});
-		}
+	if (browseFlags_ & BrowseFlags::HOMEBREW_STORE) {
+		Choice *hbStore = topBar->Add(new Choice(mm->T("Homebrew store"), ImageID("I_HOMEBREW_STORE"), new UI::LinearLayoutParams(WRAP_CONTENT, 64.0f)));
+		hbStore->OnClick.Handle(this, &GameBrowser::OnHomebrewStore);
+		hbStore->SetRoundCorners(RoundCorners::All);
+	}
 
-		ChoiceStrip *layoutChoice = topBar->Add(new ChoiceStrip(ORIENT_HORIZONTAL));
-		layoutChoice->AddChoice(ImageID("I_GRID"));
-		layoutChoice->AddChoice(ImageID("I_LINES"));
-		layoutChoice->AddChoice(ImageID("I_LARGE_LIST"));
-		layoutChoice->SetSelection((int)lastViewMode_, false);
-		layoutChoice->OnChoice.Handle(this, &GameBrowser::LayoutChange);
-		topBar->Add(new Choice(ImageID("I_ROTATE_LEFT"), new LayoutParams(64.0f, 64.0f)))->OnClick.Add([=](UI::EventParams &e) {
+	if (browseFlags_ & BrowseFlags::UPLOAD_BUTTON) {
+		Choice *uploadChoice = topBar->Add(new Choice(ImageID("I_FOLDER_UPLOAD"), new UI::LinearLayoutParams(WRAP_CONTENT, 64.0f)));
+		uploadChoice->OnClick.Add([this](UI::EventParams &e) {
+			screenManager_->push(new UploadScreen(path_.GetPath()));
+		});
+		// Nowhere to put the files until a game folder has been chosen.
+		uploadChoice->SetEnabledFunc([this]() {
+			return !path_.GetPath().empty();
+		});
+		uploadChoice->SetRoundCorners(RoundCorners::All);
+	}
+
+	ChoiceStrip *layoutChoice = topBar->Add(new ChoiceStrip(ORIENT_HORIZONTAL));
+	layoutChoice->AddChoice(ImageID("I_GRID"));
+	layoutChoice->AddChoice(ImageID("I_LINES"));
+	layoutChoice->AddChoice(ImageID("I_LARGE_LIST"));
+	layoutChoice->SetSelection((int)lastViewMode_, false);
+	layoutChoice->ApplyRoundCorners();
+	layoutChoice->OnChoice.Handle(this, &GameBrowser::LayoutChange);
+	if (!isRecent) {
+		Choice *rotateChoice = topBar->Add(new Choice(ImageID("I_ROTATE_LEFT"), new LayoutParams(64.0f, 64.0f)));
+		rotateChoice->SetRoundCorners(RoundCorners::All);
+		rotateChoice->OnClick.Add([=](UI::EventParams &e) {
 			path_.Refresh();
 			refreshPending_ = true;
 		});
-		topBar->Add(new Choice(ImageID("I_GEAR"), new LayoutParams(64.0f, 64.0f)))->OnClick.Handle(this, &GameBrowser::GridSettingsClick);
+	}
 
-		if (gridStyle) {
-			gameList_ = new UI::GridLayoutList(UI::GridLayoutSettings(150 * g_Config.fGameGridScale, 85 * g_Config.fGameGridScale), new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(10, 0, 6, 0)));
-		} else {
-			UI::LinearLayout *gl = new UI::LinearLayoutList(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
-			gl->SetSpacing(4.0f);
-			gameList_ = gl;
-		}
+	Choice *gridSettingsChoice = topBar->Add(new Choice(ImageID("I_GEAR"), new LayoutParams(64.0f, 64.0f)));
+	gridSettingsChoice->SetRoundCorners(RoundCorners::All);
+	gridSettingsChoice->OnClick.Handle(this, &GameBrowser::GridSettingsClick);
+
+	if (gridStyle) {
+		gameList_ = new UI::GridLayoutList(UI::GridLayoutSettings(150 * g_Config.fGameGridScale, 85 * g_Config.fGameGridScale), new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(0, 0, 6, 0)));
 	} else {
-		if (gridStyle) {
-			gameList_ = new UI::GridLayoutList(UI::GridLayoutSettings(150 * g_Config.fGameGridScale, 85 * g_Config.fGameGridScale), new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(10, 0, 6, 0)));
-		} else {
-			UI::LinearLayout *gl = new UI::LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
-			gl->SetSpacing(4.0f);
-			gameList_ = gl;
-		}
-		// Until we can come up with a better space to put it (next to the tabs?) let's get rid of the icon config
-		// button on the Recent tab, it's ugly. You can use the button from the other tabs.
-
-		// LinearLayout *gridOptionColumn = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(64.0, 64.0f));
-		// gridOptionColumn->Add(new Spacer(12.0));
-		// gridOptionColumn->Add(new Choice(ImageID("I_GEAR"), new LayoutParams(64.0f, 64.0f)))->OnClick.Handle(this, &GameBrowser::GridSettingsClick);
-		// LinearLayout *grid = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
-		// gameList_->ReplaceLayoutParams(new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 0.75));
-		// grid->Add(gameList_);
-		// grid->Add(gridOptionColumn);
-		// Add(grid);
+		UI::LinearLayout *gl = new UI::LinearLayoutList(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
+		gl->SetSpacing(4.0f);
+		gameList_ = gl;
 	}
 	Add(gameList_);
 
@@ -1089,12 +1153,18 @@ void GameBrowser::Refresh() {
 		}
 	} else if (!listingPending_) {
 		std::vector<File::FileInfo> fileInfo;
-		path_.GetListing(fileInfo, "iso:cso:chd:pbp:elf:prx:ppdmp:");
+		path_.GetListing(fileInfo, "iso:cso:chd:pbp:elf:prx:ppdmp:cue:ccd:mds:bin:img:");
+		// PS1 discs: a .bin or .img shows up as its cue sheet or .ccd, when it has one.
+		RemoveDescribedDiscImages(&fileInfo);
+		// Drives and servers aren't games, and probing a server that's gone away can take seconds.
+		const bool probeDirs = !path_.GetPath().IsRoot() && !path_.GetPath().IsNetworkRoot();
 		for (size_t i = 0; i < fileInfo.size(); i++) {
 			bool isGame = !fileInfo[i].isDirectory;
 			bool isSaveData = false;
 			// Check if eboot directory. TODO: Should ideally be done off-thread somehow.
-			if (!isGame && path_.GetPath().size() >= 4 && IsValidPBP(path_.GetPath() / fileInfo[i].name / "EBOOT.PBP", true))
+			if (!probeDirs) {
+				// Just a directory.
+			} else if (!isGame && path_.GetPath().size() >= 4 && IsValidPBP(path_.GetPath() / fileInfo[i].name / "EBOOT.PBP", true))
 				isGame = true;
 			else if (!isGame && File::Exists(path_.GetPath() / fileInfo[i].name / "PSP_GAME/SYSDIR"))
 				isGame = true;
@@ -1103,7 +1173,8 @@ void GameBrowser::Refresh() {
 
 			if (!isGame && !isSaveData) {
 				if (browseFlags_ & BrowseFlags::NAVIGATE) {
-					dirButtons.push_back(new DirButton(fileInfo[i].fullName, fileInfo[i].name, lastViewMode_, new UI::LinearLayoutParams(UI::FILL_PARENT, UI::FILL_PARENT)));
+					const std::string name = fileInfo[i].fullName.IsNetworkRoot() ? std::string(mm->T("Network")) : fileInfo[i].name;
+					dirButtons.push_back(new DirButton(fileInfo[i].fullName, name, lastViewMode_, new UI::LinearLayoutParams(UI::FILL_PARENT, UI::FILL_PARENT)));
 				}
 			} else {
 				gameButtons.push_back(new GameButton(fileInfo[i].fullName, lastViewMode_, new UI::LinearLayoutParams(gridStyle ? UI::WRAP_CONTENT : UI::FILL_PARENT, UI::WRAP_CONTENT)));
@@ -1128,10 +1199,11 @@ void GameBrowser::Refresh() {
 		}
 	}
 
+	DirButton *upButton = nullptr;
 	if (browseFlags_ & BrowseFlags::NAVIGATE) {
 		if (path_.CanNavigateUp()) {
-			gameList_->Add(new DirButton(Path(".."), lastViewMode_, new UI::LinearLayoutParams(UI::FILL_PARENT, UI::FILL_PARENT)))->
-				OnClick.Handle(this, &GameBrowser::NavigateClick);
+			upButton = gameList_->Add(new DirButton(Path(".."), lastViewMode_, new UI::LinearLayoutParams(UI::FILL_PARENT, UI::FILL_PARENT)));
+			upButton->OnClick.Handle(this, &GameBrowser::NavigateClick);
 		}
 
 		// Add any pinned paths before other directories.
@@ -1149,6 +1221,9 @@ void GameBrowser::Refresh() {
 
 	for (size_t i = 0; i < dirButtons.size(); i++) {
 		gameList_->Add(dirButtons[i])->OnClick.Handle(this, &GameBrowser::NavigateClick);
+		if (!focusPath_.empty() && dirButtons[i]->GetPath() == focusPath_ && dirButtons[i]->SetFocus(FocusFlags::CAUSE_RESTORE)) {
+			UI::ScrollFocusedViewIntoView();
+		}
 	}
 
 	for (size_t i = 0; i < gameButtons.size(); i++) {
@@ -1157,11 +1232,22 @@ void GameBrowser::Refresh() {
 		b->OnHoldClick.Handle(this, &GameBrowser::GameButtonHoldClick);
 		b->OnHighlight.Handle(this, &GameBrowser::GameButtonHighlight);
 
-		if (!focusGamePath_.empty() && b->GamePath() == focusGamePath_) {
-			b->SetFocus(FocusFlags::CAUSE_RESTORE);
+		if (!focusPath_.empty() && b->GamePath() == focusPath_ && b->SetFocus(FocusFlags::CAUSE_RESTORE)) {
+			UI::ScrollFocusedViewIntoView();
 		}
 	}
-	focusGamePath_.clear();
+	// A listing that's still loading has no buttons to focus yet.
+	if (!listingPending_) {
+		if (focusFirstItem_) {
+			// The folder's own contents rather than "..", which only shows up first if it's empty.
+			UI::View *first = !dirButtons.empty() ? (UI::View *)dirButtons[0] : !gameButtons.empty() ? (UI::View *)gameButtons[0] : upButton;
+			if (first && first->SetFocus(FocusFlags::CAUSE_RESTORE)) {
+				UI::ScrollFocusedViewIntoView();
+			}
+		}
+		focusFirstItem_ = false;
+		focusPath_.clear();
+	}
 
 	// Show a button to toggle pinning at the very end.
 	if ((browseFlags_ & BrowseFlags::PIN) && !path_.GetPath().empty()) {
@@ -1253,9 +1339,24 @@ void GameBrowser::NavigateClick(UI::EventParams &e) {
 	Path text = button->GetPath();
 	if (button->PathAbsolute()) {
 		path_.SetPath(text);
+	} else if (text.ToString() == "..") {
+		NavigateUp();
+		return;
 	} else {
 		path_.Navigate(text.ToString());
 	}
+	focusFirstItem_ = true;
+	PathChanged();
+}
+
+void GameBrowser::NavigateUp() {
+	// Focus the directory we came out of, in the parent's listing.
+	focusPath_ = path_.GetPath();
+	path_.Navigate("..");
+	PathChanged();
+}
+
+void GameBrowser::PathChanged() {
 	g_Config.currentDirectory = path_.GetPath();
 	// Clear the search filter. This allow for smooth directory navigation using search
 	// (although there's no good way of going up...)

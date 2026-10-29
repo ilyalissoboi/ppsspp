@@ -113,6 +113,8 @@ struct VirtualFramebuffer {
 
 	// The scale factor at which we are rendering (to achieve higher resolution).
 	u8 renderScaleFactor;
+	// Whether it gets MSAA, if it's on.
+	bool multisampled;
 
 	u16 usageFlags;
 
@@ -295,6 +297,7 @@ struct DrawPixelsEntry {
 struct GPUDebugBuffer;
 class DrawEngineCommon;
 class PresentationCommon;
+struct OutputParams;
 class ShaderManagerCommon;
 class TextureCacheCommon;
 struct DisplayLayoutConfig;
@@ -314,6 +317,9 @@ public:
 	}
 	void SetDrawEngine(DrawEngineCommon *td) {
 		drawEngine_ = td;
+	}
+	DrawEngineCommon *GetDrawEngine() const {
+		return drawEngine_;
 	}
 
 	void Init(int msaaLevel);
@@ -469,7 +475,8 @@ public:
 	virtual void DeviceLost();
 	virtual void DeviceRestore(Draw::DrawContext *draw);
 
-	Draw::Framebuffer *GetTempFBO(TempFBO reason, u16 w, u16 h);
+	// msaaLevel is only used for DEPTH_SHIFT, which needs the samples of the framebuffer it shifts.
+	Draw::Framebuffer *GetTempFBO(TempFBO reason, u16 w, u16 h, int msaaLevel = 0);
 	// A single-sampled copy of the first sample of each pixel of a multisampled framebuffer, or null if it isn't
 	// multisampled or the backend can't. For reading colors as values, which averaging the samples would corrupt.
 	Draw::Framebuffer *CopyColorSample0(VirtualFramebuffer *vfb);
@@ -519,6 +526,8 @@ public:
 	}
 
 	bool PresentedThisFrame() const;
+	void SetPresentationOutput(const OutputParams *output);
+	bool PresentsToOtherOutput() const;
 
 	const std::vector<VirtualFramebuffer *> &GetVFBs() const {
 		return vfbs_;
@@ -550,6 +559,7 @@ protected:
 	void CopyToDepthFromOverlappingFramebuffers(VirtualFramebuffer *dest);
 
 	bool UpdateRenderSize(int msaaLevel);
+	bool ShouldMultisample(const VirtualFramebuffer *vfb) const;
 
 	void FlushBeforeCopy();
 	virtual void DecimateFBOs();  // keeping it virtual to let D3D do a little extra

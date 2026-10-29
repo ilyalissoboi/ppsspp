@@ -21,6 +21,7 @@
     <ClCompile Include="TestIRPassSimplify.cpp" />
     <ClCompile Include="TestDemangle.cpp" />
     <ClCompile Include="TestLzrc.cpp" />
+    <ClCompile Include="TestCwCheat.cpp" />
     <ClCompile Include="TestMpegCsc.cpp" />
     <ClCompile Include="TestSplineTessellation.cpp" />
     <ClCompile Include="TestGEMath.cpp" />
@@ -30,6 +31,7 @@
     <ClCompile Include="TestSlangParser.cpp" />
     <ClCompile Include="TestVFS.cpp" />
     <ClCompile Include="TestZipSlip.cpp" />
+    <ClCompile Include="TestPS1Eboot.cpp" />
     <ClCompile Include="TestLoongArch64Emitter.cpp" />
   </ItemGroup>
   <ItemGroup>

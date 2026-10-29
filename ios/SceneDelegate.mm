@@ -2,6 +2,7 @@
 
 #import "SceneDelegate.h"
 #import "AppDelegate.h"
+#import "ExternalDisplaySceneDelegate.h"
 
 #import "iOSCoreAudio.h"
 #import "ViewController.h"
@@ -143,6 +144,14 @@ static NSString *ExtractGameInfoScheme(NSURL *url) {
 		NSLog(@"SceneDelegate: startup path passed to argv: %s", args.back().c_str());
 	}
 
+	// Options the process itself was launched with, from Xcode or devicectl (like --graphics=metal).
+	NSArray<NSString *> *processArgs = [NSProcessInfo processInfo].arguments;
+	for (NSUInteger i = 1; i < processArgs.count; i++) {
+		if ([processArgs[i] hasPrefix:@"--"]) {
+			args.push_back(processArgs[i].UTF8String);
+		}
+	}
+
 	// From a restart, like --start-screen=touchscreentest.
 	for (const std::string &arg : SplitCommandLine(extraArgs)) {
 		args.push_back(arg);
@@ -190,6 +199,8 @@ static NSString *ExtractGameInfoScheme(NSURL *url) {
 	self.window.rootViewController = [[PPSSPPViewController alloc] init];
 
 	[self.window makeKeyAndVisible];
+
+	ExternalDisplayNotifyLaunched();
 }
 
 - (void)restart:(const char*)restartArgs {

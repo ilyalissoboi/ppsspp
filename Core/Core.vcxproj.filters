@@ -82,6 +82,9 @@
     <Filter Include="Ext\jpge">
       <UniqueIdentifier>{6c6e0188-fabf-4203-aaa2-896c42be2c20}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Ext\libdeflate">
+      <UniqueIdentifier>{5b0c7e1a-3d2f-4c8e-9a61-d4f0b2e7c913}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Ext\libzip">
       <UniqueIdentifier>{0201ff27-4fa8-4cf3-bbb9-accfdc0c7046}</UniqueIdentifier>
     </Filter>
@@ -126,6 +129,9 @@
     <ClCompile Include="MIPS\MIPSTracer.cpp">
       <Filter>MIPS</Filter>
     </ClCompile>
+    <ClCompile Include="MIPS\MeCore.cpp">
+      <Filter>MIPS</Filter>
+    </ClCompile>
     <ClCompile Include="MIPS\MIPSAnalyst.cpp">
       <Filter>MIPS</Filter>
     </ClCompile>
@@ -139,6 +145,9 @@
       <Filter>MIPS\JitCommon</Filter>
     </ClCompile>
     <ClCompile Include="FileSystems\DirectoryFileSystem.cpp">
+      <Filter>FileSystems</Filter>
+    </ClCompile>
+    <ClCompile Include="FileSystems\CSOCompress.cpp">
       <Filter>FileSystems</Filter>
     </ClCompile>
     <ClCompile Include="FileSystems\BlockDevices.cpp">
@@ -187,6 +196,9 @@
       <Filter>HLE\Kernel</Filter>
     </ClCompile>
     <ClCompile Include="HLE\sceAdler.cpp">
+      <Filter>HLE\Libraries</Filter>
+    </ClCompile>
+    <ClCompile Include="HLE\sceAmctrl.cpp">
       <Filter>HLE\Libraries</Filter>
     </ClCompile>
     <ClCompile Include="HLE\sceAtrac.cpp">
@@ -505,6 +517,12 @@
     <ClCompile Include="MIPS\MIPSStackWalk.cpp">
       <Filter>MIPS</Filter>
     </ClCompile>
+    <ClCompile Include="..\ext\libdeflate\lib\deflate_compress.c">
+      <Filter>Ext\libdeflate</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\libdeflate\lib\utils.c">
+      <Filter>Ext\libdeflate</Filter>
+    </ClCompile>
     <ClCompile Include="..\ext\xxhash.c">
       <Filter>Ext</Filter>
     </ClCompile>
@@ -604,6 +622,9 @@
     <ClCompile Include="FileLoaders\LocalFileLoader.cpp">
       <Filter>FileLoaders</Filter>
     </ClCompile>
+    <ClCompile Include="FileLoaders\PS1EbootFileLoader.cpp">
+      <Filter>FileLoaders</Filter>
+    </ClCompile>
     <ClCompile Include="FileLoaders\HTTPFileLoader.cpp">
       <Filter>FileLoaders</Filter>
     </ClCompile>
@@ -659,6 +680,9 @@
       <Filter>Core</Filter>
     </ClCompile>
     <ClCompile Include="HLE\KUBridge.cpp">
+      <Filter>HLE\Libraries</Filter>
+    </ClCompile>
+    <ClCompile Include="HLE\sceSysreg.cpp">
       <Filter>HLE\Libraries</Filter>
     </ClCompile>
     <ClCompile Include="FileSystems\BlobFileSystem.cpp">
@@ -752,6 +776,9 @@
       <Filter>HW</Filter>
     </ClCompile>
     <ClCompile Include="HLE\Plugins.cpp">
+      <Filter>HLE</Filter>
+    </ClCompile>
+    <ClCompile Include="HLE\PopsBoot.cpp">
       <Filter>HLE</Filter>
     </ClCompile>
     <ClCompile Include="..\ext\snappy\snappy-stubs-internal.cpp">
@@ -1162,6 +1189,15 @@
     <ClCompile Include="HW\GpioMMIO.cpp">
       <Filter>HW</Filter>
     </ClCompile>
+    <ClCompile Include="HW\MMIO.cpp">
+      <Filter>HW</Filter>
+    </ClCompile>
+    <ClCompile Include="HW\MeMMIO.cpp">
+      <Filter>HW</Filter>
+    </ClCompile>
+    <ClCompile Include="HW\PopsMMIO.cpp">
+      <Filter>HW</Filter>
+    </ClCompile>
     <ClCompile Include="HLE\sceNp2.cpp">
       <Filter>HLE\Libraries</Filter>
     </ClCompile>
@@ -1419,6 +1455,9 @@
     <ClInclude Include="MIPS\MIPSTracer.h">
       <Filter>MIPS</Filter>
     </ClInclude>
+    <ClInclude Include="MIPS\MeCore.h">
+      <Filter>MIPS</Filter>
+    </ClInclude>
     <ClInclude Include="MIPS\MIPSAnalyst.h">
       <Filter>MIPS</Filter>
     </ClInclude>
@@ -1432,6 +1471,9 @@
       <Filter>MIPS\JitCommon</Filter>
     </ClInclude>
     <ClInclude Include="FileSystems\DirectoryFileSystem.h">
+      <Filter>FileSystems</Filter>
+    </ClInclude>
+    <ClInclude Include="FileSystems\CSOCompress.h">
       <Filter>FileSystems</Filter>
     </ClInclude>
     <ClInclude Include="FileSystems\BlockDevices.h">
@@ -1483,6 +1525,9 @@
       <Filter>HLE\Kernel</Filter>
     </ClInclude>
     <ClInclude Include="HLE\sceAdler.h">
+      <Filter>HLE\Libraries</Filter>
+    </ClInclude>
+    <ClInclude Include="HLE\sceAmctrl.h">
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
     <ClInclude Include="HLE\sceAtrac.h">
@@ -1650,6 +1695,9 @@
     <ClInclude Include="Util\PPGeDraw.h">
       <Filter>Util</Filter>
     </ClInclude>
+    <ClInclude Include="Util\KL4E.h">
+      <Filter>Util</Filter>
+    </ClInclude>
     <ClInclude Include="Util\PSARUnpack.h">
       <Filter>Util</Filter>
     </ClInclude>
@@ -1794,6 +1842,45 @@
     <ClInclude Include="..\ext\disarm.h">
       <Filter>Ext</Filter>
     </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\libdeflate.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\common\common_defs.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\common\compiler_gcc.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\common\compiler_msc.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\bt_matchfinder.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\deflate_compress.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\deflate_constants.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\hc_matchfinder.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\lib_common.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\matchfinder_common.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\unaligned.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\x86\matchfinder_impl.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\libdeflate\lib\arm\matchfinder_impl.h">
+      <Filter>Ext\libdeflate</Filter>
+    </ClInclude>
     <ClInclude Include="..\ext\xxhash.h">
       <Filter>Ext</Filter>
     </ClInclude>
@@ -1914,6 +2001,9 @@
     <ClInclude Include="FileLoaders\LocalFileLoader.h">
       <Filter>FileLoaders</Filter>
     </ClInclude>
+    <ClInclude Include="FileLoaders\PS1EbootFileLoader.h">
+      <Filter>FileLoaders</Filter>
+    </ClInclude>
     <ClInclude Include="FileLoaders\HTTPFileLoader.h">
       <Filter>FileLoaders</Filter>
     </ClInclude>
@@ -1957,6 +2047,9 @@
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="HLE\KUBridge.h">
+      <Filter>HLE\Libraries</Filter>
+    </ClInclude>
+    <ClInclude Include="HLE\sceSysreg.h">
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
     <ClInclude Include="FileSystems\BlobFileSystem.h">
@@ -2055,6 +2148,9 @@
     <ClInclude Include="HLE\Plugins.h">
       <Filter>HLE</Filter>
     </ClInclude>
+    <ClInclude Include="HLE\PopsBoot.h">
+      <Filter>HLE</Filter>
+    </ClInclude>
     <ClInclude Include="..\ext\gason\gason.h">
       <Filter>Ext\gason</Filter>
     </ClInclude>
@@ -2131,6 +2227,15 @@
       <Filter>HW</Filter>
     </ClInclude>
     <ClInclude Include="HW\GpioMMIO.h">
+      <Filter>HW</Filter>
+    </ClInclude>
+    <ClInclude Include="HW\MMIO.h">
+      <Filter>HW</Filter>
+    </ClInclude>
+    <ClInclude Include="HW\MeMMIO.h">
+      <Filter>HW</Filter>
+    </ClInclude>
+    <ClInclude Include="HW\PopsMMIO.h">
       <Filter>HW</Filter>
     </ClInclude>
     <ClInclude Include="HLE\sceNp2.h">

@@ -65,6 +65,7 @@ private:
 };
 
 struct ConfigSetting;
+struct ConfigSettingRef;
 
 struct ConfigSectionMeta {
 	ConfigBlock *configBlock;
@@ -85,6 +86,7 @@ struct DisplayLayoutConfig : public ConfigBlock {
 	int iInternalScreenRotation = ROTATION_LOCKED_HORIZONTAL;  // The internal screen rotation angle. Useful for vertical SHMUPs and similar.
 	bool bRotateControlsWithScreen = true;  // Rotate gamepad controls along with the internal screen rotation.
 	bool bIgnoreScreenInsets = true;  // Android: Center screen disregarding insets if this is enabled.
+	std::string sOverlay;  // Overlay (bezel) image id, see GPU/Common/Overlay.h. Empty means off.
 
 	// Deprecated
 	bool bEnableCardboardVR = false; // Cardboard Master Switch
@@ -96,6 +98,7 @@ struct DisplayLayoutConfig : public ConfigBlock {
 	bool InternalRotationIsPortrait() const;
 	bool CanResetToDefault() const override { return true; }
 	bool ResetToDefault(std::string_view blockName) override;
+	std::unique_ptr<ConfigBlock> NewDefault(std::string_view blockName) const override;
 	size_t Size() const override { return sizeof(DisplayLayoutConfig); }  // For sanity checks
 };
 
@@ -103,6 +106,7 @@ struct TouchControlConfig : public ConfigBlock {
 	constexpr TouchControlConfig() {
 		// Hide all extras and custom buttons by default.
 		touchRightAnalogStick.show = false;
+		touchHomeKey.show = false;
 		for (size_t i = 0; i < CUSTOM_BUTTON_COUNT; i++) {
 			touchCustom[i].show = false;
 		}
@@ -118,6 +122,7 @@ struct TouchControlConfig : public ConfigBlock {
 
 	ConfigTouchPos touchStartKey;
 	ConfigTouchPos touchSelectKey;
+	ConfigTouchPos touchHomeKey;
 	ConfigTouchPos touchFastForwardKey;
 	ConfigTouchPos touchLKey;
 	ConfigTouchPos touchRKey;
@@ -143,6 +148,7 @@ struct TouchControlConfig : public ConfigBlock {
 
 	bool CanResetToDefault() const override { return true; }
 	bool ResetToDefault(std::string_view blockName) override;
+	std::unique_ptr<ConfigBlock> NewDefault(std::string_view blockName) const override;
 	size_t Size() const override { return sizeof(TouchControlConfig); }  // For sanity checks
 };
 
@@ -161,6 +167,7 @@ struct GestureControlConfig : public ConfigBlock {
 
 	bool CanResetToDefault() const override { return true; }
 	bool ResetToDefault(std::string_view blockName) override;
+	std::unique_ptr<ConfigBlock> NewDefault(std::string_view blockName) const override;
 	size_t Size() const override { return sizeof(GestureControlConfig); }  // For sanity checks
 };
 
@@ -187,7 +194,6 @@ public:
 
 	// General
 	bool bScreenshotsAsPNG;
-	bool bUseFFV1;
 	bool bDumpFrames;
 	bool bDumpVideoOutput;
 	bool bDumpAudio;
@@ -233,12 +239,12 @@ public:
 
 	bool bFastMemory;
 	int iCpuCore;
+	// Run homebrew's Media Engine code (Core/MIPS/MeCore.h). Global for now, in developer settings.
+	bool bEmulateMediaEngine;
 	bool bCheckForNewVersion;
 	bool bWow64WarningDismissed;
 	bool bForceLagSync;
 	bool bFuncReplacements;
-	// Compute the VFPU's dot products (vdot, vmmul, vtfm and the rest) bit-exactly like the PSP.
-	bool bAccurateVdot;
 	bool bHideSlowWarnings;
 	bool bHideStateWarnings;
 	uint32_t uJitDisableFlags;
@@ -253,6 +259,9 @@ public:
 	bool bCompressSymbols;
 	bool bCacheFullIsoInRam;
 	bool bAutoUpgradeFirmware;
+	// The game screen's "Compress game" (UI/GamePacker.h).
+	int iCSOPreset;  // CSOCompress::Preset: 0 = Best, 1 = PSP Compatible
+	bool bPackKeepOriginal;
 	int iRemoteISOPort; // Also used for serving a local remote debugger.
 	std::string sLastRemoteISOServer;
 	int iLastRemoteISOPort;
@@ -276,6 +285,12 @@ public:
 
 	std::string sReportHost;
 	std::vector<std::string> vPinnedPaths;
+	// Android: the content URIs that home screen shortcuts were most recently created for or launched with, newest
+	// first. Their file grants are never released (see ContentUri.manageUriGrants).
+	std::vector<std::string> vShortcutUris;
+	static constexpr int MAX_SHORTCUT_URIS = 64;  // An eighth of Android's limit on persisted URI grants.
+	// Moves the URI to the front. Returns true if it wasn't in the list before.
+	bool AddShortcutUri(std::string_view uri);
 	std::string sLanguageIni;
 
 	std::string sIgnoreCompatSettings;
@@ -284,7 +299,9 @@ public:
 
 	// GFX
 	int iGPUBackend;
+	int iExternalDisplay;  // ExternalDisplayMode
 	std::string sCustomDriver;
+	int iAdrenoEnvVars;  // AdrenoEnvVars
 	std::string sFailedGPUBackends;  // NOT stored in ppsspp.ini anymore!
 	std::string sDisabledGPUBackends;
 	// We have separate device parameters for each backend so it doesn't get erased if you switch backends.
@@ -357,9 +374,14 @@ public:
 	int iTexScalingType; // 0 = xBRZ, 1 = Hybrid
 	bool bTexDeposterize;
 	bool bTexHardwareScaling;
-	int iFpsLimit1;
-	int iFpsLimit2;
-	int iAnalogFpsLimit;
+	// In percent of normal speed. 0 means unlimited, and negative (not for analog) disabled.
+	int iAltSpeedPercent1;
+	int iAltSpeedPercent2;
+	int iAnalogAltSpeedPercent;
+	// The old frame rate based settings. Only read, to migrate them.
+	int iLegacyFpsLimit1;
+	int iLegacyFpsLimit2;
+	int iLegacyAnalogFpsLimit;
 	int iMaxRecent;
 	int iCurrentStateSlot;
 	int iRewindSnapshotInterval;
@@ -383,7 +405,6 @@ public:
 	bool bReportAccurateFreeStorageSpace;
 	int iBloomHack; //0 = off, 1 = safe, 2 = balanced, 3 = aggressive
 	int iSkipGPUReadbackMode;  // 0 = off, 1 = skip, 2 = to texture
-	int iSplineBezierQuality; // 0 = low , 1 = Intermediate , 2 = High
 	bool bShaderCache;  // Hidden ini-only setting, useful for debugging shader compile times.
 	bool bUberShaderVertex;
 	int iDefaultTab;
@@ -440,6 +461,9 @@ public:
 	int iAltSpeedVolume;
 
 	bool bExtraAudioBuffering;  // For bluetooth
+	// Android only.
+	int iAndroidAudioApi;  // AndroidAudioApi
+	bool bAndroidAudioMMap;
 	std::string sAudioDevice;
 	bool bAutoSwitchAudioDevice;
 	bool bUseOldAtrac;
@@ -458,7 +482,6 @@ public:
 	int iBackgroundAnimation;  // enum BackgroundAnimation
 	bool bTransparentBackground;
 	int iSettingsCurrentTab;
-	int iDeveloperSettingsCurrentTab;
 
 	std::string sThemeName;
 
@@ -482,14 +505,14 @@ public:
 	// 0 - no tilt, 1 - analog stick, 2 - D-Pad, 3 - Action Buttons (Tri, Cross, Square, Circle)
 	int iTiltInputType;
 	bool bTiltInputEnabled;
+	bool bTiltUseGyro;
 
 	// The four tabs (including Remote last). Values from GameBrowserViewMode.
 	int iGameBrowserView1;
 	int iGameBrowserView2;
 	int iGameBrowserView3;
 	int iGameBrowserView4;
-	// The old GridView bools, only read, to migrate to iGameBrowserView*. -1 if missing.
-	int iLegacyGridView1;
+	// The old GridView bool, only read, to migrate to iGameBrowserView4. -1 if missing.
 	int iLegacyGridView4;
 
 	// Right analog binding
@@ -603,11 +626,15 @@ public:
 	int iButtonPreference;
 	int iLockParentalLevel;
 	bool bEncryptSave;
+	// /CONFIG/SYSTEM/umd_autoboot: whether the VSH starts an inserted disc by itself.
+	bool bVshUmdAutoboot;
 
 	// Networking
 	bool bEnableAdhocServer;
 	std::string sProAdhocServer;
 	int iAdhocServerRelayMode;
+	bool bAdhocUseUdp;
+	bool bAdhocRelayModeEnetPdpReliable;
 	bool bAdhocServerShowPlayerPorts;
 	std::string sInfrastructureDNSServer;
 	std::string sInfrastructureUsername;  // Username used for Infrastructure play. Different restrictions.
@@ -772,6 +799,8 @@ public:
 
 	bool HasGameConfig(std::string_view gameId);
 	bool IsGameSpecific() const { return !gameId_.empty(); }
+	// False if the last Load() couldn't read the ini (missing, or the memory stick isn't reachable) and fell back to defaults.
+	bool LoadedFromFile() const { return loadedFromFile_; }
 
 	void SetSearchPath(const Path &path);
 
@@ -808,7 +837,10 @@ public:
 		return orientation == DeviceOrientation::Portrait ? touchControlsPortrait : touchControlsLandscape;
 	}
 
-	static int GetDefaultValueInt(int *configSetting);
+	// Finds the setting a pointer into g_Config (or one of its blocks) points to. Null if it isn't one.
+	static const ConfigSettingRef *FindSetting(const void *ptr);
+	static int GetDefaultValueInt(const int *configSetting);
+	static float GetDefaultValueFloat(const float *configSetting);
 
 	void DoNotSaveSetting(void *configSetting) {
 		settingsNotToSave_.push_back(configSetting);
@@ -823,7 +855,7 @@ private:
 
 	friend struct ConfigSetting;
 
-	static std::map<const void *, std::pair<const ConfigBlock *, const ConfigSetting *>> &getPtrLUT();
+	static std::map<const void *, ConfigSettingRef> &getPtrLUT();
 
 	// Applies defaults for missing settings.
 	void ReadAllSettings(const IniFile &iniFile);
@@ -838,6 +870,7 @@ private:
 	// Always the paths to the main configs, doesn't change with game-specific overlay.
 	Path iniFilename_;
 	Path controllerIniFilename_;
+	bool loadedFromFile_ = false;
 
 	Path searchPath_;
 	Path appendedConfigFileName_;
@@ -850,6 +883,15 @@ private:
 
 std::string CreateRandMAC();
 std::string DefaultProAdhocServer();
+
+// The frame rate limit for an alternative speed. Unlimited (0) and disabled (negative) stay as they are.
+inline int AltSpeedPercentToFps(int percent) {
+	if (percent <= 0) {
+		return percent;
+	}
+	int fps = (percent * 60 + 50) / 100;
+	return fps < 1 ? 1 : fps;
+}
 
 // TODO: Find a better place for this.
 extern http::RequestManager g_DownloadManager;
