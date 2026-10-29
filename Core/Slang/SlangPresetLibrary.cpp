@@ -64,6 +64,12 @@ static void RecursiveScanForPresets(const Path &currentDir, const Path &rootDir,
 					size_t firstSlash = relativePath.find('/');
 					if (firstSlash != std::string::npos) {
 						entry.category = relativePath.substr(0, firstSlash);
+						// A preset further down keeps its path within the category, since packs
+						// like lola-retro have presets of the same name in curved/, flat/ and so on.
+						std::string inCategory = relativePath.substr(firstSlash + 1);
+						if (inCategory.size() >= ext.size()) {
+							entry.displayName = inCategory.substr(0, inCategory.size() - ext.size());
+						}
 					} else {
 						// File directly in root -> "misc"
 						entry.category = "misc";

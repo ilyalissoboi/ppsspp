@@ -24,6 +24,7 @@
 #include "Common/UI/PopupScreens.h"
 #include "Common/UI/ScreenManager.h"
 #include "Common/Data/Text/I18n.h"
+#include "Common/StringUtils.h"
 
 #include "UI/SlangShaderScreen.h"
 #include "UI/MiscViews.h"
@@ -73,17 +74,23 @@ void SlangShaderScreen::CreateViews() {
 	LinearLayout *leftColumn = new LinearLayout(ORIENT_VERTICAL);
 	leftColumn->Add(new ItemHeader(gr->T("RetroArch (slang) shaders")));
 
-	// Import/Update button.
-	std::string importLabel = library_.Empty() ?
-		std::string(gr->T("Import RetroArch (slang) shaders")) :
-		std::string(gr->T("Import / update shaders"));
-	leftColumn->Add(new Choice(importLabel))->OnClick.Add([](EventParams &e) {
-		if (!g_SlangImporter.Busy()) {
-			if (!g_SlangImporter.Start("")) {
-				g_OSD.Show(OSDType::MESSAGE_ERROR, "Slang shader import failed", g_SlangImporter.GetError(), 4.0f);
-			}
+	// An Import/Update button per pack.
+	for (const SlangShaderPack &pack : GetSlangShaderPacks()) {
+		bool installed = IsSlangShaderPackInstalled(pack);
+		std::string importLabel;
+		if (!*pack.dir) {
+			importLabel = installed ? gr->T("Update RetroArch (slang) shaders") : gr->T("Import RetroArch (slang) shaders");
+		} else {
+			importLabel = ApplySafeSubstitutions(installed ? gr->T("Update %1 shaders") : gr->T("Download %1 shaders"), pack.name);
 		}
-	});
+		leftColumn->Add(new Choice(importLabel))->OnClick.Add([&pack](EventParams &e) {
+			if (!g_SlangImporter.Busy()) {
+				if (!g_SlangImporter.Start(pack)) {
+					g_OSD.Show(OSDType::MESSAGE_ERROR, "Slang shader import failed", g_SlangImporter.GetError(), 4.0f);
+				}
+			}
+		});
+	}
 
 	leftScrollView->Add(leftColumn);
 	root_->Add(leftScrollView);

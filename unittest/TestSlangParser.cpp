@@ -357,6 +357,11 @@ bool TestSlangPresetLibrary() {
 	File::WriteStringToFile(true, "shaders = 0\n", root / "handheld" / "lcd.slangp");
 	File::WriteStringToFile(true, "shaders = 0\n", root / "bilinear.slangp");   // root -> "misc"
 	File::WriteStringToFile(true, "not a preset\n", root / "crt" / "readme.txt"); // ignored
+	// Same name in two subdirectories of one category.
+	File::CreateFullPath(root / "lola-retro" / "curved");
+	File::CreateFullPath(root / "lola-retro" / "flat");
+	File::WriteStringToFile(true, "shaders = 0\n", root / "lola-retro" / "curved" / "amiga.slangp");
+	File::WriteStringToFile(true, "shaders = 0\n", root / "lola-retro" / "flat" / "amiga.slangp");
 
 	SlangPresetLibrary lib;
 	lib.Rescan(root);
@@ -371,9 +376,66 @@ bool TestSlangPresetLibrary() {
 	EXPECT_TRUE(crt[0].displayName == "crt-lottes");   // sorted
 	EXPECT_TRUE(crt[1].displayName == "crt-royale");
 	EXPECT_TRUE(crt[0].path.GetFileExtension() == ".slangp");
-	// only 4 presets total (txt ignored)
-	EXPECT_EQ_INT((int)lib.All().size(), 4);
+	// Nested presets keep their path within the category.
+	auto lola = lib.GetPresets("lola-retro");
+	EXPECT_EQ_INT((int)lola.size(), 2);
+	EXPECT_TRUE(lola[0].displayName == "curved/amiga");
+	EXPECT_TRUE(lola[1].displayName == "flat/amiga");
+	// only 6 presets total (txt ignored)
+	EXPECT_EQ_INT((int)lib.All().size(), 6);
 	File::DeleteDirRecursively(root);
+	return true;
+}
+
+bool TestSlangShaderPacks() {
+	Path tmp("/tmp/slang_packs_test");
+	File::DeleteDirRecursively(tmp);
+	EXPECT_TRUE(File::CreateFullPath(tmp));
+	Path zipPath = tmp / "pack.zip";
+	Path root = tmp / "slang";
+
+	int zerr = 0;
+	zip_t *z = zip_open(zipPath.ToString().c_str(), ZIP_CREATE | ZIP_TRUNCATE, &zerr);
+	EXPECT_TRUE(z != nullptr);
+	auto addFile = [&](const char *name, const std::string &content) {
+		zip_source_t *s = zip_source_buffer(z, content.data(), content.size(), 0);
+		zip_file_add(z, name, s, ZIP_FL_ENC_UTF_8);
+	};
+	addFile("pack-1.0/RetroArch/crt/x.slangp", "shaders = 0\n");
+	addFile("pack-1.0/RetroArch/crt/shaders/x.slang", "#version 450\n");
+	addFile("pack-1.0/Reshade/x.slang", "#version 450\n");   // outside the subdir, skipped
+	zip_close(z);
+
+	// A pack goes in its own directory, with only the subdir's contents.
+	std::string err;
+	Path packDir = root / "pack";
+	EXPECT_TRUE(ExtractSlangPackage(zipPath, packDir, "", 0, &err, nullptr, "pack-1.0/RetroArch/crt/"));
+	EXPECT_TRUE(File::Exists(packDir / "x.slangp"));
+	EXPECT_TRUE(File::Exists(packDir / "shaders" / "x.slang"));
+	EXPECT_FALSE(File::Exists(packDir / "Reshade"));
+	EXPECT_FALSE(File::Exists(packDir / "pack-1.0"));
+
+	// Installing at the root clears it, except for the directories it's told to keep.
+	File::WriteStringToFile(true, "stale", root / "stale.slang");
+	EXPECT_TRUE(ExtractSlangPackage(zipPath, root, "", 0, &err, nullptr, "", { "pack" }));
+	EXPECT_FALSE(File::Exists(root / "stale.slang"));
+	EXPECT_TRUE(File::Exists(root / "pack-1.0" / "Reshade" / "x.slang"));
+	EXPECT_TRUE(File::Exists(packDir / "x.slangp"));
+	File::DeleteDirRecursively(tmp);
+
+	// Picking the asset out of a "latest release" response.
+	const std::string release = R"({
+		"tag_name": "v1.19",
+		"assets": [
+			{ "name": "lola-retro-kodi-v1.19.zip", "browser_download_url": "https://example/kodi.zip" },
+			{ "name": "lola-retro-v1.19.zip", "browser_download_url": "https://example/slang.zip" }
+		]
+	})";
+	std::string url;
+	EXPECT_TRUE(FindGitHubReleaseAsset(release, "lola-retro-", &url, &err));
+	EXPECT_TRUE(url == "https://example/slang.zip");
+	EXPECT_FALSE(FindGitHubReleaseAsset(release, "satpixie-crt-shader-", &url, &err));
+	EXPECT_FALSE(FindGitHubReleaseAsset("{\"message\": \"Not Found\"}", "lola-retro-", &url, &err));
 	return true;
 }
 
