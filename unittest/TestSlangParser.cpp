@@ -17,6 +17,7 @@
 
 #include <string>
 #include <map>
+#include <cstring>
 #ifdef SHARED_LIBZIP
 #include <zip.h>
 #else
@@ -298,8 +299,9 @@ bool TestSlangPackageExtract() {
 	int zerr = 0;
 	zip_t *z = zip_open(zipPath.ToString().c_str(), ZIP_CREATE | ZIP_TRUNCATE, &zerr);
 	EXPECT_TRUE(z != nullptr);
-	auto addFile = [&](const char *name, const std::string &content) {
-		zip_source_t *s = zip_source_buffer(z, content.data(), content.size(), 0);
+	// zip_source_buffer doesn't copy, and zip_close reads the data, so the contents are literals.
+	auto addFile = [&](const char *name, const char *content) {
+		zip_source_t *s = zip_source_buffer(z, content, strlen(content), 0);
 		zip_file_add(z, name, s, ZIP_FL_ENC_UTF_8);
 	};
 	addFile("crt/x.slangp", "shaders = 0\n");
@@ -397,8 +399,9 @@ bool TestSlangShaderPacks() {
 	int zerr = 0;
 	zip_t *z = zip_open(zipPath.ToString().c_str(), ZIP_CREATE | ZIP_TRUNCATE, &zerr);
 	EXPECT_TRUE(z != nullptr);
-	auto addFile = [&](const char *name, const std::string &content) {
-		zip_source_t *s = zip_source_buffer(z, content.data(), content.size(), 0);
+	// zip_source_buffer doesn't copy, and zip_close reads the data, so the contents are literals.
+	auto addFile = [&](const char *name, const char *content) {
+		zip_source_t *s = zip_source_buffer(z, content, strlen(content), 0);
 		zip_file_add(z, name, s, ZIP_FL_ENC_UTF_8);
 	};
 	addFile("pack-1.0/RetroArch/crt/x.slangp", "shaders = 0\n");
