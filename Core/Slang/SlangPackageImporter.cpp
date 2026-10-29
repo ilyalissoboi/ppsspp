@@ -25,10 +25,78 @@
 #include "Core/Loaders.h"
 #include "Core/Config.h"
 #include "Common/Net/HTTPRequest.h"
+#include "Common/File/DirListing.h"
 #include "Common/File/FileUtil.h"
+#include "Common/Data/Format/JSONReader.h"
 #include "Common/Data/Format/JSONWriter.h"
 #include "Common/Log.h"
+#include "Common/StringUtils.h"
 #include "Common/Thread/ThreadUtil.h"
+#include <algorithm>
+
+const std::vector<SlangShaderPack> &GetSlangShaderPacks() {
+	static const std::vector<SlangShaderPack> packs = {
+		{ "libretro", "", nullptr, nullptr, "" },
+		{ "lola-retro", "lola-retro", "zoran123456/lola-retro", "lola-retro-", "lola-retro/" },
+		// The release also has Reshade versions; only the slang preset and its shaders are wanted.
+		{ "satpixie-crt", "satpixie-crt", "Conkwer/satpixie-crt-shader", "satpixie-crt-shader-", "satpixie-crt-shader/RetroArch/shaders/shaders_slang/crt/" },
+	};
+	return packs;
+}
+
+Path GetSlangShaderPackDir(const SlangShaderPack &pack) {
+	return *pack.dir ? GetSlangShaderDir() / pack.dir : GetSlangShaderDir();
+}
+
+bool IsSlangShaderPackInstalled(const SlangShaderPack &pack) {
+	return File::Exists(GetSlangShaderPackDir(pack) / "manifest.json");
+}
+
+bool FindGitHubReleaseAsset(const std::string &json, const std::string &assetPrefix,
+                            std::string *url, std::string *error) {
+	json::JsonReader reader(json.data(), json.size());
+	if (!reader.ok()) {
+		*error = "couldn't parse the release info";
+		return false;
+	}
+	json::JsonGet root = reader.root();
+	std::string tag;
+	const JsonNode *assets = root.getArray("assets");
+	if (!root.getString("tag_name", &tag) || !assets) {
+		*error = "the release info has no tag or assets";
+		return false;
+	}
+	// Matching the whole name skips the release's other zips (other emulators, variants).
+	const std::string wanted = assetPrefix + tag + ".zip";
+	for (const JsonNode *iter : assets->value) {
+		json::JsonGet asset = iter->value;
+		if (wanted == asset.getStringOr("name", "") && asset.getString("browser_download_url", url) && !url->empty()) {
+			return true;
+		}
+	}
+	*error = "release " + tag + " has no " + wanted;
+	return false;
+}
+
+// Empties 'dir', except for the top-level entries named in 'keep'.
+static void ClearDir(const Path &dir, const std::vector<std::string> &keep) {
+	if (keep.empty()) {
+		File::DeleteDirRecursively(dir);
+		return;
+	}
+	std::vector<File::FileInfo> files;
+	File::GetFilesInDir(dir, &files, nullptr);
+	for (const File::FileInfo &info : files) {
+		if (std::find(keep.begin(), keep.end(), info.name) != keep.end()) {
+			continue;
+		}
+		if (info.isDirectory) {
+			File::DeleteDirRecursively(info.fullName);
+		} else {
+			File::Delete(info.fullName);
+		}
+	}
+}
 
 static bool WriteZipEntry(zip_t *z, zip_uint64_t index, const Path &out, std::string *error) {
 	struct zip_stat st; zip_stat_init(&st);
@@ -56,7 +124,9 @@ static bool WriteZipEntry(zip_t *z, zip_uint64_t index, const Path &out, std::st
 bool ExtractSlangPackage(const Path &zipPath, const Path &destRoot,
                          const std::string &sourceUrl, int64_t unixTimestamp,
                          std::string *error,
-                         const SlangExtractProgressCallback &progress) {
+                         const SlangExtractProgressCallback &progress,
+                         const std::string &zipSubdir,
+                         const std::vector<std::string> &keep) {
 	// Extract directly into destRoot. We intentionally do NOT use a temp-dir + rename swap:
 	// on Android scoped storage (SAF) a directory rename/move is unsupported and the copy
 	// fallback recursively copies every file (minutes of thrash) and then fails, leaving an
@@ -64,12 +134,12 @@ bool ExtractSlangPackage(const Path &zipPath, const Path &destRoot,
 	// destination for the same reason. Trade-off: a failed/interrupted import can leave a
 	// partial tree, so we clear destRoot first and remove it again on failure rather than
 	// guaranteeing the previous install survives a mid-extraction error.
-	File::DeleteDirRecursively(destRoot);   // start from a clean install
+	ClearDir(destRoot, keep);   // start from a clean install
 	if (!File::CreateFullPath(destRoot)) { *error = "could not create shader dir"; return false; }
 
 	ZipContainer zipContainer = ZipOpenPath(zipPath);
 	zip_t *z = zipContainer;
-	if (!z) { *error = "could not open downloaded zip"; File::DeleteDirRecursively(destRoot); return false; }
+	if (!z) { *error = "could not open downloaded zip"; ClearDir(destRoot, keep); return false; }
 
 	int fileCount = 0;
 	zip_int64_t numEntries = zip_get_num_entries(z, 0);
@@ -77,6 +147,10 @@ bool ExtractSlangPackage(const Path &zipPath, const Path &destRoot,
 		const char *name = zip_get_name(z, (zip_uint64_t)i, 0);
 		if (!name) continue;
 		std::string entry(name);
+		if (!zipSubdir.empty()) {
+			if (!startsWith(entry, zipSubdir) || entry.size() == zipSubdir.size()) continue;
+			entry = entry.substr(zipSubdir.size());
+		}
 		bool isDir = !entry.empty() && (entry.back() == '/' || entry.back() == '\\');
 		Path outPath;
 		if (!ResolveSafeZipEntryPath(destRoot, entry, isDir, &outPath)) {
@@ -84,7 +158,7 @@ bool ExtractSlangPackage(const Path &zipPath, const Path &destRoot,
 		}
 		if (isDir) { File::CreateFullPath(outPath); continue; }
 		if (!WriteZipEntry(z, (zip_uint64_t)i, outPath, error)) {
-			File::DeleteDirRecursively(destRoot); return false;
+			ClearDir(destRoot, keep); return false;
 		}
 		fileCount++;
 		// numEntries includes directory + rejected entries, so this is an approximate fraction;
@@ -93,7 +167,7 @@ bool ExtractSlangPackage(const Path &zipPath, const Path &destRoot,
 	}
 	ZipClose(zipContainer);
 
-	if (fileCount == 0) { *error = "no valid shader files in archive"; File::DeleteDirRecursively(destRoot); return false; }
+	if (fileCount == 0) { *error = "no valid shader files in archive"; ClearDir(destRoot, keep); return false; }
 
 	// Write the manifest last, so its presence marks a completed extraction.
 	{
@@ -114,24 +188,59 @@ SlangPackageImporter::~SlangPackageImporter() {
 	if (extractThread_.joinable()) extractThread_.join();
 }
 
-bool SlangPackageImporter::Start(const std::string &url) {
+bool SlangPackageImporter::Start(const SlangShaderPack &pack) {
 	if (Busy()) return false;
-	sourceUrl_ = url.empty() ? g_Config.sSlangBuildbotUrl : url;
-	if (sourceUrl_.empty()) { error_ = "no buildbot URL configured"; state_ = SlangImportState::FAILED; return false; }
+	pack_ = pack;
 	zipPath_ = Path(g_Config.memStickDirectory) / "ppsspp_slang.dl";
 	error_.clear();
 	extractDone_ = false;
 	extractOk_ = false;
+	if (pack.githubRepo) {
+		// The zip's URL has the release tag in it, so ask GitHub which release is the latest first.
+		sourceUrl_.clear();
+		std::string apiUrl = std::string("https://api.github.com/repos/") + pack.githubRepo + "/releases/latest";
+		releaseInfo_ = g_DownloadManager.StartDownload(apiUrl, Path(), http::RequestFlags::Default,
+			"application/vnd.github+json", "slang_release_info");
+		if (!releaseInfo_) { error_ = "failed to start download"; state_ = SlangImportState::FAILED; return false; }
+		state_ = SlangImportState::DOWNLOADING;
+		return true;
+	}
+	sourceUrl_ = g_Config.sSlangBuildbotUrl;
+	if (sourceUrl_.empty()) { error_ = "no buildbot URL configured"; state_ = SlangImportState::FAILED; return false; }
+	StartZipDownload();
+	return state_ == SlangImportState::DOWNLOADING;
+}
+
+void SlangPackageImporter::StartZipDownload() {
 	download_ = g_DownloadManager.StartDownload(sourceUrl_, zipPath_,
 		http::RequestFlags::ProgressBar | http::RequestFlags::ProgressBarDelayed,
 		"application/zip", "slang_shaders");
-	if (!download_) { error_ = "failed to start download"; state_ = SlangImportState::FAILED; return false; }
+	if (!download_) { error_ = "failed to start download"; state_ = SlangImportState::FAILED; return; }
 	state_ = SlangImportState::DOWNLOADING;
-	return true;
 }
 
 void SlangPackageImporter::Update() {
 	if (state_ == SlangImportState::DOWNLOADING) {
+		if (releaseInfo_) {
+			if (!releaseInfo_->Done()) {
+				return;
+			}
+			std::shared_ptr<http::Request> finished = releaseInfo_;
+			releaseInfo_.reset();
+			if (finished->Failed() || finished->ResultCode() != 200) {
+				error_ = "couldn't look up the latest release (HTTP " + std::to_string(finished->ResultCode()) + ")";
+				state_ = SlangImportState::FAILED;
+				return;
+			}
+			std::string json;
+			finished->buffer().TakeAll(&json);
+			if (!FindGitHubReleaseAsset(json, pack_.assetPrefix, &sourceUrl_, &error_)) {
+				state_ = SlangImportState::FAILED;
+				return;
+			}
+			StartZipDownload();
+			return;
+		}
 		if (download_ && download_->Done()) {
 			bool ok = !download_->Failed() && download_->ResultCode() == 200 && File::Exists(zipPath_);
 			std::shared_ptr<http::Request> finished = download_;
@@ -146,8 +255,19 @@ void SlangPackageImporter::Update() {
 			state_ = SlangImportState::EXTRACTING;
 			std::string src = sourceUrl_;
 			Path zip = zipPath_;
+			Path dest = GetSlangShaderPackDir(pack_);
+			std::string zipSubdir = pack_.zipSubdir;
+			// The libretro pack is installed at the root, around the other packs' directories.
+			std::vector<std::string> keep;
+			if (!*pack_.dir) {
+				for (const SlangShaderPack &other : GetSlangShaderPacks()) {
+					if (*other.dir) {
+						keep.push_back(other.dir);
+					}
+				}
+			}
 			extractProgress_ = 0.0f;
-			extractThread_ = std::thread([this, zip, src]() {
+			extractThread_ = std::thread([this, zip, src, dest, zipSubdir, keep]() {
 				// On Android the shader dir is a scoped-storage (SAF) path, so File:: ops route
 				// through JNI; a raw std::thread is not attached to the JVM and would abort in
 				// getEnv(). Attach for the lifetime of the extraction (no-op on other platforms).
@@ -155,10 +275,10 @@ void SlangPackageImporter::Update() {
 				std::string err;
 				// NOTE: pass 0 for timestamp; Date/time is not available in this layer without
 				// plumbing. A wall-clock stamp can be added later; fileCount+url suffice for now.
-				bool ok = ExtractSlangPackage(zip, GetSlangShaderDir(), src, 0, &err,
+				bool ok = ExtractSlangPackage(zip, dest, src, 0, &err,
 					[this](int done, int total) {
 						extractProgress_ = total > 0 ? (float)done / (float)total : 0.0f;
-					});
+					}, zipSubdir, keep);
 				threadError_ = err;
 				extractOk_ = ok;
 				extractDone_ = true;

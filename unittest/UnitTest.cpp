@@ -3162,6 +3162,7 @@ bool TestSlangPackageExtract();
 bool TestSlangParamDescription();
 bool TestSlangPresetLibrary();
 bool TestSlangPresetParameters();
+bool TestSlangShaderPacks();
 bool TestLibrashaderLoaderAbsent();
 bool TestLibrashaderLoaderNotALibrary();
 bool TestSlangChainBackendSelection();
@@ -3554,6 +3555,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(SlangParamDescription),
 	TEST_ITEM(SlangPresetLibrary),
 	TEST_ITEM(SlangPresetParameters),
+	TEST_ITEM(SlangShaderPacks),
 	TEST_ITEM(LibrashaderLoaderAbsent),
 	TEST_ITEM(LibrashaderLoaderNotALibrary),
 	TEST_ITEM(SlangChainBackendSelection),

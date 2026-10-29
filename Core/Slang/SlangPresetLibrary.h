@@ -24,7 +24,7 @@ struct SlangParamDesc;
 
 struct SlangPresetEntry {
 	std::string category;     // first path segment under the slang root; "" -> "misc"
-	std::string displayName;  // .slangp filename without extension
+	std::string displayName;  // path within the category, without the .slangp extension
 	Path path;                // absolute path to the .slangp
 };
 

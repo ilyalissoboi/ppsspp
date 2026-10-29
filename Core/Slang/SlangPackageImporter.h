@@ -18,6 +18,7 @@
 #pragma once
 #include <functional>
 #include <string>
+#include <vector>
 #include <memory>
 #include <thread>
 #include <atomic>
@@ -31,24 +32,45 @@ using SlangExtractProgressCallback = std::function<void(int, int)>;
 
 // Extract a slang-shaders zip at 'zipPath' directly into 'destRoot' (default GetSlangShaderDir()).
 // Only shader-asset files that pass ResolveSafeZipEntryPath are written. destRoot is cleared first
-// and extraction happens in place (no temp-dir+rename swap: directory rename is unsupported on
-// Android scoped storage and its copy fallback is unusably slow / fails). On success, writes
-// destRoot/manifest.json (sourceUrl, timestamp, fileCount) last. Returns false + *error on failure,
-// removing the partial destRoot. 'sourceUrl'/'unixTimestamp' are recorded in the manifest ("" / 0
-// if unknown). Optional 'progress' is called per written file. Synchronous; run from a worker thread.
+// (except for the top-level entries named in 'keep') and extraction happens in place (no
+// temp-dir+rename swap: directory rename is unsupported on Android scoped storage and its copy
+// fallback is unusably slow / fails). If 'zipSubdir' is set, only entries under that path in the
+// zip are extracted, with the prefix stripped. On success, writes destRoot/manifest.json
+// (sourceUrl, timestamp, fileCount) last. Returns false + *error on failure, clearing destRoot
+// again. 'sourceUrl'/'unixTimestamp' are recorded in the manifest ("" / 0 if unknown). Optional
+// 'progress' is called per written file. Synchronous; run from a worker thread.
 bool ExtractSlangPackage(const Path &zipPath, const Path &destRoot,
                          const std::string &sourceUrl, int64_t unixTimestamp,
                          std::string *error,
-                         const SlangExtractProgressCallback &progress = nullptr);
+                         const SlangExtractProgressCallback &progress = nullptr,
+                         const std::string &zipSubdir = "",
+                         const std::vector<std::string> &keep = {});
+
+// A downloadable shader pack. The libretro pack installs at the slang root; each of the others
+// gets its own directory under it, which is also the category its presets are listed under.
+struct SlangShaderPack {
+	const char *name;         // shown in the UI
+	const char *dir;          // directory under GetSlangShaderDir(), "" for the libretro pack
+	const char *githubRepo;   // "owner/repo" to install its latest release; nullptr uses g_Config.sSlangBuildbotUrl
+	const char *assetPrefix;  // the release asset to download is <assetPrefix><tag>.zip
+	const char *zipSubdir;    // the path in the zip whose contents are installed
+};
+
+const std::vector<SlangShaderPack> &GetSlangShaderPacks();
+// Where a pack is installed, and whether it is (its manifest is written last).
+Path GetSlangShaderPackDir(const SlangShaderPack &pack);
+bool IsSlangShaderPackInstalled(const SlangShaderPack &pack);
+// Picks <assetPrefix><tag>.zip's download URL out of a GitHub "latest release" API response.
+bool FindGitHubReleaseAsset(const std::string &json, const std::string &assetPrefix,
+                            std::string *url, std::string *error);
 
 enum class SlangImportState { IDLE, DOWNLOADING, EXTRACTING, DONE, FAILED };
 
 class SlangPackageImporter {
 public:
 	~SlangPackageImporter();
-	// Begins download+import of 'url' (default g_Config.sSlangBuildbotUrl if empty).
-	// Returns false if an import is already in progress.
-	bool Start(const std::string &url);
+	// Begins download+import of 'pack'. Returns false if an import is already in progress.
+	bool Start(const SlangShaderPack &pack);
 	// Pump each frame from the UI thread (drives download completion + thread join).
 	void Update();
 	SlangImportState GetState() const { return state_; }
@@ -56,7 +78,11 @@ public:
 	std::string GetError() const { return error_; }
 	bool Busy() const { return state_ == SlangImportState::DOWNLOADING || state_ == SlangImportState::EXTRACTING; }
 private:
+	void StartZipDownload();
+
 	SlangImportState state_ = SlangImportState::IDLE;
+	SlangShaderPack pack_{};
+	std::shared_ptr<http::Request> releaseInfo_;  // the GitHub API request, before the zip download
 	std::shared_ptr<http::Request> download_;
 	std::thread extractThread_;
 	std::atomic<bool> extractDone_{false};
