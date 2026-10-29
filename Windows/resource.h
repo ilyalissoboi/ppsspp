@@ -159,7 +159,6 @@
 #define ID_OPTIONS_SCREEN3X              40027
 #define ID_OPTIONS_SCREEN4X              40028
 #define ID_OPTIONS_SCREEN5X              40029
-#define ID_OPTIONS_HARDWARETRANSFORM     40030
 #define IDC_STEPHLE                      40032
 #define ID_OPTIONS_LINEARFILTERING       40033
 #define ID_OPTIONS_AUTOMAXQUALITYFILTERING 40043
@@ -279,7 +278,6 @@
 #define ID_GEDBG_COPYALL                 40163
 #define ID_GEDBG_WATCH                   40164
 #define ID_FILE_DUMPFRAMES               40165
-#define ID_FILE_USEFFV1                  40166
 #define ID_FILE_DUMPAUDIO                40167
 #define ID_HELP_GITHUB                   40168
 #define IDC_GEDBG_RECORD                 40169

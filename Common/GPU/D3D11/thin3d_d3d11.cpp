@@ -64,9 +64,10 @@ public:
 // A D3D11Framebuffer is a D3D11Framebuffer plus all the textures it owns.
 class D3D11Framebuffer : public Framebuffer {
 public:
-	D3D11Framebuffer(int width, int height) {
+	D3D11Framebuffer(int width, int height, bool zStencil) {
 		width_ = width;
 		height_ = height;
+		hasDepthStencil_ = zStencil;
 	}
 	~D3D11Framebuffer() {
 	}
@@ -462,6 +463,7 @@ void D3D11DrawContext::HandleEvent(Event ev, int width, int height, void *param1
 		bbRenderTargetTex_ = (ID3D11Texture2D *)param2;
 		bbWidth_ = width;
 		bbHeight_ = height;
+		primarySwapchain_->SetSize(width, height);
 
 		// Create matching depth stencil texture. This is not really needed for PPSSPP though,
 		// and probably not for most other renderers either as you're usually rendering to other render targets and
@@ -1498,7 +1500,7 @@ uint32_t D3D11DrawContext::GetDataFormatSupport(DataFormat fmt) const {
 
 Framebuffer *D3D11DrawContext::CreateFramebuffer(const FramebufferDesc &desc) {
 	HRESULT hr;
-	D3D11Framebuffer *fb = new D3D11Framebuffer(desc.width, desc.height);
+	D3D11Framebuffer *fb = new D3D11Framebuffer(desc.width, desc.height, desc.z_stencil);
 
 	// We don't (yet?) support multiview for D3D11. Not sure if there's a way to do it.
 	// Texture arrays are supported but we don't have any other use cases yet.
@@ -1727,6 +1729,7 @@ bool D3D11DrawContext::BlitFramebuffer(Framebuffer *srcfb, int srcX1, int srcY1,
 }
 
 bool D3D11DrawContext::CopyFramebufferToMemory(Framebuffer *src, Aspect channelBits, int bx, int by, int bw, int bh, Draw::DataFormat destFormat, void *pixels, int pixelStride, ReadbackMode mode, const char *tag) {
+	src = PrimaryToNull(src);
 	D3D11Framebuffer *fb = (D3D11Framebuffer *)src;
 
 	if (fb) {
@@ -1945,6 +1948,7 @@ bool D3D11DrawContext::RunNativeCallback(Framebuffer *src, Framebuffer *dst, Nat
 }
 
 void D3D11DrawContext::BindFramebufferAsRenderTarget(Framebuffer *fbo, const RenderPassInfo &rp, const char *tag) {
+	fbo = PrimaryToNull(fbo);
 	// TODO: deviceContext1 can actually discard.
 	if (fbo) {
 		D3D11Framebuffer *fb = (D3D11Framebuffer *)fbo;
@@ -2042,6 +2046,7 @@ uint64_t D3D11DrawContext::GetNativeObject(NativeObject obj, void *srcObject) {
 }
 
 void D3D11DrawContext::GetFramebufferDimensions(Framebuffer *fbo, int *w, int *h) {
+	fbo = PrimaryToNull(fbo);
 	D3D11Framebuffer *fb = (D3D11Framebuffer *)fbo;
 	if (fb) {
 		*w = fb->Width();

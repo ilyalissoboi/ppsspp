@@ -27,6 +27,7 @@
 
 class FramebufferManagerCommon;
 class TextureCacheCommon;
+struct OutputParams;
 class DrawEngineCommon;
 class VertexDecoder;
 class GraphicsContext;
@@ -81,8 +82,8 @@ public:
 	bool GetCurrentDrawAsDebugVertices(GECommand cmd, GEPrimitiveType prim, GEPrimitiveType *outPrim, int count, std::vector<GPUDebugVertex> *vertices, std::vector<u16> *indices, int *lowerIndexBound, TransformStats *stats, DebugVertexFlags flags) const;
 	int GetCurrentPrim(GEPrimitiveType *prim, GECommand *outCmd) const;  // Return value has the count.
 
-	// FinishInitOnMainThread runs on the main thread, of course.
-	virtual void FinishInitOnMainThread() {}
+	// True while pipelines from the shader cache are still being created, in the background.
+	virtual bool IsLoadingShaderCache() const { return false; }
 
 	Draw::DrawContext *GetDrawContext() {
 		return draw_;
@@ -152,6 +153,11 @@ public:
 	virtual void PrepareCopyDisplayToOutput(const DisplayLayoutConfig &config) = 0;
 	virtual void CopyDisplayToOutput(const DisplayLayoutConfig &config) = 0;
 	virtual bool PresentedThisFrame() const = 0;
+	// Presents the display to another output than the primary one, until called with nullptr. Set it
+	// before PrepareCopyDisplayToOutput, which lays out for it.
+	virtual void SetPresentationOutput(const OutputParams *output) {}
+	// Whether the game goes to another output than the primary (SetPresentationOutput), like a TV.
+	virtual bool PresentsToOtherOutput() const { return false; }
 
 	// Invalidate any cached content sourced from the specified range.
 	// If size = -1, invalidate everything.
@@ -194,6 +200,18 @@ public:
 
 	void Execute_ImmVertexAlphaPrim(u32 op, u32 diff);
 
+	// Matrix loads, with a fast path for the DATA commands following a NUM. SoftGPU has its own.
+	void Execute_WorldMtxNum(u32 op, u32 diff);
+	void Execute_WorldMtxData(u32 op, u32 diff);
+	void Execute_ViewMtxNum(u32 op, u32 diff);
+	void Execute_ViewMtxData(u32 op, u32 diff);
+	void Execute_ProjMtxNum(u32 op, u32 diff);
+	void Execute_ProjMtxData(u32 op, u32 diff);
+	void Execute_TgenMtxNum(u32 op, u32 diff);
+	void Execute_TgenMtxData(u32 op, u32 diff);
+	void Execute_BoneMtxNum(u32 op, u32 diff);
+	void Execute_BoneMtxData(u32 op, u32 diff);
+
 	void Execute_Unknown(u32 op, u32 diff);
 
 	static int EstimatePerVertexCost();
@@ -208,8 +226,15 @@ public:
 		u32 addr;
 		u32 size;
 		int flips;
+		// How much of each row the frame covers from addr on, 0 if not known.
+		u32 rowBytes;
 	};
 	bool IsVideo(u32 addr) const;
+	// How many bytes of video frame there are from addr on, 0 if addr isn't in one.
+	u32 VideoBytesFrom(u32 addr) const;
+	// How much of the first row of a texture at addr the video frames written there cover, in bytes,
+	// counting from addr. 0 if not known.
+	u32 VideoRowBytesFrom(u32 addr, u32 rowBytes) const;
 	bool VideoIsPlaying() const {
 		return !videos_.empty();
 	}
@@ -316,6 +341,7 @@ public:
 	void NotifyFlush();
 
 protected:
+	DLResult RunDLQueue();
 	// While debugging is active, these may block.
 	void NotifyDisplay(u32 framebuf, u32 stride, int format);
 
@@ -377,6 +403,7 @@ protected:
 	TextureCacheCommon *textureCache_ = nullptr;
 
 	bool flushOnParams_ = true;
+	bool listEndedSinceDepthWait_ = false;
 
 	GraphicsContext *gfxCtx_;
 	Draw::DrawContext *draw_ = nullptr;
@@ -394,7 +421,7 @@ protected:
 	u64 drawCompleteTicks;
 	u64 busyTicks;
 
-	void NoteVideoRange(u32 addr, u32 size);
+	void NoteVideoRange(u32 addr, u32 size, u32 rowBytes = 0);
 	void DecimateVideos();
 	std::vector<VideoInfo> videos_;
 

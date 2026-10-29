@@ -33,6 +33,7 @@
 
 class VertexDecoder;
 struct DepthDraw;
+class DepthRasterWorker;
 
 enum {
 	VERTEX_BUFFER_MAX = 65536,
@@ -159,13 +160,31 @@ public:
 		return decoded_ + 12 * 65536;
 	}
 
+	// Rasterizes the queued depth draws, and waits for them.
 	void FlushQueuedDepth();
+	// Starts rasterizing the queued depth draws, without waiting.
+	void SubmitQueuedDepth();
+	// Waits for the depth draws already submitted, leaving the queued ones queued.
+	void WaitForSubmittedDepth();
+	// Waits if depth rasterization in progress may write to these bytes.
+	void WaitForDepthWrites(u32 addr, u32 size);
 
 protected:
 	bool CheckClipFlags(bool useHwTransform) const;
 
 	void DecodeVerts(const VertexDecoder *dec, u8 *dest);
 	int DecodeInds();
+
+	// How many vertices software transform turns a prim into, for the prims it expands to quads.
+	static int ExpandedVertexCount(GEPrimitiveType prim, int vertexCount) {
+		switch (prim) {
+		case GE_PRIM_POINTS: return vertexCount * 4;
+		case GE_PRIM_LINES: return (vertexCount / 2) * 4;
+		case GE_PRIM_LINE_STRIP: return vertexCount > 1 ? (vertexCount - 1) * 4 : 0;
+		case GE_PRIM_RECTANGLES: return (vertexCount / 2) * 4;
+		default: return 0;
+		}
+	}
 
 	// Whether an indexed draw can share the previous draw's vertex decode, by widening its index range.
 	bool CanExtendDecode(const void *verts, const void *inds, const VertexDecoder *dec) const {
@@ -181,6 +200,7 @@ protected:
 	void DepthRasterSubmitRaw(GEPrimitiveType prim, const VertexDecoder *dec, uint32_t vertTypeID, int vertexCount);
 	void DepthRasterPredecoded(GEPrimitiveType prim, const void *inVerts, int numDecoded, const VertexDecoder *dec, int vertexCount);
 	bool CalculateDepthDraw(DepthDraw *draw, GEPrimitiveType prim, int vertexCount, int numDecoded);
+	void CommitDepthDraw(const DepthDraw &draw, int vertexCount, int numDecoded);
 
 	static inline int IndexSize(u32 vtype) {
 		const u32 indexType = (vtype & GE_VTYPE_IDX_MASK);
@@ -368,18 +388,11 @@ protected:
 	// Software depth raster
 	bool useDepthRaster_ = false;
 
-	float *depthTransformed_ = nullptr;
-	int *depthScreenVerts_ = nullptr;
-	uint16_t *depthIndices_ = nullptr;
+	DepthRasterWorker *depthWorker_ = nullptr;
 
 	// Depth tracking
 	ClipInfoFlags clipInfoFlags_{};
 	ClipInfoFlags lastClipInfoFlags_{};  // Flags at the last flush. For dirtying.
-
-	// Queue
-	int depthVertexCount_ = 0;
-	int depthIndexCount_ = 0;
-	std::vector<DepthDraw> depthDraws_;
 
 	double rasterTimeStart_ = 0.0;
 

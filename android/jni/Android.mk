@@ -423,6 +423,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Common/Render/ManagedTexture.cpp \
   $(SRC)/Common/Render/DrawBuffer.cpp \
   $(SRC)/Common/Render/AtlasGen.cpp \
+  $(SRC)/Common/Render/DropShadow.cpp \
   $(SRC)/Common/Render/TextureAtlas.cpp \
   $(SRC)/Common/Render/Text/draw_text.cpp \
   $(SRC)/Common/Render/Text/draw_text_android.cpp \
@@ -553,6 +554,8 @@ EXEC_AND_LIB_FILES := \
   $(ARCH_FILES) \
   $(GPU_VULKAN_FILES) \
   $(SRC)/ext/xxhash.c \
+  $(SRC)/ext/libdeflate/lib/deflate_compress.c \
+  $(SRC)/ext/libdeflate/lib/utils.c \
   $(SRC)/Core/MIPS/MIPS.cpp.arm \
   $(SRC)/Core/MIPS/MIPSAnalyst.cpp \
   $(SRC)/Core/MIPS/MIPSDis.cpp \
@@ -567,6 +570,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/MIPS/MIPSCodeUtils.cpp.arm \
   $(SRC)/Core/MIPS/MIPSDebugInterface.cpp \
   $(SRC)/Core/MIPS/MIPSTracer.cpp \
+  $(SRC)/Core/MIPS/MeCore.cpp \
   $(SRC)/Core/MIPS/IR/IRAnalysis.cpp \
   $(SRC)/Core/MIPS/IR/IRFrontend.cpp \
   $(SRC)/Core/MIPS/IR/IRJit.cpp \
@@ -592,6 +596,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/GPU/Common/DepalettizeShaderCommon.cpp \
   $(SRC)/GPU/Common/FragmentShaderGenerator.cpp \
   $(SRC)/GPU/Common/FramebufferManagerCommon.cpp \
+  $(SRC)/GPU/Common/Overlay.cpp \
   $(SRC)/GPU/Common/PresentationCommon.cpp \
   $(SRC)/GPU/Common/GPUDebugInterface.cpp \
   $(SRC)/GPU/Common/IndexGenerator.cpp.arm \
@@ -647,6 +652,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/GPU/Software/RasterizerRectangle.cpp.arm \
   $(SRC)/GPU/Software/Sampler.cpp \
   $(SRC)/GPU/Software/SoftGpu.cpp \
+  $(SRC)/GPU/Null/GPU_Null.cpp \
   $(SRC)/GPU/Software/TransformUnit.cpp \
   $(SRC)/Core/ELF/ElfReader.cpp \
   $(SRC)/Core/ELF/PBPReader.cpp \
@@ -659,6 +665,9 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/HW/Camera.cpp \
   $(SRC)/Core/HW/Display.cpp \
   $(SRC)/Core/HW/GpioMMIO.cpp \
+  $(SRC)/Core/HW/MMIO.cpp \
+  $(SRC)/Core/HW/MeMMIO.cpp \
+  $(SRC)/Core/HW/PopsMMIO.cpp \
   $(SRC)/Core/HW/MemoryStick.cpp \
   $(SRC)/Core/HW/MpegDemux.cpp.arm \
   $(SRC)/Core/HW/AvcDecoder.cpp.arm \
@@ -688,6 +697,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/FileLoaders/DiskCachingFileLoader.cpp \
   $(SRC)/Core/FileLoaders/HTTPFileLoader.cpp \
   $(SRC)/Core/FileLoaders/LocalFileLoader.cpp \
+  $(SRC)/Core/FileLoaders/PS1EbootFileLoader.cpp \
   $(SRC)/Core/FileLoaders/RamCachingFileLoader.cpp \
   $(SRC)/Core/FileLoaders/RetryingFileLoader.cpp \
   $(SRC)/Core/FileLoaders/ZipFileLoader.cpp \
@@ -750,10 +760,13 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/HLE/ReplaceTables.cpp \
   $(SRC)/Core/HLE/HLE.cpp \
   $(SRC)/Core/HLE/KUBridge.cpp \
+  $(SRC)/Core/HLE/sceSysreg.cpp \
   $(SRC)/Core/HLE/NetInetConstants.cpp \
   $(SRC)/Core/HLE/SocketManager.cpp \
   $(SRC)/Core/HLE/Plugins.cpp \
+  $(SRC)/Core/HLE/PopsBoot.cpp \
   $(SRC)/Core/HLE/sceAdler.cpp \
+  $(SRC)/Core/HLE/sceAmctrl.cpp \
   $(SRC)/Core/HLE/sceAtrac.cpp \
   $(SRC)/Core/HLE/AtracCtx.cpp \
   $(SRC)/Core/HLE/AtracCtx2.cpp \
@@ -810,6 +823,18 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/ext/aemu_postoffice/client/mutex_impl_cpp.cpp \
   $(SRC)/ext/aemu_postoffice/client/delay_impl_cpp.cpp \
   $(SRC)/ext/aemu_postoffice/client/log_impl_ppsspp.cpp \
+  $(SRC)/ext/aemu_postoffice/client/list.c \
+  $(SRC)/ext/aemu_postoffice/client/enet.c \
+  $(SRC)/ext/aemu_postoffice/adhocctl/client/adhocctl.c \
+  $(SRC)/ext/aemu_postoffice/adhocctl/client/adhocctl_mem.c \
+  $(SRC)/ext/aemu_postoffice/server_cpp/server.cpp \
+  $(SRC)/ext/aemu_postoffice/server_cpp/session.cpp \
+  $(SRC)/ext/aemu_postoffice/server_cpp/semaphore.cpp \
+  $(SRC)/ext/aemu_postoffice/server_cpp/log.cpp \
+  $(SRC)/ext/aemu_postoffice/server_cpp/common.cpp \
+  $(SRC)/ext/aemu_postoffice/server_cpp/enet.cpp \
+  $(SRC)/ext/aemu_postoffice/server_cpp/snapshot.cpp \
+  $(SRC)/ext/aemu_postoffice/server_cpp/native_socket_linux.cpp \
   $(SRC)/Core/HLE/sceNetAdhocMatching.cpp \
   $(SRC)/Core/HLE/sceNetApctl.cpp \
   $(SRC)/Core/HLE/sceNetInet.cpp \
@@ -845,6 +870,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/HLE/scePauth.cpp \
   $(SRC)/Core/FileSystems/BlobFileSystem.cpp \
   $(SRC)/Core/FileSystems/BlockDevices.cpp \
+  $(SRC)/Core/FileSystems/CSOCompress.cpp \
   $(SRC)/Core/FileSystems/ISOFileSystem.cpp \
   $(SRC)/Core/FileSystems/FileSystem.cpp \
   $(SRC)/Core/FileSystems/MetaFileSystem.cpp \
@@ -986,6 +1012,39 @@ LOCAL_MODULE := libzstd
 LOCAL_SRC_FILES := $(LIBZSTD_FILES)
 include $(BUILD_STATIC_LIBRARY)
 
+# The bundled zlib, rather than the NDK's, which is too old for some of what we use (uncompress2).
+include $(CLEAR_VARS)
+LOCAL_MODULE := libzlib
+LOCAL_SRC_FILES := \
+  $(SRC)/ext/zlib/adler32.c \
+  $(SRC)/ext/zlib/compress.c \
+  $(SRC)/ext/zlib/crc32.c \
+  $(SRC)/ext/zlib/deflate.c \
+  $(SRC)/ext/zlib/gzclose.c \
+  $(SRC)/ext/zlib/gzlib.c \
+  $(SRC)/ext/zlib/gzread.c \
+  $(SRC)/ext/zlib/gzwrite.c \
+  $(SRC)/ext/zlib/infback.c \
+  $(SRC)/ext/zlib/inffast.c \
+  $(SRC)/ext/zlib/inflate.c \
+  $(SRC)/ext/zlib/inftrees.c \
+  $(SRC)/ext/zlib/trees.c \
+  $(SRC)/ext/zlib/uncompr.c \
+  $(SRC)/ext/zlib/zutil.c
+LOCAL_CFLAGS := -O3
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/$(SRC)/ext/zlib
+include $(BUILD_STATIC_LIBRARY)
+
+# FFmpeg, from the sources in ext/ffmpeg. See its README.md.
+include $(CLEAR_VARS)
+include $(LOCAL_PATH)/$(SRC)/ext/ffmpeg-build/sources.mk
+LOCAL_MODULE := libffmpeg
+LOCAL_SRC_FILES := $(addprefix $(SRC)/ext/ffmpeg/,$(FFMPEG_SOURCES))
+LOCAL_CFLAGS := -O3 -DHAVE_AV_CONFIG_H -D_ISOC99_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -w -Werror=implicit-function-declaration
+LOCAL_C_INCLUDES := $(LOCAL_PATH)/$(SRC)/ext/ffmpeg-build $(LOCAL_PATH)/$(SRC)/ext/ffmpeg
+LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/$(SRC)/ext/ffmpeg
+include $(BUILD_STATIC_LIBRARY)
+
 include $(CLEAR_VARS)
 include $(LOCAL_PATH)/Locals.mk
 LOCAL_STATIC_LIBRARIES += ppsspp_common ppsspp_core libarmips libzstd oboe
@@ -1015,9 +1074,20 @@ LOCAL_SRC_FILES := \
   $(SRC)/UI/DisplayLayoutScreen.cpp \
   $(SRC)/UI/SlangShaderScreen.cpp \
   $(SRC)/UI/EmuScreen.cpp \
+  $(SRC)/UI/ImposeHome.cpp \
   $(SRC)/UI/GameBrowser.cpp \
   $(SRC)/UI/MainScreen.cpp \
   $(SRC)/UI/TabbedDialogScreen.cpp \
+  $(SRC)/UI/SettingsPage.cpp \
+  $(SRC)/UI/Settings/GraphicsPage.cpp \
+  $(SRC)/UI/Settings/ControlsPage.cpp \
+  $(SRC)/UI/Settings/AudioPage.cpp \
+  $(SRC)/UI/Settings/NetworkingPage.cpp \
+  $(SRC)/UI/Settings/GeneralPage.cpp \
+  $(SRC)/UI/Settings/SystemPage.cpp \
+  $(SRC)/UI/Settings/ToolsPage.cpp \
+  $(SRC)/UI/Settings/VRPage.cpp \
+  $(SRC)/UI/SettingsPagesDialogScreen.cpp \
   $(SRC)/UI/AdhocServerScreen.cpp \
   $(SRC)/UI/SimpleDialogScreen.cpp \
   $(SRC)/UI/MemStickScreen.cpp \
@@ -1036,10 +1106,11 @@ LOCAL_SRC_FILES := \
   $(SRC)/UI/LoadStateConfirmScreen.cpp \
   $(SRC)/UI/GameInfoCache.cpp \
   $(SRC)/UI/GameScreen.cpp \
+  $(SRC)/UI/GamePacker.cpp \
   $(SRC)/UI/UploadScreen.cpp \
   $(SRC)/UI/ControlMappingScreen.cpp \
   $(SRC)/UI/GameSettingsScreen.cpp \
-  $(SRC)/UI/DeveloperToolsScreen.cpp \
+  $(SRC)/UI/DeveloperSettingsPages.cpp \
   $(SRC)/UI/GPUDriverTestScreen.cpp \
   $(SRC)/UI/TiltAnalogSettingsScreen.cpp \
   $(SRC)/UI/TouchControlLayoutScreen.cpp \
@@ -1120,12 +1191,14 @@ ifeq ($(UNITTEST),1)
     $(SRC)/unittest/TestVFS.cpp \
     $(SRC)/unittest/TestDemangle.cpp \
     $(SRC)/unittest/TestLzrc.cpp \
+    $(SRC)/unittest/TestCwCheat.cpp \
     $(SRC)/unittest/TestMpegCsc.cpp \
     $(SRC)/unittest/TestSplineTessellation.cpp \
     $(SRC)/unittest/TestGEMath.cpp \
     $(SRC)/unittest/TestZipSlip.cpp \
     $(SRC)/unittest/TestSlangParser.cpp \
     $(SRC)/unittest/TestLibrashader.cpp \
+    $(SRC)/unittest/TestPS1Eboot.cpp \
     $(SRC)/unittest/UnitTest.cpp
 
   include $(BUILD_EXECUTABLE)

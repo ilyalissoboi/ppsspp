@@ -314,6 +314,10 @@ static inline bool GuessVRDrawingHUD(bool is2D, bool flatScreen) {
 	else if (!is2D) hud = false;
 	//HUD has to be blended
 	else if (!gstate.isAlphaBlendEnabled()) hud = false;
+#ifdef __LIBRETRO__
+	// Untextured transition fades must cover the view, not be scaled with the HUD.
+	else if (!gstate.isTextureMapEnabled()) hud = false;
+#endif
 	//HUD cannot be rendered with clear color mask
 	else if (gstate.isClearModeColorMask()) hud = false;
 	//HUD cannot be rendered with depth color mask
@@ -361,7 +365,12 @@ void LinkedShader::UpdateUniforms(const ShaderID &vsid, const ShaderLanguageDesc
 		flatScreen = IsFlatVRScene();
 	}
 
+#ifdef __LIBRETRO__
+	// Blend and texture-enable changes can change HUD classification without dirtying uniforms.
+	if (!dirty && !useVR)
+#else
 	if (!dirty)
+#endif
 		return;
 
 	if (dirty & DIRTY_DEPAL) {
@@ -603,6 +612,7 @@ void ShaderManagerGLES::Clear() {
 	linkedShaderCache_.clear();
 	fsCache_.Clear();
 	vsCache_.Clear();
+	lastShader_ = nullptr;
 	lastFSID_.set_invalid();
 	lastVSID_.set_invalid();
 
@@ -858,7 +868,7 @@ enum class CacheDetectFlags {
 };
 
 #define CACHE_HEADER_MAGIC 0x83277592
-#define CACHE_VERSION 46
+#define CACHE_VERSION 47
 
 struct CacheHeader {
 	uint32_t magic;
@@ -932,6 +942,7 @@ bool ShaderManagerGLES::LoadCache(File::IOFile &f) {
 	expectedSize += header.numVertexShaders * sizeof(VShaderID);
 	expectedSize += header.numFragmentShaders * sizeof(FShaderID);
 	expectedSize += header.numLinkedPrograms * (sizeof(VShaderID) + sizeof(FShaderID));
+	expectedSize += sizeof(uint64_t);  // The checksum.
 	if (sz != expectedSize) {
 		ERROR_LOG(Log::G3D, "Shader cache file is wrong size: %lld instead of %lld", sz, expectedSize);
 		return false;
@@ -1076,4 +1087,8 @@ void ShaderManagerGLES::SaveCache(const Path &filename, DrawEngineGLES *drawEngi
 		fwrite(&fsid, 1, sizeof(fsid), f);
 	}
 	fclose(f);
+	if (!AppendShaderCacheChecksum(filename)) {
+		ERROR_LOG(Log::G3D, "Failed to write the shader cache");
+		File::Delete(filename);
+	}
 }

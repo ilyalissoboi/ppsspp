@@ -511,6 +511,9 @@ static void ClipTrianglesAgainstNearPlane(
 		}
 		// Case 2: Entirely visible
 		else if (insideCount == 3) {
+			if (numIndicesOut + 3 > maxIndicesOut) {
+				continue;
+			}
 			indicesOut[numIndicesOut++] = idx0;
 			indicesOut[numIndicesOut++] = idx1;
 			indicesOut[numIndicesOut++] = idx2;
@@ -523,6 +526,10 @@ static void ClipTrianglesAgainstNearPlane(
 		}
 		// Case 4: Partially clipped
 		else {
+			// Clipping adds two vertices and up to two triangles. Drop the triangle if they don't fit.
+			if (transformedCount + 2 > maxTransformed || numIndicesOut + 6 > maxIndicesOut) {
+				continue;
+			}
 			stats->clippedTriangles++;
 
 			// We need to organize vertices cleanly to calculate intersections.
@@ -894,28 +901,24 @@ static SoftwareTransformAction ProjectClipAndExpand(SoftwareTransformParams &par
 			if (gstate.isDepthClipEnabled()) {
 				const u16 *indsIn = (const u16 *)inds;
 				int newIndexCount = 0;
-				ClipTrianglesAgainstNearPlane(transformed, numDecodedVerts, 65536, inds, vertexCount, indsOut, newIndexCount, 65336, params.trianglesReversed, &result->stats);
+				ClipTrianglesAgainstNearPlane(transformed, numDecodedVerts, std::min(vertsSize, 65536), inds, vertexCount, indsOut, newIndexCount, indsSize - vertexCount, params.trianglesReversed, &result->stats);
 				drawIndexCount = newIndexCount;
 			} else {
 				std::vector<int> outsideZ;
 				outsideZ.resize(vertexCount);
 
-				// First, check inside/outside directions for each index.
-				// We are still in clip space here, so we can cull aggressively in Z.
+				// First, check each index. Without depth clip, a vertex is outside when its screen Z is beyond
+				// 0..65535 or it's behind the camera, as in the software renderer's ClipToScreen and ProcessTriangle.
+				// The viewport's own Z range can be narrower: Yu-Gi-Oh GX Tag Force's backdrop has 10000..50000 and
+				// vertices past it, which the PSP draws (the replay of 7124 ULES00600_0003 in ppsspp-framedumps).
 				// TODO: This is so cheap now that we can probably avoid the buffer and just do the work below.
-				// See the comment in VertexShader for the epsilons
-
+				const float zScale = gstate.getViewportZScale();
+				const float zCenter = gstate.getViewportZCenter();
 				for (int i = 0; i < vertexCount; ++i) {
 					float z = transformed[indsIn[i]].z;
 					float w = transformed[indsIn[i]].pos_w;
-					const float delta = 0.0000304f / w;
-					if (z > w + delta) {
-						outsideZ[i] = 1;
-					} else if (z < -(w + delta)) {
-						outsideZ[i] = -1;
-					} else {
-						outsideZ[i] = 0;
-					}
+					float screenZ = z * zScale / w + zCenter;
+					outsideZ[i] = (w > 0.0f && screenZ >= 0.0f && screenZ < 65536.0f) ? 0 : 1;
 				}
 
 				drawIndexCount = 0;
@@ -1004,6 +1007,20 @@ static SoftwareTransformAction ProjectClipAndExpand(SoftwareTransformParams &par
 	result->drawIndexCount = drawIndexCount;
 	result->drawVertexCount = numDecodedVerts;
 	return SW_DRAW_INDEXED;
+}
+
+// A sprite with its corners on pixel centers (x.5), as the PS1 emulator draws them. Above 1x it covers
+// half a pixel more on the right and bottom and reads its neighbours' texels (seams between tiles).
+// Moved back half a pixel, with its texture coordinates, it draws the same at 1x.
+static bool IsHalfPixelSprite(const TransformedVertex &tl, const TransformedVertex &br) {
+	auto onCenter = [](float f) {
+		const float frac = f - floorf(f);
+		return frac > 0.49f && frac < 0.51f;
+	};
+	if (!onCenter(tl.x) || !onCenter(tl.y) || !onCenter(br.x) || !onCenter(br.y)) {
+		return false;
+	}
+	return br.x > tl.x && br.y > tl.y;
 }
 
 static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSize, u16 *&inds, int indsSize, const TransformedVertex *transformed, TransformedVertex *transformedExpanded, int *drawIndexCount, bool throughmode, bool *pixelMappedExactly) {
@@ -1156,6 +1173,26 @@ static bool ExpandRectangles(int vertexCount, int &numDecodedVerts, int vertsSiz
 		trans[3].u = (transVtxTL.u + spriteBorderFixL - uNudge) * uScale;
 		trans[3].v = (transVtxBR.v - spriteBorderFixB) * vScale;
 		trans[3].z = z;
+
+		if (PSP_CoreParameter().compat.flags().SnapHalfPixelSprites && gstate.isTextureMapEnabled()) {
+			// In texels for through mode (scaled below), else normalized.
+			const float texW = throughmode ? 1.0f : (float)gstate.getTextureWidth(0);
+			const float texH = throughmode ? 1.0f : (float)gstate.getTextureHeight(0);
+			if (IsHalfPixelSprite(transVtxTL, transVtxBR)) {
+				// Half a pixel in texture coordinates. Plus a nudge in: a scaled sprite can sample right on a
+				// texel edge, where interpolation here can fall short of the texel the GE reads.
+				const float du = 0.5f * (transVtxBR.u - transVtxTL.u) / (transVtxBR.x - transVtxTL.x) * (throughmode ? uScale : 1.0f);
+				const float dv = 0.5f * (transVtxBR.v - transVtxTL.v) / (transVtxBR.y - transVtxTL.y) * (throughmode ? vScale : 1.0f);
+				const float nudgeU = (1.0f / 64.0f) / texW * (throughmode ? uScale : 1.0f);
+				const float nudgeV = (1.0f / 64.0f) / texH * (throughmode ? vScale : 1.0f);
+				for (int c = 0; c < 4; c++) {
+					trans[c].x -= 0.5f;
+					trans[c].y -= 0.5f;
+					trans[c].u += nudgeU - du;
+					trans[c].v += nudgeV - dv;
+				}
+			}
+		}
 
 		// That's the four corners. Now process UV rotation.
 		// TODO: Should we apply the sprite border fix before or after rotation? Likely after, right?

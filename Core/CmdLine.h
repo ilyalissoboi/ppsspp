@@ -33,7 +33,10 @@ struct CommandLineOptions {
 	std::optional<bool> fullscreen;
 	std::optional<GPUBackend> gpuBackend;
 	std::optional<bool> softwareRendering;
+	// --graphics=null: headless only, see GPU_Null.h.
+	std::optional<bool> nullGraphics;
 	std::optional<bool> enableLogging;
+	std::optional<bool> skipLogo;
 	std::optional<LogLevel> logLevel;  // Override log level with this.
 	std::optional<std::string> log;
 	std::vector<std::string> bootFilenames;
@@ -43,8 +46,10 @@ struct CommandLineOptions {
 	std::optional<std::string> startScreen;
 
 	std::optional<bool> escapeExit;
+	std::optional<bool> gameWindow;
 	// Run as if no memory stick were inserted.
 	std::optional<bool> memStickInserted;
+	// Quit the app instead of going to the main menu when the game ends, for external launchers.
 	std::optional<bool> pauseMenuExit;
 
 	// Enables the WebSocket debugger on startup, on this port (0 = pick automatically).
@@ -103,6 +108,9 @@ struct CommandLineOptions {
 	// The opposite: put our HLE back for libraries that now run the real module by default. The
 	// way to compare the two without editing a config, and the way out if the real one breaks a game.
 	std::optional<int> forceHLE;
+
+	// Overrides g_Config.iLockedCPUSpeed, in MHz.
+	std::optional<int> lockedCPUSpeed;
 
 	// Headless: install the game update in a .pkg (given as the boot filename) into this
 	// directory, then exit without booting anything. The directory is the game folder itself -
@@ -166,7 +174,6 @@ struct CommandLineOptions {
 	bool optionS = false;   // a legacy option
 
 	std::optional<bool> oldAtrac;
-	std::optional<bool> accurateVdot;
 	std::optional<std::string> jitProfile;
 
 	// Headless options that may also be mildly useful in application mode
@@ -187,16 +194,28 @@ struct CommandLineOptions {
 	std::optional<bool> printEqualLines;
 	// Headless: print flips per emulated second at the end, counted from the loaded state (if any).
 	std::optional<bool> frameStats;
+	// Headless: which of several instances running at once this is (sets PPSSPP_ID, and with it the
+	// instance's 127.0.0.N address and MAC), and whether to run at PSP speed rather than flat out.
+	// Both are for ad hoc tests where instances talk to each other.
+	std::optional<int> instance;
+	std::optional<bool> realtime;
+	std::optional<bool> adhocServer;
 
 	std::optional<std::string> screenshotFilename;
 	std::optional<std::string> screenshotFilenameSave;
+	// Headless: save each test's screenshot as DIR/<test path>.png, for many dumps in one run.
+	std::optional<std::string> screenshotDir;
 	std::optional<std::string> depthFilenameSave;
 	std::optional<std::string> dumpAudioFilename;
+	std::optional<std::string> pressScript;
+	std::optional<std::string> screenshotAt;
 	std::optional<int> replayEnd;
 	// Headless: apply the game's compatibility settings when replaying a GE frame dump.
 	std::optional<bool> dumpCompat;
 	std::optional<bool> hardwareTransform;
 	std::optional<bool> vertexJit;
+	std::optional<bool> shaderCache;
+	std::optional<bool> emulateMediaEngine;
 	// Headless: comma-separated clip-distance, cull-distance, depth-clamp, framebuffer-fetch, dual-source-blend.
 	std::optional<std::string> disableGPUFeatures;
 	std::optional<bool> screenshotRenderTarget;
@@ -204,7 +223,7 @@ struct CommandLineOptions {
 	// Headless: preserve the alpha channel when saving PNG screenshots.
 	std::optional<bool> screenshotSaveKeepAlpha;
 
-	// Headless: mount an ISO/CSO on umd1:.
+	// Mount an ISO/CSO on umd1: when booting an ELF/PBP (or the VSH).
 	std::optional<std::string> mountIso;
 	// Headless: also log through OutputDebugString (Windows).
 	std::optional<bool> odsLog;
