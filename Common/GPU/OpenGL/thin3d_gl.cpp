@@ -25,9 +25,6 @@
 #else
 #include <dlfcn.h>
 #endif
-#if defined(__ANDROID__) || defined(USING_EGL)
-#include <EGL/egl.h>
-#endif
 
 // #define DEBUG_READ_PIXELS 1
 
@@ -48,9 +45,15 @@ static const void *GLGetProcAddress(const char *name) {
 	return p;
 #else
 #if defined(__ANDROID__) || defined(USING_EGL)
-	void *p = (void *)eglGetProcAddress(name);
-	if (p)
-		return p;
+	// Looked up rather than called directly, so building doesn't need the EGL headers (cross builds
+	// often don't have them). libEGL is loaded wherever this runs.
+	typedef void *(*EGLGetProcAddressFunc)(const char *);
+	static const EGLGetProcAddressFunc eglGetProc = (EGLGetProcAddressFunc)dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+	if (eglGetProc) {
+		void *p = eglGetProc(name);
+		if (p)
+			return p;
+	}
 #endif
 	return dlsym(RTLD_DEFAULT, name);  // macOS OpenGL.framework, Linux libGL/libGLESv2 already loaded
 #endif
