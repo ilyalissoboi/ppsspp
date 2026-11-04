@@ -139,6 +139,9 @@
 #include "Common/Render/AtlasGen.h"
 #include "Common/Render/Text/draw_text.h"
 #include "Common/Net/Resolve.h"
+#include "Core/RetroAchievementsQueue.h"
+#include "ext/rcheevos/include/rc_api_runtime.h"
+#include "ext/rcheevos/include/rc_error.h"
 
 #include "unittest/JitHarness.h"
 #include "unittest/TestVertexJit.h"
@@ -3621,6 +3624,127 @@ static bool TestOverlayHole() {
 	return true;
 }
 
+static bool TestRetroAchievementsQueue() {
+	using namespace Achievements;
+	const int64_t now = 1700000000;
+	const std::string hash = "0123456789abcdef0123456789abcdef";
+	std::string error;
+
+	// An unlock as the rc_client sends it, on a retry 30 seconds after it was earned.
+	rc_api_award_achievement_request_t achParams{};
+	achParams.username = "Some.User";
+	achParams.api_token = "token";
+	achParams.achievement_id = 12345;
+	achParams.hardcore = 1;
+	achParams.game_hash = hash.c_str();
+	achParams.seconds_since_unlock = 30;
+	rc_api_request_t request;
+	EXPECT_EQ_INT(rc_api_init_award_achievement_request(&request, &achParams), RC_OK);
+	DeferredSubmission ach;
+	EXPECT_TRUE(ParseDeferrableRequest(request.url, request.post_data, now, &ach));
+	EXPECT_EQ_STR(ach.url, std::string(request.url));
+	rc_api_destroy_request(&request);
+	EXPECT_TRUE(ach.type == DeferredSubmission::Type::Achievement);
+	EXPECT_EQ_STR(ach.username, std::string("Some.User"));
+	EXPECT_EQ_INT(ach.id, 12345);
+	EXPECT_TRUE(ach.hardcore);
+	EXPECT_EQ_STR(ach.gameHash, hash);
+	EXPECT_EQ_INT(ach.time, now - 30);
+
+	// Submitted 100 seconds later, it says it was earned 130 seconds ago, and the server can check that.
+	std::string postData = BuildDeferredPostData(ach, "token", now + 100);
+	EXPECT_TRUE(postData.find("&o=130&") != std::string::npos);
+	achParams.seconds_since_unlock = 130;
+	EXPECT_EQ_INT(rc_api_init_award_achievement_request(&request, &achParams), RC_OK);
+	EXPECT_EQ_STR(postData, std::string(request.post_data));
+	rc_api_destroy_request(&request);
+	DeferredSubmission reparsed;
+	EXPECT_TRUE(ParseDeferrableRequest(ach.url, postData, now + 100, &reparsed));
+	EXPECT_TRUE(reparsed == ach);
+
+	// A leaderboard entry, sent right away (no offset).
+	rc_api_submit_lboard_entry_request_t lbParams{};
+	lbParams.username = "Some.User";
+	lbParams.api_token = "token";
+	lbParams.leaderboard_id = 678;
+	lbParams.score = -42;
+	lbParams.game_hash = hash.c_str();
+	EXPECT_EQ_INT(rc_api_init_submit_lboard_entry_request(&request, &lbParams), RC_OK);
+	DeferredSubmission lb;
+	EXPECT_TRUE(ParseDeferrableRequest(request.url, request.post_data, now, &lb));
+	rc_api_destroy_request(&request);
+	EXPECT_TRUE(lb.type == DeferredSubmission::Type::Leaderboard);
+	EXPECT_EQ_INT(lb.id, 678);
+	EXPECT_EQ_INT(lb.score, -42);
+	EXPECT_EQ_INT(lb.time, now);
+
+	// Other requests aren't touched.
+	DeferredSubmission other;
+	EXPECT_FALSE(ParseDeferrableRequest("http://retroachievements.org/dorequest.php", "r=login2&u=Some.User&t=token", now, &other));
+	EXPECT_FALSE(ParseDeferrableRequest("http://retroachievements.org/dorequest.php", "r=awardachievement&u=Some.User&t=token&h=1", now, &other));
+
+	// The rc_client has to accept the responses we make up for it.
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, SynthesizeDeferredResponse(ach, 1000, 50), &error) == SubmissionOutcome::Accepted);
+	EXPECT_TRUE(ClassifySubmissionResponse(lb, 200, SynthesizeDeferredResponse(lb, 1000, 50), &error) == SubmissionOutcome::Accepted);
+	rc_api_award_achievement_response_t awardResponse;
+	std::string body = SynthesizeDeferredResponse(ach, 1000, 50);
+	rc_api_server_response_t serverResponse{};
+	serverResponse.body = body.c_str();
+	serverResponse.body_length = body.size();
+	serverResponse.http_status_code = 200;
+	EXPECT_EQ_INT(rc_api_process_award_achievement_server_response(&awardResponse, &serverResponse), RC_OK);
+	EXPECT_EQ_INT(awardResponse.new_player_score, 1000);
+	EXPECT_EQ_INT(awardResponse.new_player_score_softcore, 50);
+	EXPECT_EQ_INT(awardResponse.awarded_achievement_id, 12345);
+	// Not the 0 that would make the rc_client announce mastery.
+	EXPECT_EQ_INT(awardResponse.achievements_remaining, (uint32_t)-1);
+	rc_api_destroy_award_achievement_response(&awardResponse);
+
+	// The server's answers.
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "{\"Success\":false,\"Error\":\"User already has hardcore and regular achievements awarded.\"}", &error) == SubmissionOutcome::Accepted);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, -1, "", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 503, "<html>Maintenance</html>", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(lb, 500, "", &error) == SubmissionOutcome::Retry);
+	// Error pages from something between us and the API don't drop the submission.
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 500, "<html><body>Internal Server Error</body></html>", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "<html><title>Sign in to Wi-Fi</title></html>", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "{\"Success\":false,\"Error", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "{\"Message\":\"Hello\"}", &error) == SubmissionOutcome::Retry);
+	// Accepted, but without the fields rcheevos wants. Sending it again wouldn't help.
+	EXPECT_TRUE(ClassifySubmissionResponse(lb, 200, "{\"Success\":true}", &error) == SubmissionOutcome::Accepted);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 401, "{\"Success\":false,\"Error\":\"Invalid user/token combination.\",\"Code\":\"invalid_credentials\"}", &error) == SubmissionOutcome::AuthFailed);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "{\"Success\":false,\"Error\":\"Expired.\",\"Code\":\"expired_token\"}", &error) == SubmissionOutcome::AuthFailed);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 404, "{\"Success\":false,\"Error\":\"Achievement not found.\",\"Code\":\"not_found\"}", &error) == SubmissionOutcome::Rejected);
+	EXPECT_EQ_STR(error, std::string("Achievement not found."));
+
+	// Duplicates.
+	std::vector<DeferredSubmission> queue;
+	DeferredSubmission softcore = ach;
+	softcore.hardcore = false;
+	EXPECT_TRUE(AddDeferredSubmission(&queue, softcore));
+	EXPECT_FALSE(AddDeferredSubmission(&queue, softcore));
+	EXPECT_TRUE(AddDeferredSubmission(&queue, ach));
+	// A queued hardcore unlock covers softcore too.
+	EXPECT_FALSE(AddDeferredSubmission(&queue, softcore));
+	EXPECT_TRUE(AddDeferredSubmission(&queue, lb));
+	EXPECT_FALSE(AddDeferredSubmission(&queue, lb));
+	DeferredSubmission lbLater = lb;
+	lbLater.time += 60;
+	EXPECT_TRUE(AddDeferredSubmission(&queue, lbLater));
+	EXPECT_EQ_INT(queue.size(), 4);
+
+	// Storage.
+	std::vector<DeferredSubmission> loaded;
+	EXPECT_TRUE(DeserializeDeferredSubmissions(SerializeDeferredSubmissions(queue), &loaded));
+	EXPECT_EQ_INT(loaded.size(), queue.size());
+	for (size_t i = 0; i < queue.size(); i++) {
+		EXPECT_TRUE(loaded[i] == queue[i]);
+	}
+	EXPECT_FALSE(DeserializeDeferredSubmissions("not json", &loaded));
+	EXPECT_EQ_INT(loaded.size(), 0);
+	return true;
+}
+
 typedef bool (*TestFunc)();
 struct TestItem {
 	const char *name;
@@ -4198,6 +4322,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(VolumeFunc),
 	TEST_ITEM(ConfigSettings),
 	TEST_ITEM(SplitSearch),
+	TEST_ITEM(RetroAchievementsQueue),
 	TEST_ITEM(FriendlyPath),
 	TEST_ITEM(LinAlg),
 	TEST_ITEM(Lang),

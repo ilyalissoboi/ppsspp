@@ -16,7 +16,10 @@
 // Then just place it next to PPSSPP and enable RAIntegration in PPSSPP achivement settings, then restart it.
 
 #include <algorithm>
+#include <atomic>
+#include <ctime>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -59,6 +62,8 @@
 #include "Core/FileSystems/BlockDevices.h"
 #include "Core/FileSystems/ISOFileSystem.h"
 #include "Core/RetroAchievements.h"
+#include "Core/RetroAchievementsQueue.h"
+#include "Core/Util/PathUtil.h"
 
 #if RC_CLIENT_SUPPORTS_RAINTEGRATION
 
@@ -197,6 +202,246 @@ constexpr double LOGIN_ATTEMPT_INTERVAL_S = 10.0;
 
 static void TryLoginByToken(bool isInitialAttempt);
 
+// Offline queue (bAchievementsOfflineQueue). Unlocks and leaderboard entries that can't reach the server
+// are saved to disk, and the rc_client is told they went through, so it doesn't keep its own retries (which
+// are lost when the game is closed). Idle() submits them, one at a time and in order, once we're online.
+// Requests are made on the CPU thread too, so the queue itself is under g_deferredMutex. The flush state is
+// only touched from Idle() and the download callbacks, which both run on the main thread.
+static std::mutex g_deferredMutex;
+static std::vector<DeferredSubmission> g_deferred;
+static bool g_deferredLoaded = false;
+static std::atomic<int> g_deferredCount{ 0 };
+// Set by the platform, which knows when there's no connection (Android). Otherwise we only find out from failed requests.
+static std::atomic<bool> g_platformOffline{ false };
+static std::atomic<bool> g_flushRequested{ false };
+static std::atomic<bool> g_deferredAdded{ false };
+static std::atomic<bool> g_offlineNoticeShown{ false };
+// Set while the rc_client handles a response we made up for a queued request, so the events it raises know.
+static thread_local bool g_inDeferredResponse = false;
+
+constexpr double FLUSH_NEVER = 1e30;
+constexpr double FLUSH_BACKOFF_MIN_S = 15.0;
+constexpr double FLUSH_BACKOFF_MAX_S = 300.0;
+static bool g_flushing = false;
+static double g_nextFlushTime = 0.0;  // Submit what's left from last time right away.
+static double g_flushBackoff = FLUSH_BACKOFF_MIN_S;
+static int g_flushSubmitted = 0;
+
+static Path DeferredQueuePath() {
+	return GetSysDirectory(DIRECTORY_SYSTEM) / "achievements_offline_queue.json";
+}
+
+// The new queue is written here first, so a write that doesn't finish can't take the old one with it.
+static Path DeferredQueueTempPath() {
+	return GetSysDirectory(DIRECTORY_SYSTEM) / "achievements_offline_queue.json.tmp";
+}
+
+static bool LoadDeferredFile(const Path &path) {
+	std::string data;
+	if (!File::Exists(path) || !File::ReadTextFileToString(path, &data)) {
+		return false;
+	}
+	if (!DeserializeDeferredSubmissions(data, &g_deferred)) {
+		ERROR_LOG(Log::Achievements, "Failed to parse %s", path.c_str());
+		return false;
+	}
+	INFO_LOG(Log::Achievements, "Loaded %d deferred achievement submissions from %s", (int)g_deferred.size(), path.c_str());
+	return true;
+}
+
+// Call with g_deferredMutex held.
+static void LoadDeferredLocked() {
+	if (g_deferredLoaded) {
+		return;
+	}
+	g_deferredLoaded = true;
+	const Path path = DeferredQueuePath();
+	const Path tempPath = DeferredQueueTempPath();
+	if (!LoadDeferredFile(path) && LoadDeferredFile(tempPath)) {
+		// Saving was interrupted after the old file was deleted, so the new one is complete. Finish the job.
+		File::Rename(tempPath, path);
+	}
+	g_deferredCount = (int)g_deferred.size();
+}
+
+// Call with g_deferredMutex held.
+static void SaveDeferredLocked() {
+	g_deferredCount = (int)g_deferred.size();
+	const Path path = DeferredQueuePath();
+	const Path tempPath = DeferredQueueTempPath();
+	if (g_deferred.empty()) {
+		if (File::Exists(path)) {
+			File::Delete(path);
+		}
+		if (File::Exists(tempPath)) {
+			File::Delete(tempPath);
+		}
+		return;
+	}
+	if (!File::WriteStringToFile(true, SerializeDeferredSubmissions(g_deferred), tempPath)) {
+		ERROR_LOG(Log::Achievements, "Failed to write %s, keeping the previous queue", tempPath.c_str());
+		return;
+	}
+	// Rename doesn't replace an existing file everywhere (content URIs, for one), so delete it first.
+	if (File::Exists(path)) {
+		File::Delete(path);
+	}
+	if (!File::Rename(tempPath, path)) {
+		// The queue is still complete in the temp file, and loading falls back to it.
+		ERROR_LOG(Log::Achievements, "Failed to rename %s to %s", tempPath.c_str(), path.c_str());
+	}
+}
+
+static void DeferSubmission(const DeferredSubmission &sub) {
+	{
+		std::lock_guard<std::mutex> guard(g_deferredMutex);
+		LoadDeferredLocked();
+		if (!AddDeferredSubmission(&g_deferred, sub)) {
+			return;
+		}
+		SaveDeferredLocked();
+	}
+	INFO_LOG(Log::Achievements, "Deferred %s %u until the server can be reached", sub.type == DeferredSubmission::Type::Achievement ? "achievement" : "leaderboard entry", sub.id);
+	g_deferredAdded = true;
+	if (!g_offlineNoticeShown.exchange(true)) {
+		auto ac = GetI18NCategory(I18NCat::ACHIEVEMENTS);
+		g_OSD.Show(OSDType::MESSAGE_INFO, ac->T("Offline: achievements will be submitted when the connection is back"), "", g_RAImageID, 5.0f);
+	}
+}
+
+// Hands the rc_client a successful response for a request that went in the queue instead.
+static void RespondDeferred(const DeferredSubmission &sub, rc_client_t *client, rc_client_server_callback_t callback, void *callback_data) {
+	const rc_client_user_t *user = rc_client_get_user_info(client);
+	std::string body = SynthesizeDeferredResponse(sub, user ? user->score : 0, user ? user->score_softcore : 0);
+	rc_api_server_response_t response{};
+	response.body = body.c_str();
+	response.body_length = body.size();
+	response.http_status_code = 200;
+	g_inDeferredResponse = true;
+	callback(&response, callback_data);
+	g_inDeferredResponse = false;
+}
+
+static void FinishFlush(bool retryLater) {
+	g_flushing = false;
+	if (retryLater) {
+		g_nextFlushTime = time_now_d() + g_flushBackoff;
+		g_flushBackoff = std::min(g_flushBackoff * 2.0, FLUSH_BACKOFF_MAX_S);
+	}
+	if (g_flushSubmitted > 0) {
+		auto ac = GetI18NCategory(I18NCat::ACHIEVEMENTS);
+		g_OSD.Show(OSDType::MESSAGE_SUCCESS, ApplySafeSubstitutions(ac->T("Submitted %1 saved achievement unlocks and leaderboard entries"), g_flushSubmitted), "", g_RAImageID);
+		g_flushSubmitted = 0;
+	}
+}
+
+static void SubmitNextDeferred(const std::string &username, const std::string &token) {
+	DeferredSubmission sub;
+	{
+		std::lock_guard<std::mutex> guard(g_deferredMutex);
+		auto iter = std::find_if(g_deferred.begin(), g_deferred.end(), [&](const DeferredSubmission &s) {
+			return equalsNoCase(s.username, username);
+		});
+		if (iter == g_deferred.end()) {
+			// All done (anything left belongs to another account).
+			g_flushBackoff = FLUSH_BACKOFF_MIN_S;
+			g_offlineNoticeShown = false;
+			FinishFlush(false);
+			return;
+		}
+		sub = *iter;
+	}
+
+	std::string postData = BuildDeferredPostData(sub, token, (int64_t)time(nullptr));
+	if (postData.empty()) {
+		ERROR_LOG(Log::Achievements, "Failed to build a request for deferred submission %u, dropping it", sub.id);
+		{
+			std::lock_guard<std::mutex> guard(g_deferredMutex);
+			g_deferred.erase(std::remove(g_deferred.begin(), g_deferred.end(), sub), g_deferred.end());
+			SaveDeferredLocked();
+		}
+		SubmitNextDeferred(username, token);
+		return;
+	}
+
+	INFO_LOG(Log::Achievements, "Submitting deferred %s %u", sub.type == DeferredSubmission::Type::Achievement ? "achievement" : "leaderboard entry", sub.id);
+	g_DownloadManager.AsyncPostWithCallback(http::RemoveHttpsIfNeeded(sub.url), postData, "application/x-www-form-urlencoded", http::RequestFlags::Default,
+		[sub, username, token](http::Request &download) {
+		std::string body;
+		download.buffer().TakeAll(&body);
+		std::string error;
+		SubmissionOutcome outcome = ClassifySubmissionResponse(sub, download.ResultCode(), body, &error);
+		switch (outcome) {
+		case SubmissionOutcome::Retry:
+			WARN_LOG(Log::Achievements, "Deferred submission %u failed (%d), will try again later", sub.id, download.ResultCode());
+			FinishFlush(true);
+			return;
+		case SubmissionOutcome::AuthFailed:
+			// Keep them, they're submitted after the next successful login.
+			WARN_LOG(Log::Achievements, "Deferred submission %u: the server refused the login (%s)", sub.id, error.c_str());
+			FinishFlush(false);
+			return;
+		case SubmissionOutcome::Rejected:
+			ERROR_LOG(Log::Achievements, "Deferred submission %u rejected by the server, dropping it: %s", sub.id, error.c_str());
+			break;
+		case SubmissionOutcome::Accepted:
+			INFO_LOG(Log::Achievements, "Deferred submission %u accepted%s%s", sub.id, error.empty() ? "" : ": ", error.c_str());
+			g_flushSubmitted++;
+			break;
+		}
+		{
+			std::lock_guard<std::mutex> guard(g_deferredMutex);
+			g_deferred.erase(std::remove(g_deferred.begin(), g_deferred.end(), sub), g_deferred.end());
+			SaveDeferredLocked();
+		}
+		SubmitNextDeferred(username, token);
+	});
+}
+
+static void UpdateDeferredSubmissions(double now) {
+	{
+		std::lock_guard<std::mutex> guard(g_deferredMutex);
+		LoadDeferredLocked();
+	}
+	if (g_deferredAdded.exchange(false)) {
+		g_nextFlushTime = std::min(g_nextFlushTime, now + g_flushBackoff);
+	}
+	if (g_flushRequested.exchange(false)) {
+		g_nextFlushTime = now;
+	}
+	if (g_flushing || g_deferredCount == 0 || g_platformOffline || now < g_nextFlushTime || !g_Config.bAchievementsEnable) {
+		return;
+	}
+
+	// Rescheduled if this fails, or when something new is deferred.
+	g_nextFlushTime = FLUSH_NEVER;
+	const std::string &username = g_Config.sAchievementsUserName;
+	std::string token = NativeLoadSecret(RA_TOKEN_SECRET_NAME);
+	if (username.empty() || token.empty()) {
+		// Not logged in. Login requests a flush.
+		return;
+	}
+	g_flushing = true;
+	g_flushSubmitted = 0;
+	SubmitNextDeferred(username, token);
+}
+
+void SetNetworkAvailable(bool available) {
+	const bool wasOffline = g_platformOffline.exchange(!available);
+	if (wasOffline != !available) {
+		INFO_LOG(Log::Achievements, "Network %s", available ? "available" : "unavailable");
+	}
+	if (available) {
+		g_flushRequested = true;
+	}
+}
+
+int GetDeferredSubmissionCount() {
+	std::lock_guard<std::mutex> guard(g_deferredMutex);
+	LoadDeferredLocked();
+	return (int)g_deferred.size();
+}
+
 rc_client_t *GetClient() {
 	return g_rcClient;
 }
@@ -323,8 +568,10 @@ static void destroy_client(rc_client_t *client) {
 	rc_client_destroy(client);
 }
 
-static void complete_server_call(uint32_t clientId, http::Request &download, rc_client_server_callback_t callback, void *callback_data) {
-	if (g_trackedClients.find(clientId) == g_trackedClients.end()) {
+// deferrable is set for an unlock or leaderboard entry that goes in the offline queue if it can't be delivered.
+static void complete_server_call(uint32_t clientId, http::Request &download, rc_client_server_callback_t callback, void *callback_data, const DeferredSubmission *deferrable) {
+	auto tracked = g_trackedClients.find(clientId);
+	if (tracked == g_trackedClients.end()) {
 		// The client timed out after being retired and is gone. callback_data belongs to it, and leaks.
 		WARN_LOG(Log::Achievements, "Dropping a server response for a destroyed client");
 		return;
@@ -334,18 +581,33 @@ static void complete_server_call(uint32_t clientId, http::Request &download, rc_
 	download.buffer().TakeAll(&buffer);
 	rc_api_server_response_t response{};
 	int resultCode = download.ResultCode();
-	if (resultCode <= 0) {
+	if (deferrable && (resultCode <= 0 || IsRetryableHttpStatus(resultCode))) {
+		WARN_LOG(Log::Achievements, "Submission failed (%d), putting it in the offline queue", resultCode);
+		DeferSubmission(*deferrable);
+		RespondDeferred(*deferrable, tracked->second.client, callback, callback_data);
+	} else if (resultCode <= 0) {
 		// No HTTP status: the request failed in transport (naett's codes are negative, and
 		// naettConnectionError is -1, which rcheevos reads as a non-retryable client error).
 		// Report it as retryable so that unlocks and leaderboard submissions aren't dropped.
 		buffer = StringFromFormat("Network error (%d)", resultCode);
 		response.http_status_code = RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR;
+		response.body = buffer.c_str();
+		response.body_length = buffer.size();
+		callback(&response, callback_data);
 	} else {
+		if (g_platformOffline.exchange(false)) {
+			// We got an answer, so the platform was wrong (or hasn't told us yet).
+			INFO_LOG(Log::Achievements, "Got a server response while supposedly offline, assuming we're online");
+		}
+		if (resultCode >= 200 && resultCode < 300 && g_deferredCount > 0) {
+			// The server is reachable again.
+			g_flushRequested = true;
+		}
 		response.http_status_code = resultCode;
+		response.body = buffer.c_str();
+		response.body_length = buffer.size();
+		callback(&response, callback_data);
 	}
-	response.body = buffer.c_str();
-	response.body_length = buffer.size();
-	callback(&response, callback_data);
 
 	// Look it up again, the callback may have issued new requests.
 	auto iter = g_trackedClients.find(clientId);
@@ -366,6 +628,20 @@ static void server_call_callback(const rc_api_request_t *request,
 	auto ac = GetI18NCategory(I18NCat::ACHIEVEMENTS);
 	std::string url = http::RemoveHttpsIfNeeded(request->url);
 
+	std::shared_ptr<DeferredSubmission> deferrable;
+	if (g_Config.bAchievementsOfflineQueue && request->post_data) {
+		DeferredSubmission sub;
+		if (ParseDeferrableRequest(request->url, request->post_data, (int64_t)time(nullptr), &sub)) {
+			if (g_platformOffline) {
+				// No point trying.
+				DeferSubmission(sub);
+				RespondDeferred(sub, client, callback, callback_data);
+				return;
+			}
+			deferrable = std::make_shared<DeferredSubmission>(sub);
+		}
+	}
+
 	uint32_t clientId = 0;
 	for (auto &iter : g_trackedClients) {
 		if (iter.second.client == client) {
@@ -378,14 +654,14 @@ static void server_call_callback(const rc_api_request_t *request,
 
 	if (request->post_data) {
 		std::shared_ptr<http::Request> download = g_DownloadManager.AsyncPostWithCallback(url, std::string(request->post_data), "application/x-www-form-urlencoded", http::RequestFlags::ProgressBar | http::RequestFlags::ProgressBarDelayed,
-			[clientId, callback, callback_data](http::Request &download) {
-			complete_server_call(clientId, download, callback, callback_data);
+			[clientId, callback, callback_data, deferrable](http::Request &download) {
+			complete_server_call(clientId, download, callback, callback_data, deferrable.get());
 		}, ac->T("Contacting RetroAchievements server..."));
 	} else {
 		std::shared_ptr<http::Request> download = g_DownloadManager.StartDownload(url, Path(), http::RequestFlags::ProgressBar | http::RequestFlags::ProgressBarDelayed, nullptr,
 			ac->T("Contacting RetroAchievements server..."),
 			[clientId, callback, callback_data](http::Request &download) {
-			complete_server_call(clientId, download, callback, callback_data);
+			complete_server_call(clientId, download, callback, callback_data, nullptr);
 		});
 	}
 }
@@ -473,7 +749,10 @@ static void event_handler_callback(const rc_client_event_t *event, rc_client_t *
 		// Hack around some problematic events in Burnout Legends. Hopefully this can be fixed in the backend.
 		std::string msg;
 		const rc_client_leaderboard_scoreboard_t *scoreboard = event->leaderboard_scoreboard;
-		if (event->leaderboard_scoreboard) {
+		if (g_inDeferredResponse) {
+			// There's no rank to show, the server hasn't seen it yet.
+			msg = ApplySafeSubstitutions(ac->T("Saved %1 for %2, to submit when online"), scoreboard ? DeNull(scoreboard->submitted_score) : DeNull(event->leaderboard->tracker_value), title);
+		} else if (event->leaderboard_scoreboard) {
 			msg = ApplySafeSubstitutions(ac->T("Submitted %1 for %2"), DeNull(scoreboard->submitted_score), title);
 			if (!strcmp(scoreboard->best_score, scoreboard->submitted_score)) {
 				msg += ": ";
@@ -561,6 +840,7 @@ static void login_token_callback(int result, const char *error_message, rc_clien
 	case RC_OK:
 	{
 		INFO_LOG(Log::Achievements, "Successful login by token.");
+		g_flushRequested = true;
 		OnAchievementsLoginStateChange();
 		if (!isInitialAttempt) {
 			auto ac = GetI18NCategory(I18NCat::ACHIEVEMENTS);
@@ -832,6 +1112,7 @@ static void login_password_callback(int result, const char *error_message, rc_cl
 		const rc_client_user_t *user = rc_client_get_user_info(client);
 		g_Config.sAchievementsUserName = user->username;
 		NativeSaveSecret(RA_TOKEN_SECRET_NAME, std::string(user->token));
+		g_flushRequested = true;
 		OnAchievementsLoginStateChange();
 		g_OSD.Show(OSDType::MESSAGE_SUCCESS, di->T("Logged in!"), "", g_RAImageID);
 		break;
@@ -946,6 +1227,7 @@ void Idle() {
 	rc_client_idle(g_rcClient);
 
 	double now = time_now_d();
+	UpdateDeferredSubmissions(now);
 	for (auto iter = g_trackedClients.begin(); iter != g_trackedClients.end(); ) {
 		if (iter->second.retireTime != 0.0 && now > iter->second.retireTime + RETIRED_CLIENT_TIMEOUT) {
 			WARN_LOG(Log::Achievements, "Destroying retired client with %d requests still in flight", iter->second.outstandingRequests);

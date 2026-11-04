@@ -524,6 +524,13 @@ static bool DefaultSasThread() {
 	return cpu_info.num_cores > 1;
 }
 
+// Only Android has the setting in the UI, and tells us when the network comes back.
+#if PPSSPP_PLATFORM(ANDROID)
+static constexpr bool DEFAULT_ACHIEVEMENTS_OFFLINE_QUEUE = true;
+#else
+static constexpr bool DEFAULT_ACHIEVEMENTS_OFFLINE_QUEUE = false;
+#endif
+
 static constexpr const char *achievementsLeaderboardTrackerPosNames[] = { "None", "Bottom Left", "Bottom Center", "Bottom Right", "Top Left", "Top Center", "Top Right", "Center Left", "Center Right" };
 
 static constexpr ConfigSetting achievementSettings[] = {
@@ -535,6 +542,7 @@ static constexpr ConfigSetting achievementSettings[] = {
 	ConfigSetting("AchievementsUnofficial", SETTING(g_Config, bAchievementsUnofficial), false, CfgFlag::PER_GAME | CfgFlag::DEFAULT),
 	ConfigSetting("AchievementsLogBadMemReads", SETTING(g_Config, bAchievementsLogBadMemReads), false, CfgFlag::DEFAULT),
 	ConfigSetting("AchievementsSaveStateInHardcoreMode", SETTING(g_Config, bAchievementsSaveStateInHardcoreMode), false, CfgFlag::DEFAULT),
+	ConfigSetting("AchievementsOfflineQueue", SETTING(g_Config, bAchievementsOfflineQueue), DEFAULT_ACHIEVEMENTS_OFFLINE_QUEUE, CfgFlag::DEFAULT),
 
 	// Achievements login info. Note that password is NOT stored, only a login token.
 	// And that login token is stored separately from the ini, see NativeSaveSecret, but it can also be loaded

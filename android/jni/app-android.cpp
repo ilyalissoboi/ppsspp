@@ -103,6 +103,7 @@ struct JNIEnv {};
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
 #include "Core/Loaders.h"
+#include "Core/RetroAchievements.h"
 #include "Core/SaveSync.h"
 #include "Core/KeyMap.h"
 #include "Core/Util/RecentFiles.h"
@@ -1538,6 +1539,8 @@ extern "C" void JNICALL Java_org_ppsspp_ppsspp_NativeApp_sendMessageFromJava(JNI
 	} else if (msg == "core_powerSaving") {
 		// Forward.
 		System_PostUIMessage(UIMessage::POWER_SAVING, prm);
+	} else if (msg == "network_connectivity") {
+		Achievements::SetNetworkAvailable(prm == "1");
 	} else if (msg == "exception") {
 		g_OSD.Show(OSDType::MESSAGE_ERROR, std::string("Java Exception"), prm, 10.0f);
 	} else if (msg == "shortcutParam") {
