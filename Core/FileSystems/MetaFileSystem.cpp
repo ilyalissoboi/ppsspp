@@ -740,10 +740,10 @@ void MetaFileSystem::DoStatePositionalMounts(PointerWrap &p) {
 	// sections for mounts that didn't exist yet, and we have to leave out exactly those to stay
 	// lined up. We only know how many are missing (n), not which, hence the list below.
 	//
-	// Mounts added before version 2, newest first: a state missing k mounts is missing the k most
-	// recently added ones. Mounts added since don't go here (version 2 states name their mounts),
-	// but old states still rely on the existing mounts keeping their relative order.
-	static const char * const mountsAddedOverTime[] = { "flash1:", "pfat0:" };
+	// Mounts in the order they were added, newest first: a state missing k mounts is missing the k most
+	// recently added ones. A mount added after version 2 goes here too, since no version 1 state has
+	// it (msoem0: is one). Old states rely on the existing mounts keeping their relative order.
+	static const char * const mountsAddedOverTime[] = { "msoem0:", "flash1:", "pfat0:" };
 
 	const size_t missing = n < (u32)fileSystems.size() ? fileSystems.size() - n : 0;
 	if (n > (u32)fileSystems.size() || missing > ARRAY_SIZE(mountsAddedOverTime)) {

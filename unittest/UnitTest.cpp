@@ -298,6 +298,59 @@ bool TestSaveStateMounts() {
 	return true;
 }
 
+// A version 1 MetaFileSystem state, with the mounts one after another and nothing to tell them apart.
+struct PositionalMountsState {
+	std::vector<std::shared_ptr<SaveStateTestFileSystem>> mounts;
+	void DoState(PointerWrap &p) {
+		auto s = p.Section("MetaFileSystem", 1);
+		if (!s)
+			return;
+		s32 current = 6;
+		std::map<int, std::string> currentDir;
+		Do(p, current);
+		Do(p, currentDir);
+		u32 n = (u32)mounts.size();
+		Do(p, n);
+		for (auto &mount : mounts) {
+			mount->DoState(p);
+		}
+	}
+};
+
+bool TestSaveStatePositionalMounts() {
+	// The mounts in boot order, as of version 2 (MountFileSystems() in System.cpp).
+	static const char * const prefixes[] = { "ms0:", "fatms0:", "fatms:", "pfat0:", "msoem0:", "flash0:", "flash1:" };
+	// Each version 1 build's mounts. The section names make a mismatched load fail.
+	static const std::vector<std::string> builds[] = {
+		{ "ms0:", "fatms0:", "fatms:", "flash0:" },
+		{ "ms0:", "fatms0:", "fatms:", "pfat0:", "flash0:" },
+		{ "ms0:", "fatms0:", "fatms:", "pfat0:", "flash0:", "flash1:" },  // Up to v1.20.4.6.
+	};
+	for (const auto &build : builds) {
+		PositionalMountsState state;
+		for (size_t i = 0; i < build.size(); i++) {
+			state.mounts.push_back(std::make_shared<SaveStateTestFileSystem>(build[i].c_str(), 100 + (int)i));
+		}
+		std::vector<u8> data;
+		EXPECT_TRUE(CChunkFileReader::MeasureAndSavePtr(state, &data) == CChunkFileReader::ERROR_NONE);
+
+		MetaFileSystem loaded;
+		std::vector<std::shared_ptr<SaveStateTestFileSystem>> mounts;
+		for (const char *prefix : prefixes) {
+			mounts.push_back(std::make_shared<SaveStateTestFileSystem>(prefix, -1));
+			loaded.Mount(prefix, mounts.back());
+		}
+		std::string error;
+		EXPECT_TRUE(CChunkFileReader::LoadPtr(data.data(), data.size(), loaded, &error) == CChunkFileReader::ERROR_NONE);
+		for (size_t i = 0; i < ARRAY_SIZE(prefixes); i++) {
+			auto it = std::find(build.begin(), build.end(), prefixes[i]);
+			// Each mount gets its own section back, and one the state doesn't have is left alone.
+			EXPECT_EQ_INT(mounts[i]->Value(), it == build.end() ? -1 : 100 + (int)(it - build.begin()));
+		}
+	}
+	return true;
+}
+
 // The start of a state as SaveStart writes it, and a little more.
 struct PeekTestState {
 	int version;
@@ -4453,6 +4506,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(StackWalk),
 	TEST_ITEM(InetPton),
 	TEST_ITEM(SaveStateMounts),
+	TEST_ITEM(SaveStatePositionalMounts),
 	TEST_ITEM(SaveStatePeek),
 };
 
