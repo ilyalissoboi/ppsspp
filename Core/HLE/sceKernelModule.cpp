@@ -850,7 +850,7 @@ void ImportVarSymbol(WriteVarSymbolState &state, const VarSymbolImport &var) {
 	}
 
 	// It hasn't been exported yet, but hopefully it will later.
-	INFO_LOG(Log::Loader, "Variable (%s,%08x) unresolved, storing for later resolving", var.moduleName, var.nid);
+	DEBUG_LOG(Log::Loader, "Variable (%s,%08x) unresolved, storing for later resolving", var.moduleName, var.nid);
 }
 
 void ExportVarSymbol(const VarSymbolExport &var) {
@@ -945,7 +945,7 @@ void ImportFuncSymbol(const FuncSymbolImport &func, bool reimporting, const char
 		// We used to report this, but I don't think it's very interesting anymore.
 		WARN_LOG(Log::Loader, "Unknown syscall from known HLE module '%s': 0x%08x (import for '%s')", func.moduleName, func.nid, importingModule);
 	} else {
-		INFO_LOG(Log::Loader, "Function (%s,%08x) unresolved in '%s', storing for later resolving", func.moduleName, func.nid, importingModule);
+		DEBUG_LOG(Log::Loader, "Function (%s,%08x) unresolved in '%s', storing for later resolving", func.moduleName, func.nid, importingModule);
 	}
 
 	if (shouldHLE || !reimporting) {
@@ -2317,6 +2317,21 @@ bool KernelUnloadModuleByID(SceUID moduleId) {
 	return true;
 }
 
+void KernelReimportLibrary(std::string_view importName) {
+	u32 error;
+	for (SceUID moduleId : loadedModules) {
+		PSPModule *module = kernelObjects.Get<PSPModule>(moduleId, error);
+		if (!module) {
+			continue;
+		}
+		for (const FuncSymbolImport &func : module->importedFuncs) {
+			if (equals(importName, func.moduleName)) {
+				ImportFuncSymbol(func, true, module->nm.name);
+			}
+		}
+	}
+}
+
 bool KernelModuleIsLoaded(std::string_view name) {
 	u32 error;
 	for (SceUID moduleId : loadedModules) {
@@ -2616,6 +2631,29 @@ bool __KernelLoadGEDump(MIPSState *mips, std::string_view base_filename, std::st
 
 	__KernelStartIdleThreads(module->GetUID());
 	return true;
+}
+
+void __KernelLoadStateBootStub(MIPSState *mips) {
+	__KernelLoadReset();
+
+	constexpr u32 codeStartAddr = PSP_GetUserMemoryBase();
+	mips->pc = codeStartAddr;
+	// b . (to itself), and the delay slot.
+	Memory::WriteUnchecked_U32(MIPS_MAKE_B(-1), codeStartAddr);
+	Memory::WriteUnchecked_U32(MIPS_MAKE_NOP(), codeStartAddr + 4);
+
+	PSPModule *module = new PSPModule();
+	kernelObjects.Create(module);
+	loadedModules.insert(module->GetUID());
+	memset(&module->nm, 0, sizeof(module->nm));
+	module->isFake = true;
+	module->nm.entry_addr = codeStartAddr;
+	module->nm.gp_value = -1;
+
+	SceUID threadID = __KernelSetupRootThread(module->GetUID(), 0, nullptr, 0x20, 0x1000, 0);
+	__KernelSetThreadRA(threadID, NID_MODULERETURN);
+
+	__KernelStartIdleThreads(module->GetUID());
 }
 
 int __KernelGPUReplay(MIPSState *mips) {

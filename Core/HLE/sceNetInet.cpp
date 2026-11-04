@@ -64,7 +64,30 @@ static int UpdateErrnoFromHost(int threadID, int hostErrno, const char *func) {
 }
 
 // A descriptor that isn't open fails the call with -1 and EBADF (pspautotests net/inet/errors).
+// Roughly what the calls cost on a PSP when they don't wait, whether or not they succeed (pspautotests
+// net/inet/calls). Not the sends, receives, poll and select, which grow with what they handle.
+static const int INET_BAD_SOCKET_US = 4;
+static const int INET_CONVERT_US = 3;
+static const int INET_SOCKET_UDP_US = 32;
+static const int INET_SOCKET_TCP_US = 47;
+static const int INET_BIND_US = 36;
+static const int INET_LISTEN_US = 8;
+static const int INET_CONNECT_UDP_US = 30;
+static const int INET_CONNECT_TCP_US = 110;
+static const int INET_ACCEPT_US = 42;
+static const int INET_SOCKOPT_US = 22;
+static const int INET_SOCKNAME_US = 26;
+static const int INET_SHUTDOWN_RD_US = 12;
+static const int INET_SHUTDOWN_US = 62;
+static const int INET_ABORT_US = 6;
+static const int INET_CLOSE_UDP_US = 20;
+static const int INET_CLOSE_TCP_US = 37;
+static const int INET_CLOSE_CONNECTED_US = 76;
+static const int INET_CLOSE_RST_US = 30;
+static const int INET_CLOSE_RST_CONNECTED_US = 95;
+
 static int InetBadSocket(int socket, const char *func) {
+	hleEatMicro(INET_BAD_SOCKET_US);
 	UpdateErrnoFromHost(__KernelGetCurThread(), EBADF, func);
 	return hleLogError(Log::sceNet, -1, "Bad socket #%d", socket);
 }
@@ -157,6 +180,11 @@ struct InetTry {
 static std::map<SceUID, InetWait> g_inetWaits;
 static int eventInetWaitPoll = -1;
 static const int INET_WAIT_POLL_US = 1000;
+// A timed wait on a PSP ends about 120 us after its timeout (pspautotests net/inet/timing). Measured
+// with select and poll from 1 us to 25 ms, it also lasts at least about 330 us, and a timeout of 1 us
+// doesn't wait at all.
+static const int INET_TIMEOUT_LATE_US = 120;
+static const int INET_TIMEOUT_MIN_US = 330;
 static const SceUID INET_WAIT_ID = 0x494E4554;
 
 static void __NetInetWaitPoll(u64 userdata, int cyclesLate);
@@ -370,6 +398,7 @@ static bool InetParsePton4(const char *str, u32 *addr) {
 }
 
 static int sceNetInetInetPton(int af, const char* hostname, u32 inAddrPtr) {
+	hleEatMicro(INET_CONVERT_US);
 	if (af != PSP_NET_INET_AF_INET) {
 		// INET6 too (pspautotests net/inet/addr).
 		SetInetErrno(ERROR_INET_EAFNOSUPPORT, __FUNCTION__);
@@ -388,6 +417,7 @@ static int sceNetInetInetPton(int af, const char* hostname, u32 inAddrPtr) {
 }
 
 static int sceNetInetInetAton(const char* hostname, u32 inAddrPtr) {
+	hleEatMicro(INET_CONVERT_US);
 	if (!Memory::IsValidRange(inAddrPtr, 4)) {
 		return hleLogError(Log::sceNet, 0, "invalid arg"); //-1
 	}
@@ -403,6 +433,7 @@ static int sceNetInetInetAton(const char* hostname, u32 inAddrPtr) {
 // Returns dst, or 0 with errno set: ENOSPC when the string and its terminator don't fit, leaving dst
 // untouched, and EAFNOSUPPORT for anything but AF_INET (pspautotests net/inet/addr).
 static u32 sceNetInetInetNtop(int af, u32 srcInAddrPtr, u32 dstBufPtr, u32 bufsize) {
+	hleEatMicro(INET_CONVERT_US);
 	if (af != PSP_NET_INET_AF_INET) {
 		SetInetErrno(ERROR_INET_EAFNOSUPPORT, __FUNCTION__);
 		return hleLogError(Log::sceNet, 0, "unsupported family %d", af);
@@ -426,6 +457,7 @@ static u32 sceNetInetInetNtop(int af, u32 srcInAddrPtr, u32 dstBufPtr, u32 bufsi
 }
 
 static u32_le sceNetInetInetAddr(const char *hostname) {
+	hleEatMicro(INET_CONVERT_US);
 	u32 addr;
 	if (!hostname || !InetParseAton(hostname, &addr)) {
 		return hleLogDebug(Log::sceNet, INADDR_NONE, "not an address");
@@ -459,6 +491,7 @@ static int sceNetInetGetpeername(int socket, u32 namePtr, u32 namelenPtr) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(INET_SOCKNAME_US);
 
 	SockAddrIN4 saddr{};
 	socklen_t len = sizeof(saddr);
@@ -487,6 +520,7 @@ static int sceNetInetGetsockname(int socket, u32 namePtr, u32 namelenPtr) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(INET_SOCKNAME_US);
 
 	SockAddrIN4 saddr{};
 	socklen_t len = sizeof(saddr);
@@ -867,8 +901,11 @@ static int InetWouldBlockResult(InetWaitOp op, SceUID threadID, const u32 *args,
 // Called when the first attempt would block. Returns true if the thread now waits for the call to
 // complete, and the result is delivered when it wakes.
 static bool StartInetWait(InetWaitOp op, const u32 *args, int numArgs, s64 timeoutUs) {
-	if (timeoutUs == 0 || !__KernelIsDispatchEnabled() || __IsInInterrupt()) {
+	if (timeoutUs == 0 || timeoutUs == 1 || !__KernelIsDispatchEnabled() || __IsInInterrupt()) {
 		return false;
+	}
+	if (timeoutUs > 0) {
+		timeoutUs = std::max(timeoutUs + INET_TIMEOUT_LATE_US, (s64)INET_TIMEOUT_MIN_US);
 	}
 	const SceUID threadID = __KernelGetCurThread();
 	InetWait &wait = g_inetWaits[threadID];
@@ -921,12 +958,38 @@ static void __NetInetWaitPoll(u64 userdata, int cyclesLate) {
 	__KernelReSchedule("inet wait done");
 }
 
-// FIXME: nfds is number of fd(s) as in posix poll, or was it maximum fd value as in posix select? Star Wars Battlefront Renegade seems to set the nfds to 64, while Coded Arms Contagion is using 256
-// What these cost on a PSP when they return without waiting (pspautotests net/inet/timing).
-static const int INET_SELECT_US = 15;
-static const int INET_POLL_US = 11;
+// Roughly what the calls cost on a PSP when they return without waiting, by how much they handle
+// (pspautotests net/inet/timing and net/inet/sizes). Sends are measured with UDP over WiFi, receives
+// with the data already waiting.
 static const int INET_RECV_US = 4;
 
+static int InetSendUs(int bytes) {
+	return 125 + bytes / 25;
+}
+
+static int InetRecvUs(int bytes) {
+	return bytes < 0 ? INET_RECV_US : 35 + bytes / 70;
+}
+
+// Worse than linear, as each socket costs more the further along the PSP's list it is.
+static int InetPollUs(int sockets, bool select) {
+	return (select ? 15 : 10) + 3 * sockets + sockets * sockets / 8;
+}
+
+static int CountFdSetSockets(int nfds, const u32 *ptrs, int count) {
+	int sockets = 0;
+	for (int fd = 0; fd < nfds; ++fd) {
+		for (int i = 0; i < count; ++i) {
+			if (ptrs[i] && (((const SceNetInetFdSet *)Memory::GetPointerUnchecked(ptrs[i]))->fds_bits[fd >> 5] & (1U << (fd & 31)))) {
+				sockets++;
+				break;
+			}
+		}
+	}
+	return sockets;
+}
+
+// FIXME: nfds is number of fd(s) as in posix poll, or was it maximum fd value as in posix select? Star Wars Battlefront Renegade seems to set the nfds to 64, while Coded Arms Contagion is using 256
 int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr, u32 timeoutPtr) {
 	INET_CHECK_STACK_SOCKET();
 	InetThreadSeen();
@@ -953,6 +1016,7 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 	}
 
 	const u32 args[] = { (u32)nfds, readfdsPtr, writefdsPtr, exceptfdsPtr };
+	const int sockets = CountFdSetSockets(nfds, args + 1, 3);
 	// A null timeout waits for as long as it takes.
 	const s64 waitUs = timeout ? (s64)timeout->tv_sec * 1000000 + timeout->tv_usec : -1;
 	InetTry attempt = TrySelect(__KernelGetCurThread(), args, true);
@@ -962,7 +1026,7 @@ int sceNetInetSelect(int nfds, u32 readfdsPtr, u32 writefdsPtr, u32 exceptfdsPtr
 		}
 		attempt.result = InetWouldBlockResult(InetWaitOp::Select, __KernelGetCurThread(), args, attempt.hostErrno, __FUNCTION__);
 	}
-	hleEatMicro(INET_SELECT_US);
+	hleEatMicro(InetPollUs(sockets, true));
 	return hleLogDebug(Log::sceNet, attempt.result);
 }
 
@@ -988,7 +1052,7 @@ int sceNetInetPoll(MIPSState *mips, u32 fdsPtr, u32 nfds, int timeout) {
 		}
 		attempt.result = 0;
 	}
-	hleEatMicro(INET_POLL_US);
+	hleEatMicro(InetPollUs((int)nfds, false));
 	return hleLogDebug(Log::sceNet, attempt.result);
 }
 
@@ -1013,7 +1077,7 @@ static int sceNetInetRecv(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 		hleEatMicro(INET_RECV_US);
 		return hleLogDebug(Log::sceNet, attempt.result, "EAGAIN");
 	}
-	hleEatMicro(INET_RECV_US);
+	hleEatMicro(InetRecvUs(attempt.result));
 	if (attempt.result < 0) {
 		return hleLogError(Log::sceNet, attempt.result);
 	}
@@ -1045,6 +1109,7 @@ static int sceNetInetSend(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 	if (attempt.result < 0) {
 		return hleLogError(Log::sceNet, attempt.result);
 	}
+	hleEatMicro(InetSendUs(attempt.result));
 	return hleLogInfo(Log::sceNet, attempt.result);
 }
 
@@ -1085,6 +1150,7 @@ static int sceNetInetSocket(MIPSState *mips, int domain, int type, int protocol)
 		const int sndBuf = 65536;
 		setsockopt(inetSock->sock, SOL_SOCKET, SO_SNDBUF, (const char *)&sndBuf, sizeof(sndBuf));
 	}
+	hleEatMicro(type == PSP_NET_INET_SOCK_STREAM ? INET_SOCKET_TCP_US : INET_SOCKET_UDP_US);
 	ClearInetErrno();
 	return hleLogDebug(Log::sceNet, socket);
 }
@@ -1241,6 +1307,7 @@ static int InetSetsockopt(MIPSState *mips, int socket, int level, int optname, u
 
 static int sceNetInetSetsockopt(MIPSState *mips, int socket, int level, int optname, u32 optvalPtr, int optlen) {
 	INET_CHECK_STACK_SOCKET();
+	hleEatMicro(INET_SOCKOPT_US);
 	const int result = InetSetsockopt(mips, socket, level, optname, optvalPtr, optlen);
 	if (result >= 0) {
 		ClearInetErrno();
@@ -1257,6 +1324,7 @@ static int sceNetInetGetsockopt(MIPSState *mips, int socket, int level, int optn
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(INET_SOCKOPT_US);
 	if (!InetValidRange(optlenPtr, 4, __FUNCTION__)) {
 		return hleLogError(Log::sceNet, -1, "bad optlen %08x", optlenPtr);
 	}
@@ -1345,6 +1413,7 @@ static int sceNetInetBind(MIPSState *mips, int socket, u32 namePtr, int namelen)
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(INET_BIND_US);
 
 	if (!InetValidRange(namePtr, sizeof(SceNetInetSockaddr), __FUNCTION__)) {
 		return hleLogError(Log::sceNet, -1, "bad address %08x", namePtr);
@@ -1467,6 +1536,7 @@ static int sceNetInetConnect(int socket, u32 sockAddrPtr, int sockAddrLen) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(IsTcpSocket(inetSock) ? INET_CONNECT_TCP_US : INET_CONNECT_UDP_US);
 
 	// Still using warn log here so it stands out in the log
 
@@ -1530,6 +1600,7 @@ static int sceNetInetListen(int socket, int backlog) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(INET_LISTEN_US);
 
 	if (IsTcpSocket(inetSock)) {
 		if (inetSock->tcpClosed) {
@@ -1606,6 +1677,7 @@ static int sceNetInetAccept(int socket, u32 addrPtr, u32 addrLenPtr) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(INET_ACCEPT_US);
 
 	if ((addrPtr && !InetValidRange(addrPtr, sizeof(SceNetInetSockaddr), __FUNCTION__)) || (addrLenPtr && !InetValidRange(addrLenPtr, 4, __FUNCTION__))) {
 		return hleLogError(Log::sceNet, -1, "bad address %08x or length %08x", addrPtr, addrLenPtr);
@@ -1631,6 +1703,7 @@ static int sceNetInetShutdown(int socket, int how) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(how == PSP_NET_INET_SHUT_RD ? INET_SHUTDOWN_RD_US : INET_SHUTDOWN_US);
 
 	// As in 4.4BSD's soshutdown(), it can only fail on a bad how or a TCP socket with no state left
 	// (pspautotests net/inet/errors and states).
@@ -1666,6 +1739,7 @@ static int sceNetInetSocketAbort(int socket) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(INET_ABORT_US);
 
 	// FIXME: either using shutdown/close or select? probably using select if blocking mode is being simulated with non-blocking
 	int retVal = shutdown(inetSock->sock, SHUT_RDWR);
@@ -1677,6 +1751,11 @@ static int sceNetInetClose(int socket) {
 	InetSocket *inetSock;
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
+	}
+	if (!IsTcpSocket(inetSock)) {
+		hleEatMicro(INET_CLOSE_UDP_US);
+	} else {
+		hleEatMicro(IsHostSocketConnected(inetSock) ? INET_CLOSE_CONNECTED_US : INET_CLOSE_TCP_US);
 	}
 
 	CloseInetSocket(inetSock);
@@ -1691,6 +1770,7 @@ static int sceNetInetCloseWithRST(int socket) {
 	if (!GetCallSocket(socket, &inetSock)) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
+	hleEatMicro(IsTcpSocket(inetSock) && IsHostSocketConnected(inetSock) ? INET_CLOSE_RST_CONNECTED_US : INET_CLOSE_RST_US);
 
 	// Based on http://deepix.github.io/2016/10/21/tcprst.html
 	struct linger sl {};
@@ -1760,7 +1840,7 @@ static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32
 		hleEatMicro(INET_RECV_US);
 		return hleLogDebug(Log::sceNet, attempt.result, "EAGAIN");
 	}
-	hleEatMicro(INET_RECV_US);
+	hleEatMicro(InetRecvUs(attempt.result));
 	if (attempt.result < 0) {
 		return hleLogError(Log::sceNet, attempt.result);
 	}
@@ -1863,6 +1943,7 @@ static int sceNetInetSendto(int socket, u32 bufferPtr, int len, int flags, u32 t
 	if (attempt.result < 0) {
 		return hleLogError(Log::sceNet, attempt.result);
 	}
+	hleEatMicro(InetSendUs(attempt.result));
 	return hleLogDebug(Log::sceNet, attempt.result);
 }
 
@@ -2002,6 +2083,7 @@ static int sceNetInetSendmsg(int socket, u32 msghdrPtr, int flags) {
 		}
 		return hleLogError(Log::sceNet, retval);
 	}
+	hleEatMicro(InetSendUs(retval));
 	return hleLogInfo(Log::sceNet, retval);
 }
 
@@ -2089,8 +2171,10 @@ static int sceNetInetRecvmsg(MIPSState *mips, int socket, u32 msghdrPtr, int fla
 		if (StartInetWait(InetWaitOp::RecvMsg, args, ARRAY_SIZE(args), SocketWaitUs(inetSock, flags, false))) {
 			return hleLogDebug(Log::sceNet, 0, "waiting");
 		}
+		hleEatMicro(INET_RECV_US);
 		return hleLogDebug(Log::sceNet, InetWouldBlockResult(InetWaitOp::RecvMsg, __KernelGetCurThread(), args, attempt.hostErrno, __FUNCTION__), "EAGAIN");
 	}
+	hleEatMicro(InetRecvUs(attempt.result));
 	if (attempt.result < 0) {
 		return hleLogError(Log::sceNet, attempt.result);
 	}

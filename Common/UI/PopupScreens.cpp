@@ -23,7 +23,7 @@ static void TextToImage(std::string_view buttonText, ImageID *image) {
 	if (buttonText == di->T("Delete") || buttonText == di->T("Move to trash")) {
 		*image = ImageID("I_TRASHCAN");
 	} else if (buttonText == di->T("Back")) {
-		*image = ImageID("I_NAVIGATE_BACK");
+		*image = ImageID("I_CHEVRON_LEFT");
 	} else if (buttonText == di->T("Add")) {
 		*image = ImageID("I_PLUS");
 	} else if (buttonText == di->T("OK")) {
@@ -189,6 +189,7 @@ void PopupScreen::CreateViews() {
 	root_->Add(box_);
 	box_->SetBG(dc.GetTheme().popupStyle.background);
 	box_->SetHasDropShadow(hasDropShadow_);
+	box_->SetRadiusFactor(1.44f);
 	// Since we scale a bit, make the dropshadow bleed past the edges.
 	box_->SetDropShadowExpand(std::max(g_display.dp_xres, g_display.dp_yres));
 	box_->SetSpacing(0.0f);
