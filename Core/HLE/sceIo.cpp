@@ -2842,7 +2842,7 @@ static bool ReadFatComponentPath(u32 addr, std::string *path) {
 // sceIoDevctl("ms0:", 0x02435865): sceIoGetstat with the path given as UTF-16 components (see
 // IoOpenFatSearch). The argument is { path list, SceIoStat *, options }.
 static u32 IoGetstatFatComponentPath(u32 argAddr, int argLen) {
-	if (argLen < 12 || !Memory::IsValid4AlignedAddress(argAddr)) {
+	if (argLen < 12 || !Memory::IsValid4AlignedRange(argAddr, 12)) {
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT, "bad args");
 	}
 	const u32 pathListAddr = Memory::ReadUnchecked_U32(argAddr);
@@ -2863,7 +2863,7 @@ static u32 IoGetstatFatComponentPath(u32 argAddr, int argLen) {
 // sceIoDevctl("ms0:", 0x02435860): sceIoOpen with the path given as UTF-16 components (see
 // IoOpenFatSearch). The argument is { path list, flags, mode, options }, and the result a file fd.
 static u32 IoOpenFatComponentPath(u32 argAddr, int argLen) {
-	if (argLen < 16 || !Memory::IsValid4AlignedAddress(argAddr)) {
+	if (argLen < 16 || !Memory::IsValid4AlignedRange(argAddr, 16)) {
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT, "bad args");
 	}
 	const u32 pathListAddr = Memory::ReadUnchecked_U32(argAddr);
@@ -2920,7 +2920,7 @@ static bool FatPatternMatch(const char *pattern, const char *name) {
 // From fatmsmod.prx (3.71): the devctl opens "ms0:....****DOPEN MAGIC NAME****...." and passes
 // the arguments on to the dir with ioctl 0x0243D85F, which starts a FAT find-first.
 static u32 IoOpenFatSearch(u32 argAddr, int argLen) {
-	if (argLen < 12 || !Memory::IsValid4AlignedAddress(argAddr)) {
+	if (argLen < 12 || !Memory::IsValid4AlignedRange(argAddr, 12)) {
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT, "bad args");
 	}
 	const u32 pathListAddr = Memory::ReadUnchecked_U32(argAddr);
