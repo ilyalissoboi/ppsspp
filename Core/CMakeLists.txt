@@ -308,6 +308,8 @@ add_library(Core STATIC
 	LuaContext.h
 	RetroAchievements.h
 	RetroAchievements.cpp
+	RetroAchievementsQueue.h
+	RetroAchievementsQueue.cpp
 	Debugger/Breakpoints.cpp
 	Debugger/Breakpoints.h
 	Debugger/DebugInterface.h

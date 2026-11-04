@@ -707,6 +707,7 @@ EXEC_AND_LIB_FILES := \
   $(SRC)/Core/Reporting.cpp \
   $(SRC)/Core/Replay.cpp \
   $(SRC)/Core/RetroAchievements.cpp \
+  $(SRC)/Core/RetroAchievementsQueue.cpp \
   $(SRC)/Core/SaveState.cpp \
   $(SRC)/Core/SaveSync.cpp \
   $(SRC)/Core/SaveStateRewind.cpp \

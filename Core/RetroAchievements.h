@@ -104,6 +104,13 @@ void SetGame(const Path &path, IdentifiedFileType fileType, FileLoader *fileLoad
 void ChangeUMD(const Path &path, FileLoader *fileLoader);  // for in-game UMD change
 void UnloadGame();  // Call when leaving a game.
 
+// For platforms that know when the device goes offline (Android). Unlocks are queued without trying the
+// network while it's unavailable, and the queue is submitted as soon as it's back. Safe to call from any thread.
+void SetNetworkAvailable(bool available);
+
+// Unlocks and leaderboard entries in the offline queue, waiting to be submitted.
+int GetDeferredSubmissionCount();
+
 Statistics GetStatistics();
 
 std::string GetGameAchievementSummary(uint32_t subsetId);

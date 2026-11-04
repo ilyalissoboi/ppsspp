@@ -1216,6 +1216,9 @@
     <ClCompile Include="RetroAchievements.cpp">
       <Filter>Core</Filter>
     </ClCompile>
+    <ClCompile Include="RetroAchievementsQueue.cpp">
+      <Filter>Core</Filter>
+    </ClCompile>
     <ClCompile Include="MIPS\RiscV\RiscVJit.cpp">
       <Filter>MIPS\RiscV</Filter>
     </ClCompile>
@@ -2254,6 +2257,9 @@
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="RetroAchievements.h">
+      <Filter>Core</Filter>
+    </ClInclude>
+    <ClInclude Include="RetroAchievementsQueue.h">
       <Filter>Core</Filter>
     </ClInclude>
     <ClInclude Include="MIPS\RiscV\RiscVJit.h">

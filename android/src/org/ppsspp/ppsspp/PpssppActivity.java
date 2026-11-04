@@ -159,6 +159,7 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 	private final ArrayList<InputDeviceState> inputPlayers = new ArrayList<>();
 
 	private PowerSaveModeReceiver mPowerSaveModeReceiver = null;
+	private NetworkConnectivityMonitor mNetworkConnectivityMonitor = null;
 	// The open input boxes. There can be two, if a game's OSK pops up over a UI one.
 	private final ArrayList<AlertDialog> inputDialogs = new ArrayList<>();
 	private NativeSurfaceManager surfaceManager = null;
@@ -787,6 +788,9 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		if (mPowerSaveModeReceiver == null) {
 			mPowerSaveModeReceiver = new PowerSaveModeReceiver(this);
 		}
+		if (mNetworkConnectivityMonitor == null) {
+			mNetworkConnectivityMonitor = new NetworkConnectivityMonitor(this);
+		}
 
 		// OK, config should be initialized, we can query for screen rotation.
 		updateScreenRotation("onCreate");
@@ -1104,6 +1108,10 @@ public class PpssppActivity extends AppCompatActivity implements SensorEventList
 		if (mPowerSaveModeReceiver != null) {
 			mPowerSaveModeReceiver.destroy(this);
 			mPowerSaveModeReceiver = null;
+		}
+		if (mNetworkConnectivityMonitor != null) {
+			mNetworkConnectivityMonitor.destroy();
+			mNetworkConnectivityMonitor = null;
 		}
 		// Otherwise its window leaks, and its request is never answered. Dismissing answers it as cancelled.
 		for (AlertDialog dlg : new ArrayList<>(inputDialogs)) {

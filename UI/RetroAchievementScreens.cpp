@@ -465,6 +465,13 @@ void RetroAchievementsSettingsScreen::CreateAccountTab(UI::ViewGroup *viewGroup)
 	});
 	settingsGroup->Add(new CheckBox(&g_Config.bAchievementsHardcoreMode, ac->T("Hardcore Mode (no savestates)")))->SetEnabledPtr(&g_Config.bAchievementsEnable);
 	settingsGroup->Add(new CheckBox(&g_Config.bAchievementsSoundEffects, ac->T("Sound Effects")))->SetEnabledPtr(&g_Config.bAchievementsEnable);
+#if PPSSPP_PLATFORM(ANDROID)
+	settingsGroup->Add(new CheckBox(&g_Config.bAchievementsOfflineQueue, ac->T("Save unlocks while offline, submit them when back online")))->SetEnabledPtr(&g_Config.bAchievementsEnable);
+#endif
+	const int deferredCount = Achievements::GetDeferredSubmissionCount();
+	if (deferredCount > 0) {
+		settingsGroup->Add(new InfoItem(ac->T("Waiting to be submitted"), deferredCount));
+	}
 
 	ChoiceGroup *linksGroup = groups->Add(new ChoiceGroup(di->T("Links")));
 	Choice *webSite = linksGroup->Add(new Choice(ac->T("RetroAchievements website")));

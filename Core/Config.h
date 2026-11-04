@@ -736,6 +736,7 @@ public:
 	bool bAchievementsLogBadMemReads;
 	bool bAchievementsSaveStateInHardcoreMode;
 	bool bAchievementsEnableRAIntegration;
+	bool bAchievementsOfflineQueue;  // Keep unlocks that can't be submitted, and submit them when back online.
 
 	// Positioning of the various notifications
 	int iNotificationPos;
