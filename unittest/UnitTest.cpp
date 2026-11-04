@@ -3705,6 +3705,13 @@ static bool TestRetroAchievementsQueue() {
 	EXPECT_TRUE(ClassifySubmissionResponse(ach, -1, "", &error) == SubmissionOutcome::Retry);
 	EXPECT_TRUE(ClassifySubmissionResponse(ach, 503, "<html>Maintenance</html>", &error) == SubmissionOutcome::Retry);
 	EXPECT_TRUE(ClassifySubmissionResponse(lb, 500, "", &error) == SubmissionOutcome::Retry);
+	// Error pages from something between us and the API don't drop the submission.
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 500, "<html><body>Internal Server Error</body></html>", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "<html><title>Sign in to Wi-Fi</title></html>", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "{\"Success\":false,\"Error", &error) == SubmissionOutcome::Retry);
+	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "{\"Message\":\"Hello\"}", &error) == SubmissionOutcome::Retry);
+	// Accepted, but without the fields rcheevos wants. Sending it again wouldn't help.
+	EXPECT_TRUE(ClassifySubmissionResponse(lb, 200, "{\"Success\":true}", &error) == SubmissionOutcome::Accepted);
 	EXPECT_TRUE(ClassifySubmissionResponse(ach, 401, "{\"Success\":false,\"Error\":\"Invalid user/token combination.\",\"Code\":\"invalid_credentials\"}", &error) == SubmissionOutcome::AuthFailed);
 	EXPECT_TRUE(ClassifySubmissionResponse(ach, 200, "{\"Success\":false,\"Error\":\"Expired.\",\"Code\":\"expired_token\"}", &error) == SubmissionOutcome::AuthFailed);
 	EXPECT_TRUE(ClassifySubmissionResponse(ach, 404, "{\"Success\":false,\"Error\":\"Achievement not found.\",\"Code\":\"not_found\"}", &error) == SubmissionOutcome::Rejected);

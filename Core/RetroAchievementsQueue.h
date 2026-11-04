@@ -54,7 +54,7 @@ enum class SubmissionOutcome {
 	Accepted,  // Done, including an achievement the server already had.
 	Retry,  // No answer, or the server is busy. Keep it and try again later.
 	AuthFailed,  // The token was refused. Keep it until the user logs in again.
-	Rejected,  // The server refused the submission itself. Retrying won't help.
+	Rejected,  // The API answered and refused the submission itself. Retrying won't help.
 };
 
 // Recognizes the awardachievement and submitlbentry requests rcheevos builds, from their form-encoded

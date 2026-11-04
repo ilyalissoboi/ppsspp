@@ -231,20 +231,35 @@ static Path DeferredQueuePath() {
 	return GetSysDirectory(DIRECTORY_SYSTEM) / "achievements_offline_queue.json";
 }
 
+// The new queue is written here first, so a write that doesn't finish can't take the old one with it.
+static Path DeferredQueueTempPath() {
+	return GetSysDirectory(DIRECTORY_SYSTEM) / "achievements_offline_queue.json.tmp";
+}
+
+static bool LoadDeferredFile(const Path &path) {
+	std::string data;
+	if (!File::Exists(path) || !File::ReadTextFileToString(path, &data)) {
+		return false;
+	}
+	if (!DeserializeDeferredSubmissions(data, &g_deferred)) {
+		ERROR_LOG(Log::Achievements, "Failed to parse %s", path.c_str());
+		return false;
+	}
+	INFO_LOG(Log::Achievements, "Loaded %d deferred achievement submissions from %s", (int)g_deferred.size(), path.c_str());
+	return true;
+}
+
 // Call with g_deferredMutex held.
 static void LoadDeferredLocked() {
 	if (g_deferredLoaded) {
 		return;
 	}
 	g_deferredLoaded = true;
-	std::string data;
 	const Path path = DeferredQueuePath();
-	if (File::Exists(path) && File::ReadTextFileToString(path, &data)) {
-		if (!DeserializeDeferredSubmissions(data, &g_deferred)) {
-			ERROR_LOG(Log::Achievements, "Failed to parse %s, ignoring it", path.c_str());
-		} else {
-			INFO_LOG(Log::Achievements, "Loaded %d deferred achievement submissions", (int)g_deferred.size());
-		}
+	const Path tempPath = DeferredQueueTempPath();
+	if (!LoadDeferredFile(path) && LoadDeferredFile(tempPath)) {
+		// Saving was interrupted after the old file was deleted, so the new one is complete. Finish the job.
+		File::Rename(tempPath, path);
 	}
 	g_deferredCount = (int)g_deferred.size();
 }
@@ -253,14 +268,27 @@ static void LoadDeferredLocked() {
 static void SaveDeferredLocked() {
 	g_deferredCount = (int)g_deferred.size();
 	const Path path = DeferredQueuePath();
+	const Path tempPath = DeferredQueueTempPath();
 	if (g_deferred.empty()) {
 		if (File::Exists(path)) {
 			File::Delete(path);
 		}
+		if (File::Exists(tempPath)) {
+			File::Delete(tempPath);
+		}
 		return;
 	}
-	if (!File::WriteStringToFile(true, SerializeDeferredSubmissions(g_deferred), path)) {
-		ERROR_LOG(Log::Achievements, "Failed to write %s", path.c_str());
+	if (!File::WriteStringToFile(true, SerializeDeferredSubmissions(g_deferred), tempPath)) {
+		ERROR_LOG(Log::Achievements, "Failed to write %s, keeping the previous queue", tempPath.c_str());
+		return;
+	}
+	// Rename doesn't replace an existing file everywhere (content URIs, for one), so delete it first.
+	if (File::Exists(path)) {
+		File::Delete(path);
+	}
+	if (!File::Rename(tempPath, path)) {
+		// The queue is still complete in the temp file, and loading falls back to it.
+		ERROR_LOG(Log::Achievements, "Failed to rename %s to %s", tempPath.c_str(), path.c_str());
 	}
 }
 

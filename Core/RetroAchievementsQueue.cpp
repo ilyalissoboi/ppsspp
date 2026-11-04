@@ -206,25 +206,33 @@ SubmissionOutcome ClassifySubmissionResponse(const DeferredSubmission &sub, int 
 		rc_api_destroy_submit_lboard_entry_response(&response);
 	}
 
-	if (succeeded) {
+	// Only an answer from the API itself, which always has Success, can settle a submission. Anything else (an
+	// empty body, an error page from a proxy or a captive portal) may well work next time, and dropping it would
+	// lose the unlock. rcheevos can't tell us, it reads a missing Success as true.
+	if (bodyStr.empty() || bodyStr[0] != '{') {
+		return SubmissionOutcome::Retry;
+	}
+	json::JsonReader reader(bodyStr.data(), bodyStr.size());
+	if (!reader.ok() || !reader.root()) {
+		return SubmissionOutcome::Retry;
+	}
+	json::JsonGet root = reader.root();
+	if (root.hasChild("Success", JSON_TRUE)) {
+		// Accepted, even if the rest of the response isn't what rcheevos expects.
 		return SubmissionOutcome::Accepted;
 	}
-
-	// The award achievement parser doesn't look at the error code, so check it here.
-	std::string code;
-	if (!bodyStr.empty() && bodyStr[0] == '{') {
-		json::JsonReader reader(bodyStr.data(), bodyStr.size());
-		if (reader.ok() && reader.root()) {
-			code = reader.root().getStringOr("Code", "");
-		}
+	if (!root.hasChild("Success", JSON_FALSE)) {
+		return SubmissionOutcome::Retry;
 	}
+	if (succeeded) {
+		// An achievement the server already had.
+		return SubmissionOutcome::Accepted;
+	}
+	// The award achievement parser doesn't look at the error code, so check it here.
+	std::string code = root.getStringOr("Code", "");
 	if (result == RC_INVALID_CREDENTIALS || result == RC_EXPIRED_TOKEN || result == RC_ACCESS_DENIED || httpStatus == 401 ||
 		code == "invalid_credentials" || code == "expired_token" || code == "access_denied") {
 		return SubmissionOutcome::AuthFailed;
-	}
-	if (bodyStr.empty()) {
-		// Like rc_client_should_retry: no answer to read, so it may well work next time.
-		return SubmissionOutcome::Retry;
 	}
 	if (errorMessage->empty()) {
 		*errorMessage = rc_error_str(result);
