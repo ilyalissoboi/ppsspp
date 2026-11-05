@@ -194,6 +194,15 @@ u64 GameInfo::GetSizeOnDiskInBytes() {
 		return File::ComputeRecursiveDirectorySize(ResolvePBPDirectory(filePath_));
 	case IdentifiedFileType::PSP_DISC_DIRECTORY:
 		return File::ComputeRecursiveDirectorySize(GetFileLoader()->GetPath());
+	case IdentifiedFileType::PSX_ISO:
+	{
+		// A cue sheet or similar, and the image files it names.
+		PS1EbootFileLoader disc(filePath_);
+		if (disc.IsValid()) {
+			return disc.SourceFilesSize();
+		}
+		return GetFileLoader()->FileSize();
+	}
 	default:
 		return GetFileLoader()->FileSize();
 	}
@@ -206,6 +215,15 @@ u64 GameInfo::GetSizeUncompressedInBytes() {
 		return File::ComputeRecursiveDirectorySize(ResolvePBPDirectory(filePath_));
 	case IdentifiedFileType::PSP_DISC_DIRECTORY:
 		return File::ComputeRecursiveDirectorySize(GetFileLoader()->GetPath());
+	case IdentifiedFileType::PSX_ISO:
+	{
+		// Not necessarily a block device (a cue sheet isn't), so measure the disc it describes.
+		PS1EbootFileLoader disc(filePath_);
+		if (disc.IsValid()) {
+			return disc.DiscSize();
+		}
+		return GetFileLoader()->FileSize();
+	}
 	default:
 	{
 		std::string errorString;
@@ -221,37 +239,40 @@ u64 GameInfo::GetSizeUncompressedInBytes() {
 	}
 }
 
-std::string GetFileDateAsString(const Path &filename) {
-	tm time;
-	if (File::GetModifTime(filename, time)) {
-		char buf[256];
-		switch (g_Config.iDateFormat) {
-		case PSP_SYSTEMPARAM_DATE_FORMAT_YYYYMMDD:
-			strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &time);
-			break;
-		case PSP_SYSTEMPARAM_DATE_FORMAT_MMDDYYYY:
-			strftime(buf, sizeof(buf), "%m-%d-%Y %H:%M:%S", &time);
-			break;
-		case PSP_SYSTEMPARAM_DATE_FORMAT_DDMMYYYY:
-			strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", &time);
-			break;
-		default: // Should never happen
-			return "";
-		}
-		return std::string(buf);
+static std::string FormatFileDate(const tm &time) {
+	char buf[256];
+	switch (g_Config.iDateFormat) {
+	case PSP_SYSTEMPARAM_DATE_FORMAT_YYYYMMDD:
+		strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &time);
+		break;
+	case PSP_SYSTEMPARAM_DATE_FORMAT_MMDDYYYY:
+		strftime(buf, sizeof(buf), "%m-%d-%Y %H:%M:%S", &time);
+		break;
+	case PSP_SYSTEMPARAM_DATE_FORMAT_DDMMYYYY:
+		strftime(buf, sizeof(buf), "%d-%m-%Y %H:%M:%S", &time);
+		break;
+	default: // Should never happen
+		return "";
 	}
-	return "";
+	return std::string(buf);
+}
+
+Path GameInfo::GetMTimePath() const {
+	switch (fileType) {
+	case IdentifiedFileType::PSP_SAVEDATA_DIRECTORY:
+		return GetFilePath() / "PARAM.SFO";
+	case IdentifiedFileType::PSP_PBP_DIRECTORY:
+		return GetFilePath() / "EBOOT.PBP";
+	default:
+		return GetFilePath();
+	}
 }
 
 std::string GameInfo::GetMTime() const {
-	switch (fileType) {
-	case IdentifiedFileType::PSP_SAVEDATA_DIRECTORY:
-		return GetFileDateAsString(GetFilePath() / "PARAM.SFO");
-	case IdentifiedFileType::PSP_PBP_DIRECTORY:
-		return GetFileDateAsString(GetFilePath() / "EBOOT.PBP");
-	default:
-		return GetFileDateAsString(GetFilePath());
+	if (!hasMTime) {
+		return "";
 	}
+	return FormatFileDate(mtime);
 }
 
 // Not too meaningful if the object itself is a savedata directory...
@@ -974,11 +995,15 @@ handleELF:
 
 		if (flags_ & GameInfoFlags::SIZE) {
 			const u64 gameSizeOnDisk = info_->GetSizeOnDiskInBytes();
+			tm mtime{};
+			const bool hasMTime = File::GetModifTime(info_->GetMTimePath(), mtime);
 
 			// NOTE: Don't touch saveDataSize/installDataSize here - those belong to SAVEDATA_SIZE,
 			// which can have been fetched by an earlier work item.
 			std::lock_guard<std::mutex> lock(info_->lock);
 			info_->gameSizeOnDisk = gameSizeOnDisk;
+			info_->mtime = mtime;
+			info_->hasMTime = hasMTime;
 		}
 
 		if (flags_ & GameInfoFlags::SAVEDATA_SIZE) {

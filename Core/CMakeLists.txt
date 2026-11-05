@@ -503,6 +503,10 @@ add_library(Core STATIC
 	HLE/sceNetApctl.h
 	HLE/sceNetResolver.cpp
 	HLE/sceNetResolver.h
+	HLE/AdhocTransport.h
+	HLE/AdhocTransportP2P.cpp
+	HLE/AdhocTransportRelay.cpp
+	HLE/AdhocTransportNetSim.cpp
 	HLE/proAdhoc.h
 	HLE/proAdhoc.cpp
 	HLE/proAdhocServer.h
@@ -811,7 +815,11 @@ if (WIN32)
 	set(WIN_VERSION_CMD COMMAND ${CMAKE_SOURCE_DIR}/Windows/git-version-gen.cmd PPSSPPWindows)
 endif()
 
+# BYPRODUCTS tells Ninja that this writes git-version.cpp, so it checks the file again after the
+# command has run. Otherwise it only sees the timestamp from before the build, and the object is
+# recompiled a build late, if at all. The file is only rewritten when the version changes.
 add_custom_command(OUTPUT something_that_never_exists
+	BYPRODUCTS ${CMAKE_BINARY_DIR}/git-version.cpp
 	COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
 		-DOUTPUT_DIR=${CMAKE_BINARY_DIR}
 		-P ${CMAKE_SOURCE_DIR}/git-version.cmake

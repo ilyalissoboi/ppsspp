@@ -717,6 +717,7 @@ Shader *ShaderManagerGLES::ApplyVertexShader(bool useHWTransform, u32 vertexType
 }
 
 LinkedShader *ShaderManagerGLES::ApplyFragmentShader(VShaderID VSID, Shader *vs, const ComputedPipelineState &pipelineState, ClipInfoFlags clipInfoFlags, bool pixelMapped) {
+	DirtyDepalIfPixelMappedChanged(pixelMapped);
 	uint64_t dirty = gstate_c.GetDirtyUniforms();
 	if (dirty) {
 		if (lastShader_)
@@ -961,7 +962,7 @@ bool ShaderManagerGLES::LoadCache(File::IOFile &f) {
 		return false;
 	}
 
-	for (int i = 0; i < header.numLinkedPrograms; i++) {
+	for (uint32_t i = 0; i < header.numLinkedPrograms; i++) {
 		VShaderID vsid;
 		FShaderID fsid;
 		if (!f.ReadArray(&vsid, 1)) {
